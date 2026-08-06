@@ -250,4 +250,25 @@ command_fails_like(
 	'pg_dumpall: option --exclude-database cannot be used together with -g/--globals-only'
 );
 
+# Table chunking --max-table-segment-pages CLI option validation
+command_fails_like(
+	[ 'pg_dump', '--max-table-segment-pages=0' ],
+	qr/\Qpg_dump: error: --max-table-segment-pages not in range 1..4294967294\E/,
+	'pg_dump: --max-table-segment-pages=0 out of range');
+
+command_fails_like(
+	[ 'pg_dump', '--max-table-segment-pages=-5' ],
+	qr/\Qpg_dump: error: value "-5" for option --max-table-segment-pages can not be negative\E/,
+	'pg_dump: --max-table-segment-pages=-5 out of range');
+
+command_fails_like(
+	[ 'pg_dump', '--max-table-segment-pages=4294967295' ],
+	qr/\Qpg_dump: error: --max-table-segment-pages not in range 1..4294967294\E/,
+	'pg_dump: --max-table-segment-pages=4294967295 out of range');
+
+command_fails_like(
+	[ 'pg_dump', '--max-table-segment-pages=invalid' ],
+	qr/\Qpg_dump: error: invalid value "invalid" for option --max-table-segment-pages\E/,
+	'pg_dump: --max-table-segment-pages=invalid');
+
 done_testing();
