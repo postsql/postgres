@@ -1,0 +1,64 @@
+-- Test logical decoding with TIDs and header metadata
+SET synchronous_commit = on;
+
+-- 1. Test GUC values
+SHOW logical_decoding_expose_headers;
+SET logical_decoding_expose_headers = 'invalid'; -- should fail
+SET logical_decoding_expose_headers = 'none';
+SHOW logical_decoding_expose_headers;
+SET logical_decoding_expose_headers = 'tids';
+SHOW logical_decoding_expose_headers;
+SET logical_decoding_expose_headers = 'all';
+SHOW logical_decoding_expose_headers;
+
+-- 2. Setup slot
+SELECT 'init' FROM pg_create_logical_replication_slot('tid_slot', 'test_decoding');
+
+CREATE TABLE tid_test (id int PRIMARY KEY, val text);
+
+-- 3. With GUC = none, include-tids should not expose any TIDs
+SET logical_decoding_expose_headers = 'none';
+INSERT INTO tid_test VALUES (1, 'one');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- 4. With GUC = tids
+SET logical_decoding_expose_headers = 'tids';
+
+-- Single insert
+INSERT INTO tid_test VALUES (2, 'two');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- Multi insert
+INSERT INTO tid_test VALUES (3, 'three'), (4, 'four');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- Update (in-place / new page)
+UPDATE tid_test SET val = 'two-updated' WHERE id = 2;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- Delete
+DELETE FROM tid_test WHERE id = 2;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- 5. Delete on table without replica identity (no old tuple logged, but old TID is still present)
+CREATE TABLE tid_nopk (val text);
+ALTER TABLE tid_nopk REPLICA IDENTITY NOTHING;
+INSERT INTO tid_nopk VALUES ('hello');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+DELETE FROM tid_nopk WHERE val = 'hello';
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- 6. Speculative insert (ON CONFLICT)
+CREATE TABLE tid_conflict (id int PRIMARY KEY, val text);
+INSERT INTO tid_conflict VALUES (1, 'initial') ON CONFLICT (id) DO NOTHING;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+INSERT INTO tid_conflict VALUES (1, 'duplicate') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+
+-- 7. Cleanup
+DROP TABLE tid_test;
+DROP TABLE tid_nopk;
+DROP TABLE tid_conflict;
+SELECT pg_drop_replication_slot('tid_slot');

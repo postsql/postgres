@@ -1941,6 +1941,13 @@
   boot_val => 'false',
 },
 
+{ name => 'logical_decoding_expose_headers', type => 'enum', context => 'PGC_USERSET', group => 'REPLICATION_SENDING',
+  short_desc => 'Exposes tuple identifiers (TIDs) and tuple header metadata during logical decoding.',
+  variable => 'logical_decoding_expose_headers',
+  boot_val => 'LOGICAL_DECODING_EXPOSE_HEADERS_NONE',
+  options => 'logical_decoding_expose_headers_options',
+},
+
 { name => 'logical_decoding_work_mem', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
   short_desc => 'Sets the maximum memory to be used for logical decoding.',
   long_desc => 'This much memory can be used by each internal reorder buffer before spilling to disk.',

@@ -957,6 +957,15 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	DecodeXLogTuple(tupledata, datalen, change->data.tp.newtuple);
 
+	if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
+	{
+		BlockNumber blk;
+
+		XLogRecGetBlockTag(r, 0, NULL, NULL, &blk);
+		ItemPointerSet(&change->data.tp.new_tid, blk, xlrec->offnum);
+		change->data.tp.newtuple->t_self = change->data.tp.new_tid;
+	}
+
 	change->data.tp.clear_toast_afterwards = true;
 
 	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr,
@@ -1026,6 +1035,25 @@ DecodeUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		DecodeXLogTuple(data, datalen, change->data.tp.oldtuple);
 	}
 
+	if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
+	{
+		BlockNumber newblk,
+					oldblk;
+
+		XLogRecGetBlockTag(r, 0, NULL, NULL, &newblk);
+		if (XLogRecHasBlockRef(r, 1))
+			XLogRecGetBlockTag(r, 1, NULL, NULL, &oldblk);
+		else
+			oldblk = newblk;
+
+		ItemPointerSet(&change->data.tp.old_tid, oldblk, xlrec->old_offnum);
+		ItemPointerSet(&change->data.tp.new_tid, newblk, xlrec->new_offnum);
+		if (change->data.tp.oldtuple)
+			change->data.tp.oldtuple->t_self = change->data.tp.old_tid;
+		if (change->data.tp.newtuple)
+			change->data.tp.newtuple->t_self = change->data.tp.new_tid;
+	}
+
 	change->data.tp.clear_toast_afterwards = true;
 
 	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr,
@@ -1089,6 +1117,16 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 		DecodeXLogTuple((char *) xlrec + SizeOfHeapDelete,
 						datalen, change->data.tp.oldtuple);
+	}
+
+	if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
+	{
+		BlockNumber blk;
+
+		XLogRecGetBlockTag(r, 0, NULL, NULL, &blk);
+		ItemPointerSet(&change->data.tp.old_tid, blk, xlrec->offnum);
+		if (change->data.tp.oldtuple)
+			change->data.tp.oldtuple->t_self = change->data.tp.old_tid;
 	}
 
 	change->data.tp.clear_toast_afterwards = true;
@@ -1215,6 +1253,18 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		header->t_infomask = xlhdr->t_infomask;
 		header->t_infomask2 = xlhdr->t_infomask2;
 		header->t_hoff = xlhdr->t_hoff;
+
+		if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
+		{
+			BlockNumber blk;
+			OffsetNumber offnum;
+			bool		isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
+
+			XLogRecGetBlockTag(r, 0, NULL, NULL, &blk);
+			offnum = isinit ? (FirstOffsetNumber + i) : xlrec->offsets[i];
+			ItemPointerSet(&change->data.tp.new_tid, blk, offnum);
+			tuple->t_self = change->data.tp.new_tid;
+		}
 
 		/*
 		 * Reset toast reassembly state only after the last row in the last
