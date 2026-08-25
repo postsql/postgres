@@ -3661,6 +3661,8 @@ describeOneTableDetails(const char *schemaname,
 			printfPQExpBuffer(&buf, "%s: %s",
 							  s,
 							  tableinfo.relreplident == REPLICA_IDENTITY_FULL ? "FULL" :
+							  tableinfo.relreplident == REPLICA_IDENTITY_ROWID ? "ROWID" :
+							  tableinfo.relreplident == REPLICA_IDENTITY_NOTHING ? "NOTHING" :
 							  tableinfo.relreplident == REPLICA_IDENTITY_DEFAULT ? "NOTHING" :
 							  "???");
 

@@ -1106,8 +1106,9 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 	if (OidIsValid(RelationGetReplicaIndex(rel)))
 		return;
 
-	/* REPLICA IDENTITY FULL is also good for UPDATE/DELETE. */
-	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+	/* REPLICA IDENTITY FULL and ROWID are also good for UPDATE/DELETE. */
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
+		rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
 		return;
 
 	/*

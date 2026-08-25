@@ -196,6 +196,8 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
  * has the same meaning as 'n'.
  */
 #define		  REPLICA_IDENTITY_INDEX	'i'
+/* tuple identifier (TID / ROWID) is used as replica identity */
+#define		  REPLICA_IDENTITY_ROWID	'r'
 
 /*
  * Relation kinds that have physical storage. These relations normally have

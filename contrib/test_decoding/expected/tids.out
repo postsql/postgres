@@ -142,7 +142,40 @@ SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xi
  COMMIT
 (3 rows)
 
--- 7. Cleanup
+-- 7. REPLICA IDENTITY ROWID and COPY tests
+CREATE TABLE tid_rowid (id int, val text);
+ALTER TABLE tid_rowid REPLICA IDENTITY ROWID;
+INSERT INTO tid_rowid VALUES (10, 'ten');
+COPY tid_rowid (val, ".rowid") TO stdout;
+ten	(0,1)
+COPY tid_rowid (val, ctid) TO stdout;
+ten	(0,1)
+-- Test pgoutput with REPLICA IDENTITY ROWID
+CREATE PUBLICATION pub_rowid FOR TABLE tid_rowid;
+SELECT 'init' FROM pg_create_logical_replication_slot('pgout_slot', 'pgoutput');
+ ?column? 
+----------
+ init
+(1 row)
+
+INSERT INTO tid_rowid VALUES (20, 'twenty');
+UPDATE tid_rowid SET val = 'twenty-upd' WHERE id = 20;
+DELETE FROM tid_rowid WHERE id = 20;
+SELECT count(*) > 0 AS got_changes FROM pg_logical_slot_get_binary_changes('pgout_slot', NULL, NULL, 'proto_version', '1', 'publication_names', 'pub_rowid');
+ got_changes 
+-------------
+ t
+(1 row)
+
+SELECT pg_drop_replication_slot('pgout_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+DROP PUBLICATION pub_rowid;
+DROP TABLE tid_rowid;
+-- 8. Cleanup
 DROP TABLE tid_test;
 DROP TABLE tid_nopk;
 DROP TABLE tid_conflict;
