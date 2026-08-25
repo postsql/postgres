@@ -7030,3 +7030,61 @@ ResOwnerReleaseRelation(Datum res)
 
 	RelationCloseCleanup((Relation) DatumGetPointer(res));
 }
+
+/*
+ * Global GUC to enable index-only storage for .rowid primary key columns
+ * during logical replication.
+ */
+bool		logical_replication_index_only_rowid = true;
+
+/*
+ * RelationIsIndexOnlyRowid
+ *		Returns true if the relation has a trailing .rowid column of type tid
+ *		and index-only storage is enabled (via GUC or table-level reloption).
+ */
+bool
+RelationIsIndexOnlyRowid(Relation rel)
+{
+	TupleDesc	desc;
+	Form_pg_attribute attr;
+
+	if (!rel || !rel->rd_att || rel->rd_att->natts < 1)
+		return false;
+
+	if (!rel->rd_rel || !rel->rd_rel->relhasindex)
+		return false;
+
+	/* Table-level reloption check if specified */
+	if (rel->rd_options)
+	{
+		StdRdOptions *opts = (StdRdOptions *) rel->rd_options;
+
+		if (opts->index_only_rowid == PG_TERNARY_FALSE)
+			return false;
+
+		if (opts->index_only_rowid == PG_TERNARY_TRUE)
+		{
+			desc = rel->rd_att;
+			attr = TupleDescAttr(desc, desc->natts - 1);
+			if (!attr->attisdropped && attr->atttypid == TIDOID &&
+				strcmp(NameStr(attr->attname), ".rowid") == 0)
+				return true;
+			return false;
+		}
+	}
+
+	/* GUC check */
+	if (!logical_replication_index_only_rowid)
+		return false;
+
+	desc = rel->rd_att;
+	attr = TupleDescAttr(desc, desc->natts - 1);
+
+	if (attr->attisdropped || attr->atttypid != TIDOID)
+		return false;
+
+	if (strcmp(NameStr(attr->attname), ".rowid") != 0)
+		return false;
+
+	return true;
+}

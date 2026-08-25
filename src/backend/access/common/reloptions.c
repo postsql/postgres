@@ -176,6 +176,14 @@ static relopt_ternary ternaryRelOpts[] =
 			ShareUpdateExclusiveLock
 		}
 	},
+	{
+		{
+			"index_only_rowid",
+			"Enables skipping physical heap storage for .rowid primary key columns during logical replication",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		}
+	},
 	/* list terminator */
 	{
 		{
@@ -2024,6 +2032,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
 		{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 		offsetof(StdRdOptions, vacuum_truncate)},
+		{"index_only_rowid", RELOPT_TYPE_TERNARY,
+		offsetof(StdRdOptions, index_only_rowid)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
 		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
 	};

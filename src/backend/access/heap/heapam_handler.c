@@ -151,7 +151,19 @@ heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 					uint32 options, BulkInsertState bistate)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	HeapTuple	tuple;
+
+	if (RelationIsIndexOnlyRowid(relation))
+	{
+		TupleDesc	desc = RelationGetDescr(relation);
+
+		slot_getallattrs(slot);
+		tuple = heap_form_tuple_natts(desc, slot->tts_values, slot->tts_isnull,
+									  desc->natts - 1);
+		shouldFree = true;
+	}
+	else
+		tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -171,7 +183,19 @@ heapam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 								BulkInsertState bistate, uint32 specToken)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	HeapTuple	tuple;
+
+	if (RelationIsIndexOnlyRowid(relation))
+	{
+		TupleDesc	desc = RelationGetDescr(relation);
+
+		slot_getallattrs(slot);
+		tuple = heap_form_tuple_natts(desc, slot->tts_values, slot->tts_isnull,
+									  desc->natts - 1);
+		shouldFree = true;
+	}
+	else
+		tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -222,8 +246,20 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	HeapTuple	tuple;
 	TM_Result	result;
+
+	if (RelationIsIndexOnlyRowid(relation))
+	{
+		TupleDesc	desc = RelationGetDescr(relation);
+
+		slot_getallattrs(slot);
+		tuple = heap_form_tuple_natts(desc, slot->tts_values, slot->tts_isnull,
+									  desc->natts - 1);
+		shouldFree = true;
+	}
+	else
+		tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);

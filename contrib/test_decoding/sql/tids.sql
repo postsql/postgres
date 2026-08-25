@@ -75,7 +75,45 @@ SELECT pg_drop_replication_slot('pgout_slot');
 DROP PUBLICATION pub_rowid;
 DROP TABLE tid_rowid;
 
--- 8. Cleanup
+-- 8. Index-Only Primary Key on Subscriber tests
+SHOW logical_replication_index_only_rowid;
+
+-- 8a. Table with .rowid and index: .rowid is omitted from physical heap (reads as NULL) but indexed
+CREATE TABLE target_rowid (id int, val text, ".rowid" tid);
+CREATE UNIQUE INDEX target_rowid_idx ON target_rowid (".rowid");
+INSERT INTO target_rowid VALUES (1, 'one', '(0,1)'::tid);
+-- Sequential scan reads physical heap (omitted .rowid is NULL)
+SELECT id, val, ".rowid" IS NULL AS rowid_omitted_from_heap FROM target_rowid;
+-- Index scan uses index on .rowid to locate row
+SET enable_seqscan = off;
+SELECT id, val FROM target_rowid WHERE ".rowid" = '(0,1)'::tid;
+RESET enable_seqscan;
+
+-- 8b. UPDATE via index on .rowid
+UPDATE target_rowid SET val = 'one-updated', ".rowid" = '(0,2)'::tid WHERE ".rowid" = '(0,1)'::tid;
+SET enable_seqscan = off;
+SELECT id, val FROM target_rowid WHERE ".rowid" = '(0,2)'::tid;
+RESET enable_seqscan;
+
+-- 8c. DELETE via index on .rowid
+DELETE FROM target_rowid WHERE ".rowid" = '(0,2)'::tid;
+SELECT count(*) FROM target_rowid;
+
+-- 8d. Post-migration cleanup (drop index and column without rewrite)
+INSERT INTO target_rowid VALUES (2, 'two', '(0,3)'::tid);
+DROP INDEX target_rowid_idx;
+ALTER TABLE target_rowid DROP COLUMN ".rowid";
+SELECT * FROM target_rowid;
+DROP TABLE target_rowid;
+
+-- 8e. Table-level reloption WITH (index_only_rowid = false) disables omission
+CREATE TABLE target_rowid_stored (id int, val text, ".rowid" tid) WITH (index_only_rowid = false);
+CREATE UNIQUE INDEX target_rowid_stored_idx ON target_rowid_stored (".rowid");
+INSERT INTO target_rowid_stored VALUES (1, 'one', '(0,1)'::tid);
+SELECT id, val, ".rowid" FROM target_rowid_stored;
+DROP TABLE target_rowid_stored;
+
+-- 9. Cleanup
 DROP TABLE tid_test;
 DROP TABLE tid_nopk;
 DROP TABLE tid_conflict;

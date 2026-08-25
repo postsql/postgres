@@ -2338,7 +2338,17 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	{
 		HeapTuple	tuple;
 
-		tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
+		if (RelationIsIndexOnlyRowid(relation))
+		{
+			TupleDesc	desc = RelationGetDescr(relation);
+
+			slot_getallattrs(slots[i]);
+			tuple = heap_form_tuple_natts(desc, slots[i]->tts_values,
+										  slots[i]->tts_isnull, desc->natts - 1);
+		}
+		else
+			tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
+
 		slots[i]->tts_tableOid = RelationGetRelid(relation);
 		tuple->t_tableOid = slots[i]->tts_tableOid;
 		heaptuples[i] = heap_prepare_insert(relation, tuple, xid, cid,
@@ -4065,9 +4075,11 @@ l2:
 		/*
 		 * Since the new tuple is going into the same page, we might be able
 		 * to do a HOT update.  Check if any of the index columns have been
-		 * changed.
+		 * changed.  Index-only rowid tables cannot use HOT update since the
+		 * virtual .rowid index entry must be updated.
 		 */
-		if (!bms_overlap(modified_attrs, hot_attrs))
+		if (!RelationIsIndexOnlyRowid(relation) &&
+			!bms_overlap(modified_attrs, hot_attrs))
 		{
 			use_hot_update = true;
 

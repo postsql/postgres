@@ -212,17 +212,20 @@ getmissingattr(TupleDesc tupleDesc,
 }
 
 /*
- * heap_compute_data_size
- *		Determine size of the data area of a tuple to be constructed
+ * heap_compute_data_size_natts
+ *		Determine size of the data area of a tuple to be constructed,
+ *		considering only the first numberOfAttributes columns.
  */
 Size
-heap_compute_data_size(TupleDesc tupleDesc,
-					   const Datum *values,
-					   const bool *isnull)
+heap_compute_data_size_natts(TupleDesc tupleDesc,
+							 const Datum *values,
+							 const bool *isnull,
+							 int numberOfAttributes)
 {
 	Size		data_length = 0;
 	int			i;
-	int			numberOfAttributes = tupleDesc->natts;
+
+	Assert(numberOfAttributes <= tupleDesc->natts);
 
 	for (i = 0; i < numberOfAttributes; i++)
 	{
@@ -264,6 +267,19 @@ heap_compute_data_size(TupleDesc tupleDesc,
 	}
 
 	return data_length;
+}
+
+/*
+ * heap_compute_data_size
+ *		Determine size of the data area of a tuple to be constructed
+ */
+Size
+heap_compute_data_size(TupleDesc tupleDesc,
+					   const Datum *values,
+					   const bool *isnull)
+{
+	return heap_compute_data_size_natts(tupleDesc, values, isnull,
+										tupleDesc->natts);
 }
 
 /*
@@ -389,24 +405,22 @@ fill_val(CompactAttribute *att,
 }
 
 /*
- * heap_fill_tuple
- *		Load data portion of a tuple from values/isnull arrays
- *
- * We also fill the null bitmap (if any) and set the infomask bits
- * that reflect the tuple's data contents.
- *
- * NOTE: it is now REQUIRED that the caller have pre-zeroed the data area.
+ * heap_fill_tuple_natts
+ *		Load data portion of a tuple from values/isnull arrays,
+ *		considering only the first numberOfAttributes columns.
  */
 void
-heap_fill_tuple(TupleDesc tupleDesc,
-				const Datum *values, const bool *isnull,
-				char *data, Size data_size,
-				uint16 *infomask, uint8 *bit)
+heap_fill_tuple_natts(TupleDesc tupleDesc,
+					  const Datum *values, const bool *isnull,
+					  char *data, Size data_size,
+					  uint16 *infomask, uint8 *bit,
+					  int numberOfAttributes)
 {
 	uint8	   *bitP;
 	int			bitmask;
 	int			i;
-	int			numberOfAttributes = tupleDesc->natts;
+
+	Assert(numberOfAttributes <= tupleDesc->natts);
 
 #ifdef USE_ASSERT_CHECKING
 	char	   *start = data;
@@ -440,6 +454,25 @@ heap_fill_tuple(TupleDesc tupleDesc,
 	}
 
 	Assert((data - start) == data_size);
+}
+
+/*
+ * heap_fill_tuple
+ *		Load data portion of a tuple from values/isnull arrays
+ *
+ * We also fill the null bitmap (if any) and set the infomask bits
+ * that reflect the tuple's data contents.
+ *
+ * NOTE: it is now REQUIRED that the caller have pre-zeroed the data area.
+ */
+void
+heap_fill_tuple(TupleDesc tupleDesc,
+				const Datum *values, const bool *isnull,
+				char *data, Size data_size,
+				uint16 *infomask, uint8 *bit)
+{
+	heap_fill_tuple_natts(tupleDesc, values, isnull, data, data_size,
+						  infomask, bit, tupleDesc->natts);
 }
 
 
@@ -1015,16 +1048,17 @@ heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
 }
 
 /*
- * heap_form_tuple
+ * heap_form_tuple_natts
  *		construct a tuple from the given values[] and isnull[] arrays,
- *		which are of the length indicated by tupleDescriptor->natts
+ *		considering only the first numberOfAttributes columns.
  *
  * The result is allocated in the current memory context.
  */
 HeapTuple
-heap_form_tuple(TupleDesc tupleDescriptor,
-				const Datum *values,
-				const bool *isnull)
+heap_form_tuple_natts(TupleDesc tupleDescriptor,
+					  const Datum *values,
+					  const bool *isnull,
+					  int numberOfAttributes)
 {
 	HeapTuple	tuple;			/* return tuple */
 	HeapTupleHeader td;			/* tuple data */
@@ -1032,8 +1066,9 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 				data_len;
 	int			hoff;
 	bool		hasnull = false;
-	int			numberOfAttributes = tupleDescriptor->natts;
 	int			i;
+
+	Assert(numberOfAttributes <= tupleDescriptor->natts);
 
 	if (numberOfAttributes > MaxTupleAttributeNumber)
 		ereport(ERROR,
@@ -1063,7 +1098,8 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 
 	hoff = len = MAXALIGN(len); /* align user data safely */
 
-	data_len = heap_compute_data_size(tupleDescriptor, values, isnull);
+	data_len = heap_compute_data_size_natts(tupleDescriptor, values, isnull,
+											numberOfAttributes);
 
 	len += data_len;
 
@@ -1092,15 +1128,32 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 	HeapTupleHeaderSetNatts(td, numberOfAttributes);
 	td->t_hoff = hoff;
 
-	heap_fill_tuple(tupleDescriptor,
-					values,
-					isnull,
-					(char *) td + hoff,
-					data_len,
-					&td->t_infomask,
-					(hasnull ? td->t_bits : NULL));
+	heap_fill_tuple_natts(tupleDescriptor,
+						  values,
+						  isnull,
+						  (char *) td + hoff,
+						  data_len,
+						  &td->t_infomask,
+						  (hasnull ? td->t_bits : NULL),
+						  numberOfAttributes);
 
 	return tuple;
+}
+
+/*
+ * heap_form_tuple
+ *		construct a tuple from the given values[] and isnull[] arrays,
+ *		which are of the length indicated by tupleDescriptor->natts
+ *
+ * The result is allocated in the current memory context.
+ */
+HeapTuple
+heap_form_tuple(TupleDesc tupleDescriptor,
+				const Datum *values,
+				const bool *isnull)
+{
+	return heap_form_tuple_natts(tupleDescriptor, values, isnull,
+								 tupleDescriptor->natts);
 }
 
 /*

@@ -1958,6 +1958,12 @@
   max => 'MAX_KILOBYTES',
 },
 
+{ name => 'logical_replication_index_only_rowid', type => 'bool', context => 'PGC_USERSET', group => 'REPLICATION_SUBSCRIBERS',
+  short_desc => 'Skips physical heap storage for .rowid primary key columns during logical replication.',
+  variable => 'logical_replication_index_only_rowid',
+  boot_val => 'true',
+},
+
 { name => 'maintenance_io_concurrency', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
   short_desc => 'A variant of "effective_io_concurrency" that is used for maintenance work.',
   long_desc => '0 disables simultaneous requests.',
