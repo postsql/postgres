@@ -71,6 +71,7 @@ OBJS_COMMON = \
 	pg_get_line.o \
 	pg_lzcompress.o \
 	pg_prng.o \
+	pgbench_funcs.o \
 	pgfnames.o \
 	psprintf.o \
 	relpath.o \

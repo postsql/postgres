@@ -25,6 +25,7 @@ common_sources = files(
   'pg_get_line.c',
   'pg_lzcompress.c',
   'pg_prng.c',
+  'pgbench_funcs.c',
   'pgfnames.c',
   'psprintf.c',
   'relpath.c',
