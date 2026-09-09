@@ -7,42 +7,42 @@
 CREATE FUNCTION setseed(seed double precision)
 RETURNS void
 AS 'MODULE_PATHNAME', 'pgbench_setseed_double'
-LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 CREATE FUNCTION setseed(seed bigint)
 RETURNS void
 AS 'MODULE_PATHNAME', 'pgbench_setseed_int64'
-LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 -- Uniform Random
 CREATE FUNCTION random(min bigint, max bigint)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'pgbench_random_int64'
-LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 -- Gaussian (Normal) Random
 CREATE FUNCTION random_gaussian(min bigint, max bigint, parameter double precision)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'pgbench_random_gaussian_int64'
-LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 -- Exponential Random
 CREATE FUNCTION random_exponential(min bigint, max bigint, parameter double precision)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'pgbench_random_exponential_int64'
-LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 -- Zipfian Random
 CREATE FUNCTION random_zipfian(min bigint, max bigint, parameter double precision)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'pgbench_random_zipfian_int64'
-LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 -- Poisson Random
 CREATE FUNCTION random_poisson(center double precision)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'pgbench_random_poisson_int64'
-LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 -- MurmurHash2 (64-bit)
 CREATE FUNCTION hash_murmur2(val bigint, seed bigint DEFAULT 0)
