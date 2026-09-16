@@ -40,6 +40,7 @@
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
 #include "storage/standbydefs.h"
+#include "utils/relfilenumbermap.h"
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -48,6 +49,7 @@ static void DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeSpecConfirm(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
+static void DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 
 static void DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 						 xl_xact_parsed_commit *parsed, TransactionId xid,
@@ -471,6 +473,9 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		case XLOG_HEAP2_PRUNE_ON_ACCESS:
 		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
 		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
+			if (!ctx->fast_forward)
+				DecodePrune(ctx, buf);
+			break;
 		case XLOG_HEAP2_LOCK_UPDATED:
 			break;
 		default:
@@ -1393,4 +1398,140 @@ DecodeTXNNeedSkip(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	}
 
 	return false;
+}
+
+/*
+ * Parse XLOG_HEAP2_PRUNE_* records.
+ *
+ * Pruning removes dead rows from a heap page and reclaims or frees line pointers.
+ */
+static void
+DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	XLogReaderState *r = buf->record;
+	uint8		info = XLogRecGetInfo(r) & XLOG_HEAP_OPMASK;
+	xl_heap_prune *xlrec = (xl_heap_prune *) XLogRecGetData(r);
+	RelFileLocator rlocator;
+	BlockNumber blkno;
+	char	   *dataptr;
+	Size		datalen = 0;
+	int			nplans = 0;
+	xlhp_freeze_plan *plans = NULL;
+	OffsetNumber *frz_offsets = NULL;
+	int			nredirected = 0;
+	OffsetNumber *redirected = NULL;
+	int			ndead = 0;
+	OffsetNumber *nowdead = NULL;
+	int			nunused = 0;
+	OffsetNumber *nowunused = NULL;
+	LogicalDecodePruneData prune_data;
+	Snapshot	snapshot;
+
+	/* only interested in our database */
+	XLogRecGetBlockTag(r, 0, &rlocator, NULL, &blkno);
+
+	/* If output plugin hasn't registered a prune callback, nothing to do */
+	if (ctx->callbacks.prune_cb == NULL)
+		return;
+
+	/* Require a consistent snapshot and that record is not before start LSN */
+	if (SnapBuildCurrentState(ctx->snapshot_builder) != SNAPBUILD_CONSISTENT ||
+		SnapBuildXactNeedsSkip(ctx->snapshot_builder, buf->origptr))
+		return;
+
+	if (rlocator.dbOid != ctx->slot->data.database &&
+		rlocator.dbOid != InvalidOid)
+		return;
+
+	/* output plugin doesn't look for this origin, no need to dispatch */
+	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
+		return;
+
+	prune_data.blkno = blkno;
+	prune_data.reason = info;
+
+	dataptr = XLogRecGetBlockData(r, 0, &datalen);
+
+	if (dataptr != NULL && datalen > 0)
+	{
+		heap_xlog_deserialize_prune_and_freeze(dataptr, xlrec->flags,
+											   &nplans, &plans, &frz_offsets,
+											   &nredirected, &redirected,
+											   &ndead, &nowdead,
+											   &nunused, &nowunused);
+
+		/* If no rows were pruned or redirected, nothing to report */
+		if (ndead == 0 && nunused == 0 && nredirected == 0)
+			return;
+
+		prune_data.has_row_info = true;
+		prune_data.ndead = ndead;
+		prune_data.nowdead = nowdead;
+		prune_data.nunused = nunused;
+		prune_data.nowunused = nowunused;
+		prune_data.nredirected = nredirected;
+		prune_data.redirected = redirected;
+	}
+	else if (XLogRecHasBlockImage(r, 0))
+	{
+		/*
+		 * The record contains a full page image (FPI) and was emitted without
+		 * REGBUF_KEEP_DATA (e.g. logical_decoding_prune_records was off at
+		 * write time). Report that pruning occurred with FPI but without
+		 * row-level details.
+		 */
+		prune_data.has_row_info = false;
+		prune_data.ndead = -1;
+		prune_data.nowdead = NULL;
+		prune_data.nunused = -1;
+		prune_data.nowunused = NULL;
+		prune_data.nredirected = -1;
+		prune_data.redirected = NULL;
+	}
+	else
+	{
+		/* No prune info and no FPI (e.g. only VM flags changed) */
+		return;
+	}
+
+	snapshot = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder);
+	SetupHistoricSnapshot(snapshot, NULL);
+	{
+		Relation	relation = NULL;
+
+		PG_TRY();
+		{
+			Oid			reloid = RelidByRelfilenumber(rlocator.spcOid, rlocator.relNumber);
+
+			if (OidIsValid(reloid))
+			{
+				relation = RelationIdGetRelation(reloid);
+
+				if (RelationIsValid(relation))
+				{
+					if (RelationIsLogicallyLogged(relation) &&
+						!IsToastRelation(relation) &&
+						relation->rd_rel->relkind != RELKIND_SEQUENCE &&
+						(!relation->rd_rel->relrewrite || ctx->reorder->output_rewrites))
+					{
+						ReorderBufferProcessPrune(ctx->reorder, relation,
+												  buf->origptr, buf->endptr,
+												  &prune_data);
+					}
+					RelationClose(relation);
+					relation = NULL;
+				}
+			}
+
+			TeardownHistoricSnapshot(false);
+		}
+		PG_CATCH();
+		{
+			if (RelationIsValid(relation))
+				RelationClose(relation);
+			TeardownHistoricSnapshot(true);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 }

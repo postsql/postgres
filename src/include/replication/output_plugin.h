@@ -211,6 +211,29 @@ typedef void (*LogicalDecodeStreamTruncateCB) (struct LogicalDecodingContext *ct
 											   ReorderBufferChange *change);
 
 /*
+ * Prune information describing removed dead rows from a page.
+ */
+typedef struct LogicalDecodePruneData
+{
+	BlockNumber blkno;
+	uint8		reason;			/* XLOG_HEAP2_PRUNE_ON_ACCESS, etc. */
+	bool		has_row_info;	/* false if record had FPI without row data */
+	int			ndead;			/* -1 if !has_row_info */
+	const OffsetNumber *nowdead;
+	int			nunused;		/* -1 if !has_row_info */
+	const OffsetNumber *nowunused;
+	int			nredirected;	/* -1 if !has_row_info */
+	const OffsetNumber *redirected;
+} LogicalDecodePruneData;
+
+/*
+ * Callback for page pruning events.
+ */
+typedef void (*LogicalDecodePruneCB) (struct LogicalDecodingContext *ctx,
+									  Relation relation,
+									  const LogicalDecodePruneData *prune);
+
+/*
  * Output plugin callbacks
  */
 typedef struct OutputPluginCallbacks
@@ -223,6 +246,7 @@ typedef struct OutputPluginCallbacks
 	LogicalDecodeMessageCB message_cb;
 	LogicalDecodeFilterByOriginCB filter_by_origin_cb;
 	LogicalDecodeShutdownCB shutdown_cb;
+	LogicalDecodePruneCB prune_cb;
 
 	/* streaming of changes at prepare time */
 	LogicalDecodeFilterPrepareCB filter_prepare_cb;

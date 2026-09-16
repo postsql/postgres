@@ -1948,6 +1948,12 @@
   options => 'logical_decoding_expose_headers_options',
 },
 
+{ name => 'logical_decoding_prune_records', type => 'bool', context => 'PGC_USERSET', group => 'REPLICATION_SENDING',
+  short_desc => 'Enables retaining row-level prune information in WAL for logical decoding.',
+  variable => 'logical_decoding_prune_records',
+  boot_val => 'false',
+},
+
 { name => 'logical_decoding_work_mem', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
   short_desc => 'Sets the maximum memory to be used for logical decoding.',
   long_desc => 'This much memory can be used by each internal reorder buffer before spilling to disk.',

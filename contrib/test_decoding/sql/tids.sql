@@ -10,6 +10,11 @@ SET logical_decoding_expose_headers = 'tids';
 SHOW logical_decoding_expose_headers;
 SET logical_decoding_expose_headers = 'all';
 SHOW logical_decoding_expose_headers;
+SHOW logical_decoding_prune_records;
+SET logical_decoding_prune_records = on;
+SHOW logical_decoding_prune_records;
+SET logical_decoding_prune_records = off;
+SHOW logical_decoding_prune_records;
 
 -- 2. Setup slot
 SELECT 'init' FROM pg_create_logical_replication_slot('tid_slot', 'test_decoding');
@@ -113,7 +118,43 @@ INSERT INTO target_rowid_stored VALUES (1, 'one', '(0,1)'::tid);
 SELECT id, val, ".rowid" FROM target_rowid_stored;
 DROP TABLE target_rowid_stored;
 
--- 9. Cleanup
+-- 9. Prune records decoding
+SHOW full_page_writes;
+CREATE TABLE prune_test (id int PRIMARY KEY, val text);
+INSERT INTO prune_test SELECT g, 'val' || g FROM generate_series(1, 10) g;
+-- Consume insert changes
+SELECT count(*) FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL);
+
+-- 9a. Test prune decoding with logical_decoding_prune_records = on
+SET logical_decoding_prune_records = on;
+DELETE FROM prune_test WHERE id IN (2, 3, 4);
+-- Advance slot past delete so tuples become dead to vacuum
+SELECT count(*) FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL);
+VACUUM prune_test;
+CHECKPOINT;
+
+-- Prune records should be decoded with include-prunes = 1
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-prunes', '1') WHERE data LIKE '%PRUNE%';
+
+-- With include-prunes = 0 (default), prune records are not output
+DELETE FROM prune_test WHERE id IN (5, 6);
+SELECT count(*) FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL);
+VACUUM prune_test;
+CHECKPOINT;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-prunes', '0') WHERE data LIKE '%PRUNE%';
+
+-- 9b. Test prune with logical_decoding_prune_records = off
+SET logical_decoding_prune_records = off;
+DELETE FROM prune_test WHERE id IN (7, 8);
+SELECT count(*) FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL);
+CHECKPOINT;
+VACUUM prune_test;
+CHECKPOINT;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-prunes', '1') WHERE data LIKE '%PRUNE%';
+
+DROP TABLE prune_test;
+
+-- 10. Cleanup
 DROP TABLE tid_test;
 DROP TABLE tid_nopk;
 DROP TABLE tid_conflict;

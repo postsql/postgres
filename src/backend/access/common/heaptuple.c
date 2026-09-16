@@ -419,12 +419,11 @@ heap_fill_tuple_natts(TupleDesc tupleDesc,
 	uint8	   *bitP;
 	int			bitmask;
 	int			i;
-
-	Assert(numberOfAttributes <= tupleDesc->natts);
-
 #ifdef USE_ASSERT_CHECKING
 	char	   *start = data;
 #endif
+
+	Assert(numberOfAttributes <= tupleDesc->natts);
 
 	if (bit != NULL)
 	{

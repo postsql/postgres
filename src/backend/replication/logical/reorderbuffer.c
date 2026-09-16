@@ -3322,6 +3322,18 @@ ReorderBufferProcessXid(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn)
 }
 
 /*
+ * Dispatch a page prune event to the registered prune callback.
+ */
+void
+ReorderBufferProcessPrune(ReorderBuffer *rb, Relation relation,
+						  XLogRecPtr lsn, XLogRecPtr end_lsn,
+						  const struct LogicalDecodePruneData *prune)
+{
+	if (rb->prune)
+		rb->prune(rb, relation, lsn, end_lsn, prune);
+}
+
+/*
  * Add a new snapshot to this transaction that may only used after lsn 'lsn'
  * because the previous snapshot doesn't describe the catalog correctly for
  * following rows.

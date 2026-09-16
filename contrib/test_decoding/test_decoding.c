@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
 #include "catalog/pg_type.h"
 
 #include "replication/logical.h"
@@ -33,6 +34,7 @@ typedef struct
 	bool		include_xids;
 	bool		include_timestamp;
 	bool		include_tids;
+	bool		include_prunes;
 	bool		skip_empty_xacts;
 	bool		only_local;
 } TestDecodingData;
@@ -76,6 +78,9 @@ static void pg_decode_message(LogicalDecodingContext *ctx,
 							  ReorderBufferTXN *txn, XLogRecPtr lsn,
 							  bool transactional, const char *prefix,
 							  Size sz, const char *message);
+static void pg_decode_prune(LogicalDecodingContext *ctx,
+							Relation relation,
+							const LogicalDecodePruneData *prune);
 static bool pg_decode_filter_prepare(LogicalDecodingContext *ctx,
 									 TransactionId xid,
 									 const char *gid);
@@ -139,6 +144,7 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->filter_by_origin_cb = pg_decode_filter;
 	cb->shutdown_cb = pg_decode_shutdown;
 	cb->message_cb = pg_decode_message;
+	cb->prune_cb = pg_decode_prune;
 	cb->filter_prepare_cb = pg_decode_filter_prepare;
 	cb->begin_prepare_cb = pg_decode_begin_prepare_txn;
 	cb->prepare_cb = pg_decode_prepare_txn;
@@ -210,6 +216,16 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 			if (elem->arg == NULL)
 				data->include_tids = true;
 			else if (!parse_bool(strVal(elem->arg), &data->include_tids))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+								strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-prunes") == 0)
+		{
+			if (elem->arg == NULL)
+				data->include_prunes = true;
+			else if (!parse_bool(strVal(elem->arg), &data->include_prunes))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -792,6 +808,88 @@ pg_decode_message(LogicalDecodingContext *ctx,
 	appendStringInfo(ctx->out, "message: transactional: %d prefix: %s, sz: %zu content:",
 					 transactional, prefix, sz);
 	appendBinaryStringInfo(ctx->out, message, sz);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_prune(LogicalDecodingContext *ctx, Relation relation,
+				const LogicalDecodePruneData *prune)
+{
+	TestDecodingData *data = ctx->output_plugin_private;
+	Form_pg_class class_form;
+	MemoryContext old;
+	const char *reason_str;
+	int			i;
+
+	if (!data->include_prunes)
+		return;
+
+	class_form = RelationGetForm(relation);
+
+	switch (prune->reason)
+	{
+		case XLOG_HEAP2_PRUNE_ON_ACCESS:
+			reason_str = "on-access";
+			break;
+		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
+			reason_str = "vacuum-scan";
+			break;
+		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
+			reason_str = "vacuum-cleanup";
+			break;
+		default:
+			reason_str = "unknown";
+			break;
+	}
+
+	/* Avoid leaking memory by using and resetting our own context */
+	old = MemoryContextSwitchTo(data->context);
+
+	OutputPluginPrepareWrite(ctx, true);
+
+	appendStringInfo(ctx->out, "table %s: PRUNE (%s) blk %u",
+					 quote_qualified_identifier(get_namespace_name(get_rel_namespace(RelationGetRelid(relation))),
+												class_form->relrewrite ?
+												get_rel_name(class_form->relrewrite) :
+												NameStr(class_form->relname)),
+					 reason_str,
+					 prune->blkno);
+
+	if (!prune->has_row_info)
+	{
+		appendStringInfoString(ctx->out, ": (no-row-info)");
+	}
+	else
+	{
+		if (prune->ndead > 0)
+		{
+			appendStringInfoString(ctx->out, " dead:");
+			for (i = 0; i < prune->ndead; i++)
+				appendStringInfo(ctx->out, " (%u,%u)", prune->blkno, prune->nowdead[i]);
+		}
+		if (prune->nunused > 0)
+		{
+			appendStringInfoString(ctx->out, " unused:");
+			for (i = 0; i < prune->nunused; i++)
+				appendStringInfo(ctx->out, " (%u,%u)", prune->blkno, prune->nowunused[i]);
+		}
+		if (prune->nredirected > 0)
+		{
+			appendStringInfoString(ctx->out, " redirected:");
+			for (i = 0; i < prune->nredirected; i++)
+				appendStringInfo(ctx->out, " (%u,%u)->(%u,%u)",
+								 prune->blkno, prune->redirected[i * 2],
+								 prune->blkno, prune->redirected[i * 2 + 1]);
+		}
+		if (prune->ndead <= 0 && prune->nunused <= 0 && prune->nredirected <= 0)
+		{
+			appendStringInfoString(ctx->out, " (no-pruned-items)");
+		}
+	}
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(data->context);
+
 	OutputPluginWrite(ctx, true);
 }
 

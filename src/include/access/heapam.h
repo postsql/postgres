@@ -464,6 +464,8 @@ extern void log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 									  OffsetNumber *dead, int ndead,
 									  OffsetNumber *unused, int nunused);
 
+extern PGDLLIMPORT bool logical_decoding_prune_records;
+
 /* in heap/vacuumlazy.c */
 extern void heap_vacuum_rel(Relation rel,
 							const VacuumParams *params, BufferAccessStrategy bstrategy);
