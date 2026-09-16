@@ -26,7 +26,7 @@
 /* GUC variables */
 extern PGDLLIMPORT int logical_decoding_work_mem;
 extern PGDLLIMPORT int debug_logical_replication_streaming;
-extern PGDLLIMPORT int logical_decoding_expose_headers;
+extern PGDLLIMPORT bool logical_decoding_expose_headers;
 extern PGDLLIMPORT bool logical_decoding_prune_records;
 
 /* possible values for debug_logical_replication_streaming */
@@ -35,14 +35,6 @@ typedef enum
 	DEBUG_LOGICAL_REP_STREAMING_BUFFERED,
 	DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE,
 }			DebugLogicalRepStreamingMode;
-
-/* possible values for logical_decoding_expose_headers */
-typedef enum
-{
-	LOGICAL_DECODING_EXPOSE_HEADERS_NONE = 0,
-	LOGICAL_DECODING_EXPOSE_HEADERS_TIDS = 1,
-	LOGICAL_DECODING_EXPOSE_HEADERS_ALL = 2,
-}			LogicalDecodingExposeHeadersOption;
 
 /*
  * Types of the change passed to a 'change' callback.

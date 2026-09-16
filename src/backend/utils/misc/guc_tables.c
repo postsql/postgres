@@ -445,12 +445,6 @@ static const struct config_enum_entry debug_logical_replication_streaming_option
 	{NULL, 0, false}
 };
 
-static const struct config_enum_entry logical_decoding_expose_headers_options[] = {
-	{"none", LOGICAL_DECODING_EXPOSE_HEADERS_NONE, false},
-	{"tids", LOGICAL_DECODING_EXPOSE_HEADERS_TIDS, false},
-	{"all", LOGICAL_DECODING_EXPOSE_HEADERS_ALL, false},
-	{NULL, 0, false}
-};
 
 StaticAssertDecl(lengthof(ssl_protocol_versions_info) == (PG_TLS1_3_VERSION + 2),
 				 "array length mismatch");

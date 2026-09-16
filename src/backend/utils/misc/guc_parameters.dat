@@ -1941,11 +1941,10 @@
   boot_val => 'false',
 },
 
-{ name => 'logical_decoding_expose_headers', type => 'enum', context => 'PGC_USERSET', group => 'REPLICATION_SENDING',
+{ name => 'logical_decoding_expose_headers', type => 'bool', context => 'PGC_USERSET', group => 'REPLICATION_SENDING',
   short_desc => 'Exposes tuple identifiers (TIDs) and tuple header metadata during logical decoding.',
   variable => 'logical_decoding_expose_headers',
-  boot_val => 'LOGICAL_DECODING_EXPOSE_HEADERS_NONE',
-  options => 'logical_decoding_expose_headers_options',
+  boot_val => 'false',
 },
 
 { name => 'logical_decoding_prune_records', type => 'bool', context => 'PGC_USERSET', group => 'REPLICATION_SENDING',

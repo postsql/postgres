@@ -912,6 +912,25 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 }
 
 /*
+ * Helpers to set tuple identifiers (TIDs) on changes and their associated tuples.
+ */
+static inline void
+ReorderBufferChangeSetNewTid(ReorderBufferChange *change, BlockNumber blk, OffsetNumber off)
+{
+	ItemPointerSet(&change->data.tp.new_tid, blk, off);
+	if (change->data.tp.newtuple)
+		change->data.tp.newtuple->t_self = change->data.tp.new_tid;
+}
+
+static inline void
+ReorderBufferChangeSetOldTid(ReorderBufferChange *change, BlockNumber blk, OffsetNumber off)
+{
+	ItemPointerSet(&change->data.tp.old_tid, blk, off);
+	if (change->data.tp.oldtuple)
+		change->data.tp.oldtuple->t_self = change->data.tp.old_tid;
+}
+
+/*
  * Parse XLOG_HEAP_INSERT (not MULTI_INSERT!) records into tuplebufs.
  *
  * Inserts can contain the new tuple.
@@ -926,6 +945,7 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	xl_heap_insert *xlrec;
 	ReorderBufferChange *change;
 	RelFileLocator target_locator;
+	BlockNumber blk;
 
 	xlrec = (xl_heap_insert *) XLogRecGetData(r);
 
@@ -937,7 +957,7 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &blk);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -962,14 +982,8 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	DecodeXLogTuple(tupledata, datalen, change->data.tp.newtuple);
 
-	if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
-	{
-		BlockNumber blk;
-
-		XLogRecGetBlockTag(r, 0, NULL, NULL, &blk);
-		ItemPointerSet(&change->data.tp.new_tid, blk, xlrec->offnum);
-		change->data.tp.newtuple->t_self = change->data.tp.new_tid;
-	}
+	if (logical_decoding_expose_headers)
+		ReorderBufferChangeSetNewTid(change, blk, xlrec->offnum);
 
 	change->data.tp.clear_toast_afterwards = true;
 
@@ -992,11 +1006,12 @@ DecodeUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	ReorderBufferChange *change;
 	char	   *data;
 	RelFileLocator target_locator;
+	BlockNumber newblk;
 
 	xlrec = (xl_heap_update *) XLogRecGetData(r);
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &newblk);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -1040,23 +1055,17 @@ DecodeUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		DecodeXLogTuple(data, datalen, change->data.tp.oldtuple);
 	}
 
-	if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
+	if (logical_decoding_expose_headers)
 	{
-		BlockNumber newblk,
-					oldblk;
+		BlockNumber oldblk;
 
-		XLogRecGetBlockTag(r, 0, NULL, NULL, &newblk);
 		if (XLogRecHasBlockRef(r, 1))
 			XLogRecGetBlockTag(r, 1, NULL, NULL, &oldblk);
 		else
 			oldblk = newblk;
 
-		ItemPointerSet(&change->data.tp.old_tid, oldblk, xlrec->old_offnum);
-		ItemPointerSet(&change->data.tp.new_tid, newblk, xlrec->new_offnum);
-		if (change->data.tp.oldtuple)
-			change->data.tp.oldtuple->t_self = change->data.tp.old_tid;
-		if (change->data.tp.newtuple)
-			change->data.tp.newtuple->t_self = change->data.tp.new_tid;
+		ReorderBufferChangeSetOldTid(change, oldblk, xlrec->old_offnum);
+		ReorderBufferChangeSetNewTid(change, newblk, xlrec->new_offnum);
 	}
 
 	change->data.tp.clear_toast_afterwards = true;
@@ -1077,6 +1086,7 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	xl_heap_delete *xlrec;
 	ReorderBufferChange *change;
 	RelFileLocator target_locator;
+	BlockNumber blk;
 
 	xlrec = (xl_heap_delete *) XLogRecGetData(r);
 
@@ -1090,7 +1100,7 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &blk);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -1124,15 +1134,8 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 						datalen, change->data.tp.oldtuple);
 	}
 
-	if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
-	{
-		BlockNumber blk;
-
-		XLogRecGetBlockTag(r, 0, NULL, NULL, &blk);
-		ItemPointerSet(&change->data.tp.old_tid, blk, xlrec->offnum);
-		if (change->data.tp.oldtuple)
-			change->data.tp.oldtuple->t_self = change->data.tp.old_tid;
-	}
+	if (logical_decoding_expose_headers)
+		ReorderBufferChangeSetOldTid(change, blk, xlrec->offnum);
 
 	change->data.tp.clear_toast_afterwards = true;
 
@@ -1191,6 +1194,8 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	char	   *tupledata;
 	Size		tuplelen;
 	RelFileLocator rlocator;
+	BlockNumber blk;
+	bool		isinit = false;
 
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(r);
 
@@ -1202,13 +1207,16 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &rlocator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &rlocator, NULL, &blk);
 	if (rlocator.dbOid != ctx->slot->data.database)
 		return;
 
 	/* output plugin doesn't look for this origin, no need to queue */
 	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
 		return;
+
+	if (logical_decoding_expose_headers)
+		isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
 
 	/*
 	 * We know that this multi_insert isn't for a catalog, so the block should
@@ -1259,16 +1267,11 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		header->t_infomask2 = xlhdr->t_infomask2;
 		header->t_hoff = xlhdr->t_hoff;
 
-		if (logical_decoding_expose_headers >= LOGICAL_DECODING_EXPOSE_HEADERS_TIDS)
+		if (logical_decoding_expose_headers)
 		{
-			BlockNumber blk;
-			OffsetNumber offnum;
-			bool		isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
+			OffsetNumber offnum = isinit ? (FirstOffsetNumber + i) : xlrec->offsets[i];
 
-			XLogRecGetBlockTag(r, 0, NULL, NULL, &blk);
-			offnum = isinit ? (FirstOffsetNumber + i) : xlrec->offsets[i];
-			ItemPointerSet(&change->data.tp.new_tid, blk, offnum);
-			tuple->t_self = change->data.tp.new_tid;
+			ReorderBufferChangeSetNewTid(change, blk, offnum);
 		}
 
 		/*

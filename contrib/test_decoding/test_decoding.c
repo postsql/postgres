@@ -623,6 +623,15 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 	}
 }
 
+static inline void
+append_tid(StringInfo str, const char *label, const ItemPointer tid)
+{
+	if (ItemPointerIsValid(tid))
+		appendStringInfo(str, " %s: (%u,%u)", label,
+						 ItemPointerGetBlockNumberNoCheck(tid),
+						 ItemPointerGetOffsetNumberNoCheck(tid));
+}
+
 /*
  * callback for individual changed tuples
  */
@@ -666,10 +675,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
 			appendStringInfoString(ctx->out, " INSERT:");
-			if (data->include_tids && ItemPointerIsValid(&change->data.tp.new_tid))
-				appendStringInfo(ctx->out, " new-tid: (%u,%u)",
-								 ItemPointerGetBlockNumberNoCheck(&change->data.tp.new_tid),
-								 ItemPointerGetOffsetNumberNoCheck(&change->data.tp.new_tid));
+			if (data->include_tids)
+				append_tid(ctx->out, "new-tid", &change->data.tp.new_tid);
 			if (change->data.tp.newtuple == NULL)
 				appendStringInfoString(ctx->out, " (no-tuple-data)");
 			else
@@ -681,14 +688,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			appendStringInfoString(ctx->out, " UPDATE:");
 			if (data->include_tids)
 			{
-				if (ItemPointerIsValid(&change->data.tp.old_tid))
-					appendStringInfo(ctx->out, " old-tid: (%u,%u)",
-									 ItemPointerGetBlockNumberNoCheck(&change->data.tp.old_tid),
-									 ItemPointerGetOffsetNumberNoCheck(&change->data.tp.old_tid));
-				if (ItemPointerIsValid(&change->data.tp.new_tid))
-					appendStringInfo(ctx->out, " new-tid: (%u,%u)",
-									 ItemPointerGetBlockNumberNoCheck(&change->data.tp.new_tid),
-									 ItemPointerGetOffsetNumberNoCheck(&change->data.tp.new_tid));
+				append_tid(ctx->out, "old-tid", &change->data.tp.old_tid);
+				append_tid(ctx->out, "new-tid", &change->data.tp.new_tid);
 			}
 			if (change->data.tp.oldtuple != NULL)
 			{
@@ -708,10 +709,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			appendStringInfoString(ctx->out, " DELETE:");
-			if (data->include_tids && ItemPointerIsValid(&change->data.tp.old_tid))
-				appendStringInfo(ctx->out, " old-tid: (%u,%u)",
-								 ItemPointerGetBlockNumberNoCheck(&change->data.tp.old_tid),
-								 ItemPointerGetOffsetNumberNoCheck(&change->data.tp.old_tid));
+			if (data->include_tids)
+				append_tid(ctx->out, "old-tid", &change->data.tp.old_tid);
 
 			/* if there was no PK, we only know that a delete happened */
 			if (change->data.tp.oldtuple == NULL)

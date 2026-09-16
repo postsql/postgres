@@ -4,11 +4,9 @@ SET synchronous_commit = on;
 -- 1. Test GUC values
 SHOW logical_decoding_expose_headers;
 SET logical_decoding_expose_headers = 'invalid'; -- should fail
-SET logical_decoding_expose_headers = 'none';
+SET logical_decoding_expose_headers = on;
 SHOW logical_decoding_expose_headers;
-SET logical_decoding_expose_headers = 'tids';
-SHOW logical_decoding_expose_headers;
-SET logical_decoding_expose_headers = 'all';
+SET logical_decoding_expose_headers = off;
 SHOW logical_decoding_expose_headers;
 SHOW logical_decoding_prune_records;
 SET logical_decoding_prune_records = on;
@@ -21,13 +19,13 @@ SELECT 'init' FROM pg_create_logical_replication_slot('tid_slot', 'test_decoding
 
 CREATE TABLE tid_test (id int PRIMARY KEY, val text);
 
--- 3. With GUC = none, include-tids should not expose any TIDs
-SET logical_decoding_expose_headers = 'none';
+-- 3. With GUC = off, include-tids should not expose any TIDs
+SET logical_decoding_expose_headers = off;
 INSERT INTO tid_test VALUES (1, 'one');
 SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
 
--- 4. With GUC = tids
-SET logical_decoding_expose_headers = 'tids';
+-- 4. With GUC = on
+SET logical_decoding_expose_headers = on;
 
 -- Single insert
 INSERT INTO tid_test VALUES (2, 'two');

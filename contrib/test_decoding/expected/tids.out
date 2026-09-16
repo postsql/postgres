@@ -4,31 +4,23 @@ SET synchronous_commit = on;
 SHOW logical_decoding_expose_headers;
  logical_decoding_expose_headers 
 ---------------------------------
- none
+ off
 (1 row)
 
 SET logical_decoding_expose_headers = 'invalid'; -- should fail
-ERROR:  invalid value for parameter "logical_decoding_expose_headers": "invalid"
-HINT:  Available values: none, tids, all.
-SET logical_decoding_expose_headers = 'none';
+ERROR:  parameter "logical_decoding_expose_headers" requires a Boolean value
+SET logical_decoding_expose_headers = on;
 SHOW logical_decoding_expose_headers;
  logical_decoding_expose_headers 
 ---------------------------------
- none
+ on
 (1 row)
 
-SET logical_decoding_expose_headers = 'tids';
+SET logical_decoding_expose_headers = off;
 SHOW logical_decoding_expose_headers;
  logical_decoding_expose_headers 
 ---------------------------------
- tids
-(1 row)
-
-SET logical_decoding_expose_headers = 'all';
-SHOW logical_decoding_expose_headers;
- logical_decoding_expose_headers 
----------------------------------
- all
+ off
 (1 row)
 
 SHOW logical_decoding_prune_records;
@@ -59,8 +51,8 @@ SELECT 'init' FROM pg_create_logical_replication_slot('tid_slot', 'test_decoding
 (1 row)
 
 CREATE TABLE tid_test (id int PRIMARY KEY, val text);
--- 3. With GUC = none, include-tids should not expose any TIDs
-SET logical_decoding_expose_headers = 'none';
+-- 3. With GUC = off, include-tids should not expose any TIDs
+SET logical_decoding_expose_headers = off;
 INSERT INTO tid_test VALUES (1, 'one');
 SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
                              data                             
@@ -72,8 +64,8 @@ SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xi
  COMMIT
 (5 rows)
 
--- 4. With GUC = tids
-SET logical_decoding_expose_headers = 'tids';
+-- 4. With GUC = on
+SET logical_decoding_expose_headers = on;
 -- Single insert
 INSERT INTO tid_test VALUES (2, 'two');
 SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
