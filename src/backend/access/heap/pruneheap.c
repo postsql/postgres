@@ -18,6 +18,7 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/toast_internals.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
@@ -319,6 +320,10 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 	minfree = RelationGetTargetPageFreeSpace(relation,
 											 HEAP_DEFAULT_FILLFACTOR);
 	minfree = Max(minfree, BLCKSZ / 10);
+	if (!rel_read_only &&
+		relation->rd_rel->relkind == RELKIND_TOASTVALUE &&
+		RelationGetDirectToastSelfPrune(relation))
+		minfree = BLCKSZ;
 
 	if (PageIsFull(page) || PageGetHeapFreeSpace(page) < minfree)
 	{
@@ -391,9 +396,15 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 			 * skip the page and not update the free space map (FSM) for it.
 			 * Keep the FSM from going stale by recording it now. We do not
 			 * want to update the freespace map otherwise, to reserve
-			 * freespace on this page for HOT updates.
+			 * freespace on this page for HOT updates (except on TOAST tables
+			 * with direct_toast_self_prune enabled, where HOT updates never
+			 * occur and unindexed Direct TOAST tuples are reclaimed directly
+			 * to LP_UNUSED).
 			 */
-			if (presult.newly_all_visible)
+			if (presult.newly_all_visible ||
+				(relation->rd_rel->relkind == RELKIND_TOASTVALUE &&
+				 presult.ndeleted > presult.nnewlpdead &&
+				 RelationGetDirectToastSelfPrune(relation)))
 			{
 				record_free_space = true;
 				freespace = PageGetHeapFreeSpace(page);

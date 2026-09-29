@@ -24,12 +24,15 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
+#include "storage/freespace.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/array.h"
 
 int			toast_flavour = TOAST_FLAVOUR_PLAIN;
+bool		direct_toast_self_prune = true;
+uint64		direct_toast_delete_count = 0;
 
 /*
  * Direct TOAST chunk organization parameters:
@@ -1086,6 +1089,7 @@ toast_delete_datum_direct(Relation rel, Datum value, bool is_speculative)
 	toastrel = table_open(toast_pointer.va_toastrelid, RowExclusiveLock);
 
 	toast_delete_datum_direct_recursive(toastrel, &toast_pointer.va_tid, is_speculative);
+	direct_toast_delete_count++;
 
 	table_close(toastrel, NoLock);
 }
@@ -1150,5 +1154,10 @@ toast_delete_datum_direct_recursive(Relation toastrel, ItemPointer tid, bool is_
 	if (is_speculative)
 		heap_abort_speculative(toastrel, tid);
 	else
+	{
 		simple_heap_delete(toastrel, tid);
+		if (RelationGetDirectToastSelfPrune(toastrel))
+			RecordPageWithFreeSpace(toastrel, ItemPointerGetBlockNumber(tid),
+									BLCKSZ - SizeOfPageHeaderData);
+	}
 }

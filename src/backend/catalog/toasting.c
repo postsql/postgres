@@ -16,6 +16,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/reloptions.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
@@ -328,6 +329,31 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	/* It's mapped if and only if its parent is, too */
 	mapped_relation = RelationIsMapped(rel);
 
+	/*
+	 * If direct_toast_self_prune was set on the main table and not overridden
+	 * with a toast. prefix, propagate it to the TOAST table's reloptions so
+	 * RelationGetDirectToastSelfPrune(toastrel) sees it directly.
+	 */
+	if (rel->rd_options &&
+		((StdRdOptions *) rel->rd_options)->direct_toast_self_prune != PG_TERNARY_UNSET)
+	{
+		StdRdOptions *topts = (StdRdOptions *) heap_reloptions(RELKIND_TOASTVALUE, reloptions, false);
+
+		if (topts == NULL || topts->direct_toast_self_prune == PG_TERNARY_UNSET)
+		{
+			const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
+			bool		val = (((StdRdOptions *) rel->rd_options)->direct_toast_self_prune == PG_TERNARY_TRUE);
+			DefElem    *def = makeDefElem("direct_toast_self_prune",
+										  (Node *) makeBoolean(val), -1);
+
+			def->defnamespace = pstrdup("toast");
+			reloptions = transformRelOptions(reloptions, list_make1(def),
+											 "toast", validnsps, false, false);
+		}
+		if (topts)
+			pfree(topts);
+	}
+
 	toast_relid = heap_create_with_catalog(toast_relname,
 										   namespaceid,
 										   rel->rd_rel->reltablespace,
@@ -383,7 +409,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	{
 		NullTest   *ntest = makeNode(NullTest);
 
-		ntest->arg = (Expr *) makeVar(1, 1, OIDOID, -1, InvalidOid, 0);
+		ntest->arg = (Expr *) makeVar(1, 1, toast_chunkid_typid, -1, InvalidOid, 0);
 		ntest->nulltesttype = IS_NOT_NULL;
 		ntest->argisrow = false;
 		ntest->location = -1;
@@ -652,13 +678,14 @@ ensure_direct_toast(Oid relid)
 				bool		replaces[Natts_pg_index];
 				NullTest   *ntest;
 				char	   *pred_str;
+				Oid			chunkid_typid = TupleDescAttr(toastrel->rd_att, 0)->atttypid;
 
 				memset(values, 0, sizeof(values));
 				memset(nulls, 0, sizeof(nulls));
 				memset(replaces, 0, sizeof(replaces));
 
 				ntest = makeNode(NullTest);
-				ntest->arg = (Expr *) makeVar(1, 1, OIDOID, -1, InvalidOid, 0);
+				ntest->arg = (Expr *) makeVar(1, 1, chunkid_typid, -1, InvalidOid, 0);
 				ntest->nulltesttype = IS_NOT_NULL;
 				ntest->argisrow = false;
 				ntest->location = -1;

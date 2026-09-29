@@ -258,6 +258,7 @@ typedef struct RelationData
 	 * relcache build time, so as to save on syscache lookups.
 	 */
 	Oid			rd_toastchunkidtype;
+	BlockNumber rd_toast_prune_hand;	/* clock hand for Direct TOAST self-pruning */
 
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
@@ -384,6 +385,7 @@ typedef struct StdRdOptions
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
 	ToastFlavour toast_flavour;
+	pg_ternary	direct_toast_self_prune;
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
