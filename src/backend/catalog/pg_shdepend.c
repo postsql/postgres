@@ -27,6 +27,8 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_encoding_context.h"
+#include "catalog/pg_encoding_type.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -1741,6 +1743,8 @@ shdepReassignOwned_Owner(Form_pg_shdepend sdepForm, Oid newrole)
 		case DatabaseRelationId:
 		case TSConfigRelationId:
 		case TSDictionaryRelationId:
+		case EncodingTypeRelationId:
+		case EncodingContextRelationId:
 			AlterObjectOwner_internal(sdepForm->classid,
 									  sdepForm->objid,
 									  newrole);

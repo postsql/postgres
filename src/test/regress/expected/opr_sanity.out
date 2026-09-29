@@ -309,8 +309,8 @@ WHERE p1.prorettype IN
      'anyrange'::regtype = ANY (p1.proargtypes) OR
      'anymultirange'::regtype = ANY (p1.proargtypes))
 ORDER BY 2;
- oid  |    proname     
-------+----------------
+ oid  |        proname         
+------+------------------------
  2296 | anyarray_in
  2502 | anyarray_recv
  2312 | anyelement_in
@@ -320,7 +320,9 @@ ORDER BY 2;
  2400 | array_recv
  3506 | enum_in
  3532 | enum_recv
-(9 rows)
+ 9454 | pg_bytea_dict_decode
+ 9456 | pg_pglz_context_decode
+(11 rows)
 
 -- anyrange and anymultirange are tighter than the rest, can only resolve
 -- from each other

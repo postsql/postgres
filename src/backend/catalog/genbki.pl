@@ -258,6 +258,20 @@ foreach my $row (@{ $catalog_data{pg_collation} })
 	$collationoids{ $row->{collname} } = $row->{oid};
 }
 
+# encoding type OID lookup
+my %enctypeoids;
+foreach my $row (@{ $catalog_data{pg_encoding_type} })
+{
+	$enctypeoids{ $row->{enctypname} } = $row->{oid};
+}
+
+# encoding context OID lookup
+my %ectxoids;
+foreach my $row (@{ $catalog_data{pg_encoding_context} })
+{
+	$ectxoids{ $row->{ectxname} } = $row->{oid};
+}
+
 # language OID lookup
 my %langoids;
 foreach my $row (@{ $catalog_data{pg_language} })
@@ -417,6 +431,8 @@ my %lookup_kind = (
 	pg_authid => \%authidoids,
 	pg_class => \%classoids,
 	pg_collation => \%collationoids,
+	pg_encoding_type => \%enctypeoids,
+	pg_encoding_context => \%ectxoids,
 	pg_language => \%langoids,
 	pg_namespace => \%namespaceoids,
 	pg_opclass => \%opcoids,

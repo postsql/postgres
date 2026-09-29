@@ -4,6 +4,7 @@ backend_sources += files(
   'attmap.c',
   'bufmask.c',
   'detoast.c',
+  'encoding_context.c',
   'heaptuple.c',
   'indextuple.c',
   'printsimple.c',

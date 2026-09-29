@@ -16,6 +16,7 @@ OBJS = \
 	attmap.o \
 	bufmask.o \
 	detoast.o \
+	encoding_context.o \
 	heaptuple.o \
 	indextuple.o \
 	printsimple.o \
