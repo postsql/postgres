@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/encoding_context.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -37,6 +38,8 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_encoding_context.h"
+#include "catalog/pg_encoding_type.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -1458,6 +1461,14 @@ doDeletion(const ObjectAddress *object, int flags)
 
 		case PublicationRelationId:
 			RemovePublicationById(object->objectId);
+			break;
+
+		case EncodingTypeRelationId:
+			RemoveEncodingTypeById(object->objectId);
+			break;
+
+		case EncodingContextRelationId:
+			RemoveEncodingContextById(object->objectId);
 			break;
 
 		case CastRelationId:

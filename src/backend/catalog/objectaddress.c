@@ -33,6 +33,8 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_encoding_context.h"
+#include "catalog/pg_encoding_type.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -636,6 +638,34 @@ static const ObjectPropertyType ObjectProperty[] =
 		OBJECT_USER_MAPPING,
 		false
 	},
+	{
+		"encoding type",
+		EncodingTypeRelationId,
+		EncodingTypeObjectIdIndexId,
+		ENCODINGTYPEOID,
+		ENCODINGTYPENAMENSP,
+		Anum_pg_encoding_type_oid,
+		Anum_pg_encoding_type_enctypname,
+		Anum_pg_encoding_type_enctypnamespace,
+		Anum_pg_encoding_type_enctypowner,
+		InvalidAttrNumber,
+		-1,
+		true
+	},
+	{
+		"encoding context",
+		EncodingContextRelationId,
+		EncodingContextObjectIdIndexId,
+		ENCODINGCONTEXTOID,
+		ENCODINGCONTEXTNAMENSP,
+		Anum_pg_encoding_context_oid,
+		Anum_pg_encoding_context_ectxname,
+		Anum_pg_encoding_context_ectxnamespace,
+		Anum_pg_encoding_context_ectxowner,
+		InvalidAttrNumber,
+		-1,
+		true
+	},
 };
 
 /*
@@ -834,6 +864,12 @@ static const struct object_type_map
 	},
 	{
 		"statistics object", OBJECT_STATISTIC_EXT
+	},
+	{
+		"encoding type", -1		/* unmapped */
+	},
+	{
+		"encoding context", -1	/* unmapped */
 	}
 };
 
@@ -3602,6 +3638,48 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case EncodingTypeRelationId:
+			{
+				HeapTuple	tup;
+				Form_pg_encoding_type typForm;
+
+				tup = SearchSysCache1(ENCODINGTYPEOID,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for encoding type %u",
+							 object->objectId);
+					break;
+				}
+				typForm = (Form_pg_encoding_type) GETSTRUCT(tup);
+				appendStringInfo(&buffer, _("encoding type %s"),
+								 NameStr(typForm->enctypname));
+				ReleaseSysCache(tup);
+				break;
+			}
+
+		case EncodingContextRelationId:
+			{
+				HeapTuple	tup;
+				Form_pg_encoding_context ctxForm;
+
+				tup = SearchSysCache1(ENCODINGCONTEXTOID,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for encoding context %u",
+							 object->objectId);
+					break;
+				}
+				ctxForm = (Form_pg_encoding_context) GETSTRUCT(tup);
+				appendStringInfo(&buffer, _("encoding context %s"),
+								 NameStr(ctxForm->ectxname));
+				ReleaseSysCache(tup);
+				break;
+			}
+
 		case TSTemplateRelationId:
 			{
 				HeapTuple	tup;
@@ -4658,6 +4736,14 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 			appendStringInfoString(&buffer, "text search configuration");
 			break;
 
+		case EncodingTypeRelationId:
+			appendStringInfoString(&buffer, "encoding type");
+			break;
+
+		case EncodingContextRelationId:
+			appendStringInfoString(&buffer, "encoding context");
+			break;
+
 		case AuthIdRelationId:
 			appendStringInfoString(&buffer, "role");
 			break;
@@ -5572,6 +5658,60 @@ getObjectIdentityParts(const ObjectAddress *object,
 				if (objname)
 					*objname = list_make2(schema,
 										  pstrdup(NameStr(formDict->dictname)));
+				ReleaseSysCache(tup);
+				break;
+			}
+
+		case EncodingTypeRelationId:
+			{
+				HeapTuple	tup;
+				Form_pg_encoding_type formTyp;
+				char	   *schema;
+
+				tup = SearchSysCache1(ENCODINGTYPEOID,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for encoding type %u",
+							 object->objectId);
+					break;
+				}
+				formTyp = (Form_pg_encoding_type) GETSTRUCT(tup);
+				schema = get_namespace_name_or_temp(formTyp->enctypnamespace);
+				appendStringInfoString(&buffer,
+									   quote_qualified_identifier(schema,
+																  NameStr(formTyp->enctypname)));
+				if (objname)
+					*objname = list_make2(schema,
+										  pstrdup(NameStr(formTyp->enctypname)));
+				ReleaseSysCache(tup);
+				break;
+			}
+
+		case EncodingContextRelationId:
+			{
+				HeapTuple	tup;
+				Form_pg_encoding_context formCtx;
+				char	   *schema;
+
+				tup = SearchSysCache1(ENCODINGCONTEXTOID,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for encoding context %u",
+							 object->objectId);
+					break;
+				}
+				formCtx = (Form_pg_encoding_context) GETSTRUCT(tup);
+				schema = get_namespace_name_or_temp(formCtx->ectxnamespace);
+				appendStringInfoString(&buffer,
+									   quote_qualified_identifier(schema,
+																  NameStr(formCtx->ectxname)));
+				if (objname)
+					*objname = list_make2(schema,
+										  pstrdup(NameStr(formCtx->ectxname)));
 				ReleaseSysCache(tup);
 				break;
 			}
