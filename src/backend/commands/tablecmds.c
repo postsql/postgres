@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/attmap.h"
+#include "access/encoding_context.h"
 #include "access/genam.h"
 #include "access/gist.h"
 #include "access/heapam.h"
@@ -547,6 +548,8 @@ static ObjectAddress ATExecSetOptions(Relation rel, const char *colName,
 									  Node *options, bool isReset, LOCKMODE lockmode);
 static ObjectAddress ATExecSetStorage(Relation rel, const char *colName,
 									  Node *newValue, LOCKMODE lockmode);
+static ObjectAddress ATExecSetEncodingContext(Relation rel, const char *column,
+											  Node *newValue, LOCKMODE lockmode);
 static void ATPrepDropColumn(List **wqueue, Relation rel, bool recurse, bool recursing,
 							 AlterTableCmd *cmd, LOCKMODE lockmode,
 							 AlterTableUtilityContext *context);
@@ -4773,6 +4776,7 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_SetExpression:
 			case AT_DropExpression:
 			case AT_SetCompression:
+			case AT_SetEncodingContext:
 				cmd_lockmode = AccessExclusiveLock;
 				break;
 
@@ -5121,6 +5125,7 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			pass = AT_PASS_MISC;
 			break;
 		case AT_SetCompression: /* ALTER COLUMN SET COMPRESSION */
+		case AT_SetEncodingContext: /* ALTER COLUMN SET ENCODING CONTEXT */
 			ATSimplePermissions(cmd->subtype, rel,
 								ATT_TABLE | ATT_PARTITIONED_TABLE | ATT_MATVIEW);
 			/* This command never recurses */
@@ -5507,6 +5512,10 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 		case AT_SetCompression: /* ALTER COLUMN SET COMPRESSION */
 			address = ATExecSetCompression(rel, cmd->name, cmd->def,
 										   lockmode);
+			break;
+		case AT_SetEncodingContext: /* ALTER COLUMN SET ENCODING CONTEXT */
+			address = ATExecSetEncodingContext(rel, cmd->name, cmd->def,
+											   lockmode);
 			break;
 		case AT_DropColumn:		/* DROP COLUMN */
 			address = ATExecDropColumn(wqueue, rel, cmd->name,
@@ -6693,6 +6702,8 @@ alter_table_type_to_string(AlterTableType cmdtype)
 			return "ALTER COLUMN ... SET STORAGE";
 		case AT_SetCompression:
 			return "ALTER COLUMN ... SET COMPRESSION";
+		case AT_SetEncodingContext:
+			return "ALTER COLUMN ... SET ENCODING CONTEXT";
 		case AT_DropColumn:
 			return "DROP COLUMN";
 		case AT_AddIndex:
@@ -19536,6 +19547,54 @@ ATExecSetCompression(Relation rel,
 
 	/* make changes visible */
 	CommandCounterIncrement();
+
+	ObjectAddressSubSet(address, RelationRelationId,
+						RelationGetRelid(rel), attnum);
+	return address;
+}
+
+/*
+ * ALTER TABLE ALTER COLUMN SET/DROP ENCODING CONTEXT
+ *
+ * Return value is the address of the modified column
+ */
+static ObjectAddress
+ATExecSetEncodingContext(Relation rel,
+						 const char *column,
+						 Node *newValue,
+						 LOCKMODE lockmode)
+{
+	HeapTuple	tuple;
+	Form_pg_attribute atttableform;
+	AttrNumber	attnum;
+	Oid			context_id = InvalidOid;
+	ObjectAddress address;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to set column encoding context")));
+
+	tuple = SearchSysCacheAttName(RelationGetRelid(rel), column);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+						column, RelationGetRelationName(rel))));
+
+	atttableform = (Form_pg_attribute) GETSTRUCT(tuple);
+	attnum = atttableform->attnum;
+	ReleaseSysCache(tuple);
+
+	if (attnum <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot alter system column \"%s\"", column)));
+
+	if (newValue != NULL)
+		context_id = get_encoding_context_oid(castNode(List, newValue), false);
+
+	ColumnSetEncodingContext(RelationGetRelid(rel), column, context_id);
 
 	ObjectAddressSubSet(address, RelationRelationId,
 						RelationGetRelid(rel), attnum);

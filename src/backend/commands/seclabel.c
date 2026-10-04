@@ -92,6 +92,8 @@ SecLabelSupportsObjectType(ObjectType objtype)
 		case OBJECT_TSDICTIONARY:
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 		case OBJECT_USER_MAPPING:
 			return false;
 

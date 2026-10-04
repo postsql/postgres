@@ -34,6 +34,8 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_encoding_context.h"
+#include "catalog/pg_encoding_type.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -3361,6 +3363,228 @@ TSConfigIsVisibleExt(Oid cfgid, bool *is_missing)
 				/* Found something else first in path */
 				break;
 			}
+		}
+	}
+
+	ReleaseSysCache(tup);
+
+	return visible;
+}
+
+/*
+ * get_encoding_type_oid - find an encoding type by possibly qualified name
+ *
+ * If not found, returns InvalidOid if missing_ok, else throws error
+ */
+Oid
+get_encoding_type_oid(List *names, bool missing_ok)
+{
+	char	   *schemaname;
+	char	   *type_name;
+	Oid			namespaceId;
+	Oid			typeoid = InvalidOid;
+	ListCell   *l;
+
+	/* deconstruct the name list */
+	DeconstructQualifiedName(names, &schemaname, &type_name);
+
+	if (schemaname)
+	{
+		/* use exact schema given */
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			typeoid = InvalidOid;
+		else
+			typeoid = GetSysCacheOid2(ENCODINGTYPENAMENSP, Anum_pg_encoding_type_oid,
+									  PointerGetDatum(type_name),
+									  ObjectIdGetDatum(namespaceId));
+	}
+	else
+	{
+		/* search for it in search path */
+		recomputeNamespacePath();
+
+		foreach(l, activeSearchPath)
+		{
+			namespaceId = lfirst_oid(l);
+
+			if (namespaceId == myTempNamespace)
+				continue;		/* do not look in temp namespace */
+
+			typeoid = GetSysCacheOid2(ENCODINGTYPENAMENSP, Anum_pg_encoding_type_oid,
+									  PointerGetDatum(type_name),
+									  ObjectIdGetDatum(namespaceId));
+			if (OidIsValid(typeoid))
+				break;
+		}
+	}
+
+	if (!OidIsValid(typeoid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("encoding type \"%s\" does not exist",
+						NameListToString(names))));
+
+	return typeoid;
+}
+
+/*
+ * EncodingTypeIsVisible
+ *		Determine whether an encoding type (identified by OID) is visible in
+ *		the current search path.
+ */
+bool
+EncodingTypeIsVisible(Oid typeId)
+{
+	HeapTuple	tup;
+	Form_pg_encoding_type form;
+	Oid			namespace;
+	bool		visible;
+
+	tup = SearchSysCache1(ENCODINGTYPEOID, ObjectIdGetDatum(typeId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for encoding type %u", typeId);
+	form = (Form_pg_encoding_type) GETSTRUCT(tup);
+
+	recomputeNamespacePath();
+
+	namespace = form->enctypnamespace;
+	if (namespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, namespace))
+		visible = false;
+	else
+	{
+		char	   *name = NameStr(form->enctypname);
+		ListCell   *l;
+
+		visible = false;
+		foreach(l, activeSearchPath)
+		{
+			Oid			namespaceId = lfirst_oid(l);
+
+			if (namespaceId == myTempNamespace)
+				continue;
+
+			if (namespaceId == namespace)
+			{
+				visible = true;
+				break;
+			}
+			if (SearchSysCacheExists2(ENCODINGTYPENAMENSP,
+									  PointerGetDatum(name),
+									  ObjectIdGetDatum(namespaceId)))
+				break;
+		}
+	}
+
+	ReleaseSysCache(tup);
+
+	return visible;
+}
+
+/*
+ * get_encoding_context_oid - find an encoding context by possibly qualified name
+ *
+ * If not found, returns InvalidOid if missing_ok, else throws error
+ */
+Oid
+get_encoding_context_oid(List *names, bool missing_ok)
+{
+	char	   *schemaname;
+	char	   *ctx_name;
+	Oid			namespaceId;
+	Oid			ctxoid = InvalidOid;
+	ListCell   *l;
+
+	/* deconstruct the name list */
+	DeconstructQualifiedName(names, &schemaname, &ctx_name);
+
+	if (schemaname)
+	{
+		/* use exact schema given */
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			ctxoid = InvalidOid;
+		else
+			ctxoid = GetSysCacheOid2(ENCODINGCONTEXTNAMENSP, Anum_pg_encoding_context_oid,
+									 PointerGetDatum(ctx_name),
+									 ObjectIdGetDatum(namespaceId));
+	}
+	else
+	{
+		/* search for it in search path */
+		recomputeNamespacePath();
+
+		foreach(l, activeSearchPath)
+		{
+			namespaceId = lfirst_oid(l);
+
+			if (namespaceId == myTempNamespace)
+				continue;		/* do not look in temp namespace */
+
+			ctxoid = GetSysCacheOid2(ENCODINGCONTEXTNAMENSP, Anum_pg_encoding_context_oid,
+									 PointerGetDatum(ctx_name),
+									 ObjectIdGetDatum(namespaceId));
+			if (OidIsValid(ctxoid))
+				break;
+		}
+	}
+
+	if (!OidIsValid(ctxoid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("encoding context \"%s\" does not exist",
+						NameListToString(names))));
+
+	return ctxoid;
+}
+
+/*
+ * EncodingContextIsVisible
+ *		Determine whether an encoding context (identified by OID) is visible in
+ *		the current search path.
+ */
+bool
+EncodingContextIsVisible(Oid contextId)
+{
+	HeapTuple	tup;
+	Form_pg_encoding_context form;
+	Oid			namespace;
+	bool		visible;
+
+	tup = SearchSysCache1(ENCODINGCONTEXTOID, ObjectIdGetDatum(contextId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for encoding context %u", contextId);
+	form = (Form_pg_encoding_context) GETSTRUCT(tup);
+
+	recomputeNamespacePath();
+
+	namespace = form->ectxnamespace;
+	if (namespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, namespace))
+		visible = false;
+	else
+	{
+		char	   *name = NameStr(form->ectxname);
+		ListCell   *l;
+
+		visible = false;
+		foreach(l, activeSearchPath)
+		{
+			Oid			namespaceId = lfirst_oid(l);
+
+			if (namespaceId == myTempNamespace)
+				continue;
+
+			if (namespaceId == namespace)
+			{
+				visible = true;
+				break;
+			}
+			if (SearchSysCacheExists2(ENCODINGCONTEXTNAMENSP,
+									  PointerGetDatum(name),
+									  ObjectIdGetDatum(namespaceId)))
+				break;
 		}
 	}
 

@@ -157,6 +157,12 @@ extern bool TSTemplateIsVisible(Oid tmplId);
 extern Oid	get_ts_config_oid(List *names, bool missing_ok);
 extern bool TSConfigIsVisible(Oid cfgid);
 
+extern Oid	get_encoding_type_oid(List *names, bool missing_ok);
+extern bool EncodingTypeIsVisible(Oid typeId);
+
+extern Oid	get_encoding_context_oid(List *names, bool missing_ok);
+extern bool EncodingContextIsVisible(Oid contextId);
+
 extern void DeconstructQualifiedName(const List *names,
 									 char **nspname_p,
 									 char **objname_p);

@@ -277,7 +277,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 }
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
-		AlterEventTrigStmt AlterCollationStmt
+		AlterEncodingContextStmt AlterEventTrigStmt AlterCollationStmt
 		AlterDatabaseStmt AlterDatabaseSetStmt AlterDomainStmt AlterEnumStmt
 		AlterFdwStmt AlterForeignServerStmt AlterGroupStmt
 		AlterObjectDependsStmt AlterObjectSchemaStmt AlterOwnerStmt
@@ -467,6 +467,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <list>	opt_fdw_options fdw_options
 %type <defelt>	fdw_option
+%type <list>	opt_encoding_context_clauses encoding_context_clause_list
+				encoding_context_clause
 
 %type <range>	OptTempTableName
 %type <into>	into_clause create_as_target create_mv_target
@@ -728,7 +730,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 	COMMITTED COMPRESSION CONCURRENTLY CONDITIONAL CONFIGURATION CONFLICT
-	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTINUE_P CONVERSION_P COPY
+	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTEXT CONTINUE_P CONVERSION_P COPY
 	COST CREATE CROSS CSV CUBE CURRENT_P
 	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
@@ -775,7 +777,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
-	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
+	PARALLEL PARAMETER PARENT PARSER PARTIAL PARTITION PASSING PASSWORD PATH
 	PERIOD PLACING PLAN PLANS POLICY
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
@@ -1015,6 +1017,7 @@ stmt:
 			| AlterDatabaseSetStmt
 			| AlterDefaultPrivilegesStmt
 			| AlterDomainStmt
+			| AlterEncodingContextStmt
 			| AlterEnumStmt
 			| AlterExtensionStmt
 			| AlterExtensionContentsStmt
@@ -2625,6 +2628,36 @@ alter_table_cmd:
 					n->subtype = AT_SetCompression;
 					n->name = $3;
 					n->def = (Node *) makeString($5);
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET ENCODING CONTEXT <ctxname> */
+			| ALTER opt_column ColId SET ENCODING CONTEXT any_name
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_SetEncodingContext;
+					n->name = $3;
+					n->def = (Node *) $7;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET ENCODING CONTEXT DEFAULT */
+			| ALTER opt_column ColId SET ENCODING CONTEXT DEFAULT
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_SetEncodingContext;
+					n->name = $3;
+					n->def = NULL;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> ALTER [COLUMN] <colname> DROP ENCODING CONTEXT */
+			| ALTER opt_column ColId DROP ENCODING CONTEXT
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_SetEncodingContext;
+					n->name = $3;
+					n->def = NULL;
 					$$ = (Node *) n;
 				}
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> ADD GENERATED ... AS IDENTITY ... */
@@ -6630,6 +6663,90 @@ DefineStmt:
 					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
+			| CREATE ENCODING TYPE_P any_name definition
+				{
+					DefineStmt *n = makeNode(DefineStmt);
+
+					n->kind = OBJECT_ENCODING_TYPE;
+					n->args = NIL;
+					n->defnames = $4;
+					n->definition = $5;
+					$$ = (Node *) n;
+				}
+			| CREATE ENCODING TYPE_P IF_P NOT EXISTS any_name definition
+				{
+					DefineStmt *n = makeNode(DefineStmt);
+
+					n->kind = OBJECT_ENCODING_TYPE;
+					n->args = NIL;
+					n->defnames = $7;
+					n->definition = $8;
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+			| CREATE ENCODING CONTEXT any_name definition
+				{
+					DefineStmt *n = makeNode(DefineStmt);
+
+					n->kind = OBJECT_ENCODING_CONTEXT;
+					n->args = NIL;
+					n->defnames = $4;
+					n->definition = $5;
+					$$ = (Node *) n;
+				}
+			| CREATE ENCODING CONTEXT IF_P NOT EXISTS any_name definition
+				{
+					DefineStmt *n = makeNode(DefineStmt);
+
+					n->kind = OBJECT_ENCODING_CONTEXT;
+					n->args = NIL;
+					n->defnames = $7;
+					n->definition = $8;
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+			| CREATE ENCODING CONTEXT any_name TYPE_P any_name opt_encoding_context_clauses
+				{
+					DefineStmt *n = makeNode(DefineStmt);
+
+					n->kind = OBJECT_ENCODING_CONTEXT;
+					n->args = NIL;
+					n->defnames = $4;
+					n->definition = lcons(makeDefElem("type", (Node *) $6, @5), $7);
+					$$ = (Node *) n;
+				}
+			| CREATE ENCODING CONTEXT IF_P NOT EXISTS any_name TYPE_P any_name opt_encoding_context_clauses
+				{
+					DefineStmt *n = makeNode(DefineStmt);
+
+					n->kind = OBJECT_ENCODING_CONTEXT;
+					n->args = NIL;
+					n->defnames = $7;
+					n->definition = lcons(makeDefElem("type", (Node *) $9, @8), $10);
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+		;
+
+opt_encoding_context_clauses:
+			encoding_context_clause_list			{ $$ = $1; }
+			| /*EMPTY*/								{ $$ = NIL; }
+		;
+
+encoding_context_clause_list:
+			encoding_context_clause
+				{ $$ = $1; }
+			| encoding_context_clause_list encoding_context_clause
+				{ $$ = list_concat($1, $2); }
+		;
+
+encoding_context_clause:
+			PARENT any_name
+				{ $$ = list_make1(makeDefElem("parent", (Node *) $2, @1)); }
+			| FOR TYPE_P Typename
+				{ $$ = list_make1(makeDefElem("for_type", (Node *) $3, @1)); }
+			| WITH definition
+				{ $$ = $2; }
 		;
 
 definition: '(' def_list ')'						{ $$ = $2; }
@@ -7175,6 +7292,8 @@ object_type_any_name:
 			| TEXT_P SEARCH DICTIONARY				{ $$ = OBJECT_TSDICTIONARY; }
 			| TEXT_P SEARCH TEMPLATE				{ $$ = OBJECT_TSTEMPLATE; }
 			| TEXT_P SEARCH CONFIGURATION			{ $$ = OBJECT_TSCONFIGURATION; }
+			| ENCODING TYPE_P						{ $$ = OBJECT_ENCODING_TYPE; }
+			| ENCODING CONTEXT						{ $$ = OBJECT_ENCODING_CONTEXT; }
 		;
 
 /*
@@ -10115,6 +10234,26 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->missing_ok = false;
 					$$ = (Node *) n;
 				}
+			| ALTER ENCODING TYPE_P any_name RENAME TO name
+				{
+					RenameStmt *n = makeNode(RenameStmt);
+
+					n->renameType = OBJECT_ENCODING_TYPE;
+					n->object = (Node *) $4;
+					n->newname = $7;
+					n->missing_ok = false;
+					$$ = (Node *) n;
+				}
+			| ALTER ENCODING CONTEXT any_name RENAME TO name
+				{
+					RenameStmt *n = makeNode(RenameStmt);
+
+					n->renameType = OBJECT_ENCODING_CONTEXT;
+					n->object = (Node *) $4;
+					n->newname = $7;
+					n->missing_ok = false;
+					$$ = (Node *) n;
+				}
 		;
 
 opt_column: COLUMN
@@ -10476,6 +10615,26 @@ AlterObjectSchemaStmt:
 					n->missing_ok = false;
 					$$ = (Node *) n;
 				}
+			| ALTER ENCODING TYPE_P any_name SET SCHEMA name
+				{
+					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
+
+					n->objectType = OBJECT_ENCODING_TYPE;
+					n->object = (Node *) $4;
+					n->newschema = $7;
+					n->missing_ok = false;
+					$$ = (Node *) n;
+				}
+			| ALTER ENCODING CONTEXT any_name SET SCHEMA name
+				{
+					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
+
+					n->objectType = OBJECT_ENCODING_CONTEXT;
+					n->object = (Node *) $4;
+					n->newschema = $7;
+					n->missing_ok = false;
+					$$ = (Node *) n;
+				}
 		;
 
 /*****************************************************************************
@@ -10531,6 +10690,39 @@ AlterTypeStmt:
 
 					n->typeName = $3;
 					n->options = $6;
+					$$ = (Node *) n;
+				}
+		;
+
+/*****************************************************************************
+ *
+ * ALTER ENCODING CONTEXT name [SET | WITH] ( ... )
+ *
+ *****************************************************************************/
+
+AlterEncodingContextStmt:
+			ALTER ENCODING CONTEXT any_name SET definition
+				{
+					AlterEncodingContextStmt *n = makeNode(AlterEncodingContextStmt);
+
+					n->contextname = $4;
+					n->options = $6;
+					$$ = (Node *) n;
+				}
+			| ALTER ENCODING CONTEXT any_name WITH definition
+				{
+					AlterEncodingContextStmt *n = makeNode(AlterEncodingContextStmt);
+
+					n->contextname = $4;
+					n->options = $6;
+					$$ = (Node *) n;
+				}
+			| ALTER ENCODING CONTEXT any_name definition
+				{
+					AlterEncodingContextStmt *n = makeNode(AlterEncodingContextStmt);
+
+					n->contextname = $4;
+					n->options = $5;
 					$$ = (Node *) n;
 				}
 		;
@@ -10755,6 +10947,24 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
 					n->objectType = OBJECT_SUBSCRIPTION;
 					n->object = (Node *) makeString($3);
 					n->newowner = $6;
+					$$ = (Node *) n;
+				}
+			| ALTER ENCODING TYPE_P any_name OWNER TO RoleSpec
+				{
+					AlterOwnerStmt *n = makeNode(AlterOwnerStmt);
+
+					n->objectType = OBJECT_ENCODING_TYPE;
+					n->object = (Node *) $4;
+					n->newowner = $7;
+					$$ = (Node *) n;
+				}
+			| ALTER ENCODING CONTEXT any_name OWNER TO RoleSpec
+				{
+					AlterOwnerStmt *n = makeNode(AlterOwnerStmt);
+
+					n->objectType = OBJECT_ENCODING_CONTEXT;
+					n->object = (Node *) $4;
+					n->newowner = $7;
 					$$ = (Node *) n;
 				}
 		;
@@ -18151,6 +18361,7 @@ unreserved_keyword:
 			| CONNECTION
 			| CONSTRAINTS
 			| CONTENT_P
+			| CONTEXT
 			| CONTINUE_P
 			| CONVERSION_P
 			| COPY
@@ -18301,6 +18512,7 @@ unreserved_keyword:
 			| OWNER
 			| PARALLEL
 			| PARAMETER
+			| PARENT
 			| PARSER
 			| PARTIAL
 			| PARTITION
@@ -18720,6 +18932,7 @@ bare_label_keyword:
 			| CONSTRAINT
 			| CONSTRAINTS
 			| CONTENT_P
+			| CONTEXT
 			| CONTINUE_P
 			| CONVERSION_P
 			| COPY
@@ -18932,6 +19145,7 @@ bare_label_keyword:
 			| OWNER
 			| PARALLEL
 			| PARAMETER
+			| PARENT
 			| PARSER
 			| PARTIAL
 			| PARTITION

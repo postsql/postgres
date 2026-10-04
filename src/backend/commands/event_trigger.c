@@ -2330,6 +2330,8 @@ stringify_grant_objtype(ObjectType objtype)
 		case OBJECT_TSDICTIONARY:
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 		case OBJECT_USER_MAPPING:
 		case OBJECT_VIEW:
 			elog(ERROR, "unsupported object type: %d", (int) objtype);
@@ -2390,6 +2392,8 @@ stringify_adefprivs_objtype(ObjectType objtype)
 		case OBJECT_DEFAULT:
 		case OBJECT_DEFACL:
 		case OBJECT_DOMCONSTRAINT:
+		case OBJECT_ENCODING_CONTEXT:
+		case OBJECT_ENCODING_TYPE:
 		case OBJECT_EVENT_TRIGGER:
 		case OBJECT_EXTENSION:
 		case OBJECT_FOREIGN_TABLE:

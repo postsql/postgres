@@ -19,6 +19,7 @@ backend_sources += files(
   'define.c',
   'discard.c',
   'dropcmds.c',
+  'encodingcmds.c',
   'event_trigger.c',
   'explain.c',
   'explain_dr.c',

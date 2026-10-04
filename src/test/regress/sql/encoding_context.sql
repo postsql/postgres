@@ -304,3 +304,233 @@ SELECT pg_drop_encoding_type(
 
 SELECT count(*) FROM pg_encoding_type;
 SELECT count(*) FROM pg_encoding_context;
+
+-- =========================================================================
+-- 9. SQL DDL Grammar & Utility Commands (Patch 2)
+-- =========================================================================
+
+-- 9a. CREATE ENCODING TYPE & IF NOT EXISTS
+CREATE ENCODING TYPE ddl_dict_type (
+    KIND = 's',
+    TYPE = 'xor_lut',
+    ENCFUNC = pg_bytea_dict_encode,
+    DECFUNC = pg_bytea_dict_decode
+);
+
+CREATE ENCODING TYPE IF NOT EXISTS ddl_dict_type (
+    KIND = 's',
+    TYPE = 'xor_lut',
+    ENCFUNC = pg_bytea_dict_encode,
+    DECFUNC = pg_bytea_dict_decode
+);
+
+CREATE ENCODING TYPE ddl_pglz_type (
+    KIND = 'c',
+    ALGORITHM = 'pglz',
+    ENCFUNC = pg_pglz_context_encode,
+    DECFUNC = pg_pglz_context_decode
+);
+
+-- Reject unrecognized parameter in CREATE ENCODING TYPE
+CREATE ENCODING TYPE ddl_bad_param_type (
+    KIND = 'c',
+    TYPE = 'pglz',
+    BOGUS = 'nope'
+);
+
+-- 9b. CREATE ENCODING CONTEXT (clause syntax & definition syntax)
+CREATE ENCODING CONTEXT ddl_root_ctx
+    TYPE ddl_dict_type
+    FOR TYPE text
+    WITH (
+        ENCTAB = '\xaa55aa55',
+        LABEL = 'ddl-v1-root',
+        custom_opt = 'enabled'
+    );
+
+CREATE ENCODING CONTEXT IF NOT EXISTS ddl_root_ctx
+    TYPE ddl_dict_type
+    FOR TYPE text;
+
+-- Chained child context via PARENT clause
+CREATE ENCODING CONTEXT ddl_child_ctx
+    TYPE ddl_pglz_type
+    PARENT ddl_root_ctx
+    WITH (
+        LABEL = 'ddl-v1-child-pglz',
+        level = 6
+    );
+
+-- Parenthesized definition syntax for CREATE ENCODING CONTEXT
+CREATE ENCODING CONTEXT ddl_parens_ctx (
+    TYPE = ddl_dict_type,
+    FOR_TYPE = bytea,
+    ENCTAB = '\x0f0f',
+    LABEL = 'ddl-parens'
+);
+
+SELECT c.ectxname,
+       t.enctypname,
+       p.ectxname AS parent_ctx,
+       c.ectxtargettypid::regtype AS target_type,
+       c.ectxlabel,
+       encode(c.ectxenctab, 'hex') AS enctab_hex,
+       c.ectxoptions
+FROM pg_encoding_context c
+JOIN pg_encoding_type t ON t.oid = c.ectxtypid
+LEFT JOIN pg_encoding_context p ON p.oid = c.ectxparentid
+ORDER BY c.ectxname;
+
+-- Verify composable round-trip on DDL-created context pipeline
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'ddl_child_ctx'),
+    pg_encode_datum(
+        (SELECT oid FROM pg_encoding_context WHERE ectxname = 'ddl_child_ctx'),
+        'DDL Composable Pipeline Test!'::text
+    ),
+    NULL::text
+) AS ddl_pipeline_roundtrip;
+
+-- 9c. ALTER ENCODING CONTEXT (SET / WITH / bare parens, and clearing via NULL/NONE)
+ALTER ENCODING CONTEXT ddl_root_ctx SET (
+    ENCTAB = '\x12345678',
+    DECTAB = '\x12345678',
+    LABEL = 'ddl-v2-root',
+    custom_opt = 'updated'
+);
+
+SELECT ectxlabel,
+       encode(ectxenctab, 'hex') AS enctab_hex,
+       encode(ectxdectab, 'hex') AS dectab_hex,
+       ectxoptions
+FROM pg_encoding_context
+WHERE ectxname = 'ddl_root_ctx';
+
+-- Clear dectab and label using NULL / NONE
+ALTER ENCODING CONTEXT ddl_root_ctx WITH (
+    DECTAB = NULL,
+    LABEL = NONE
+);
+
+SELECT ectxlabel IS NULL AS label_cleared,
+       ectxdectab IS NULL AS dectab_cleared,
+       encode(ectxenctab, 'hex') AS enctab_preserved
+FROM pg_encoding_context
+WHERE ectxname = 'ddl_root_ctx';
+
+-- 9d. ALTER TABLE ... ALTER [COLUMN] ... SET / DROP ENCODING CONTEXT
+CREATE TABLE ddl_ectx_tbl (
+    id int,
+    doc text
+);
+
+-- Type mismatch must fail
+ALTER TABLE ddl_ectx_tbl ALTER COLUMN id SET ENCODING CONTEXT ddl_child_ctx;
+
+-- Valid column binding via DDL
+ALTER TABLE ddl_ectx_tbl ALTER COLUMN doc SET ENCODING CONTEXT ddl_child_ctx;
+
+SELECT a.attname, c.ectxname
+FROM pg_attribute a
+JOIN pg_encoding_context c ON c.oid = a.attencoding_context
+WHERE a.attrelid = 'ddl_ectx_tbl'::regclass;
+
+-- Reset via DROP ENCODING CONTEXT and SET ENCODING CONTEXT DEFAULT
+ALTER TABLE ddl_ectx_tbl ALTER COLUMN doc DROP ENCODING CONTEXT;
+
+SELECT attencoding_context FROM pg_attribute
+WHERE attrelid = 'ddl_ectx_tbl'::regclass AND attname = 'doc';
+
+ALTER TABLE ddl_ectx_tbl ALTER COLUMN doc SET ENCODING CONTEXT ddl_root_ctx;
+ALTER TABLE ddl_ectx_tbl ALTER COLUMN doc SET ENCODING CONTEXT DEFAULT;
+
+SELECT attencoding_context FROM pg_attribute
+WHERE attrelid = 'ddl_ectx_tbl'::regclass AND attname = 'doc';
+
+DROP TABLE ddl_ectx_tbl;
+
+-- 9e. COMMENT ON, RENAME TO, SET SCHEMA, OWNER TO, pg_get_object_address
+COMMENT ON ENCODING TYPE ddl_dict_type IS 'Dictionary encoding type via DDL';
+COMMENT ON ENCODING CONTEXT ddl_root_ctx IS 'Root dictionary encoding context';
+
+SELECT obj_description(oid, 'pg_encoding_type') FROM pg_encoding_type WHERE enctypname = 'ddl_dict_type';
+SELECT obj_description(oid, 'pg_encoding_context') FROM pg_encoding_context WHERE ectxname = 'ddl_root_ctx';
+
+SELECT type, schema, name, identity FROM pg_identify_object(
+    (SELECT classid FROM pg_get_object_address('encoding type', ARRAY['ddl_dict_type'], '{}')),
+    (SELECT objid FROM pg_get_object_address('encoding type', ARRAY['ddl_dict_type'], '{}')),
+    0
+);
+
+SELECT type, schema, name, identity FROM pg_identify_object(
+    (SELECT classid FROM pg_get_object_address('encoding context', ARRAY['ddl_root_ctx'], '{}')),
+    (SELECT objid FROM pg_get_object_address('encoding context', ARRAY['ddl_root_ctx'], '{}')),
+    0
+);
+
+CREATE SCHEMA ddl_ectx_schema;
+ALTER ENCODING TYPE ddl_dict_type RENAME TO ddl_dict_type_renamed;
+ALTER ENCODING TYPE ddl_dict_type_renamed SET SCHEMA ddl_ectx_schema;
+
+ALTER ENCODING CONTEXT ddl_parens_ctx RENAME TO ddl_parens_ctx_renamed;
+ALTER ENCODING CONTEXT ddl_parens_ctx_renamed SET SCHEMA ddl_ectx_schema;
+
+SELECT n.nspname, t.enctypname
+FROM pg_encoding_type t
+JOIN pg_namespace n ON n.oid = t.enctypnamespace
+WHERE t.enctypname = 'ddl_dict_type_renamed';
+
+SELECT n.nspname, c.ectxname
+FROM pg_encoding_context c
+JOIN pg_namespace n ON n.oid = c.ectxnamespace
+WHERE c.ectxname = 'ddl_parens_ctx_renamed';
+
+-- 9f. Privilege checks on SQL DDL for unprivileged role
+CREATE ROLE regress_ddl_encoding_user;
+SET ROLE regress_ddl_encoding_user;
+
+CREATE ENCODING TYPE unpriv_ddl_type (
+    KIND = 'c',
+    TYPE = 'pglz',
+    ENCFUNC = pg_pglz_context_encode,
+    DECFUNC = pg_pglz_context_decode
+);
+
+CREATE ENCODING CONTEXT unpriv_ddl_ctx
+    TYPE ddl_pglz_type
+    FOR TYPE text;
+
+ALTER ENCODING CONTEXT ddl_root_ctx SET (LABEL = 'hacked');
+
+RESET ROLE;
+
+-- Superuser can transfer ownership
+ALTER ENCODING CONTEXT ddl_root_ctx OWNER TO regress_ddl_encoding_user;
+ALTER ENCODING TYPE ddl_pglz_type OWNER TO regress_ddl_encoding_user;
+
+-- Still must be superuser to execute ALTER ENCODING CONTEXT even if owner
+SET ROLE regress_ddl_encoding_user;
+ALTER ENCODING CONTEXT ddl_root_ctx SET (LABEL = 'still-requires-superuser');
+RESET ROLE;
+
+-- Reassign back and drop role
+REASSIGN OWNED BY regress_ddl_encoding_user TO CURRENT_USER;
+DROP ROLE regress_ddl_encoding_user;
+
+-- 9g. DROP ENCODING CONTEXT & DROP ENCODING TYPE (IF EXISTS, RESTRICT, CASCADE)
+DROP ENCODING CONTEXT IF EXISTS non_existent_ctx;
+DROP ENCODING TYPE IF EXISTS non_existent_type;
+
+-- RESTRICT must fail while ddl_child_ctx depends on ddl_root_ctx
+DROP ENCODING CONTEXT ddl_root_ctx RESTRICT;
+
+-- Drop child first, then root
+DROP ENCODING CONTEXT ddl_child_ctx;
+DROP ENCODING CONTEXT ddl_root_ctx;
+
+-- Drop remaining types and schema with CASCADE
+DROP ENCODING TYPE ddl_pglz_type;
+DROP SCHEMA ddl_ectx_schema CASCADE;
+
+SELECT count(*) FROM pg_encoding_type;
+SELECT count(*) FROM pg_encoding_context;

@@ -2750,6 +2750,12 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_TSDICTIONARY:
 						msg = gettext_noop("permission denied for text search dictionary %s");
 						break;
+					case OBJECT_ENCODING_TYPE:
+						msg = gettext_noop("permission denied for encoding type %s");
+						break;
+					case OBJECT_ENCODING_CONTEXT:
+						msg = gettext_noop("permission denied for encoding context %s");
+						break;
 					case OBJECT_TYPE:
 						msg = gettext_noop("permission denied for type %s");
 						break;
@@ -2882,6 +2888,12 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 						break;
 					case OBJECT_TSDICTIONARY:
 						msg = gettext_noop("must be owner of text search dictionary %s");
+						break;
+					case OBJECT_ENCODING_TYPE:
+						msg = gettext_noop("must be owner of encoding type %s");
+						break;
+					case OBJECT_ENCODING_CONTEXT:
+						msg = gettext_noop("must be owner of encoding context %s");
 						break;
 
 						/*

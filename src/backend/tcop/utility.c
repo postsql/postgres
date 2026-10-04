@@ -157,6 +157,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterSubscriptionStmt:
 		case T_AlterTSConfigurationStmt:
 		case T_AlterTSDictionaryStmt:
+		case T_AlterEncodingContextStmt:
 		case T_AlterTableMoveAllStmt:
 		case T_AlterTableSpaceOptionsStmt:
 		case T_AlterTableStmt:
@@ -1445,6 +1446,20 @@ ProcessUtilitySlow(ParseState *pstate,
 													  stmt->definition,
 													  stmt->if_not_exists);
 							break;
+						case OBJECT_ENCODING_TYPE:
+							Assert(stmt->args == NIL);
+							address = DefineEncodingType(pstate,
+														 stmt->defnames,
+														 stmt->definition,
+														 stmt->if_not_exists);
+							break;
+						case OBJECT_ENCODING_CONTEXT:
+							Assert(stmt->args == NIL);
+							address = DefineEncodingContext(pstate,
+															stmt->defnames,
+															stmt->definition,
+															stmt->if_not_exists);
+							break;
 						default:
 							elog(ERROR, "unrecognized define stmt type: %d",
 								 (int) stmt->kind);
@@ -1753,6 +1768,10 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_AlterTSDictionaryStmt:
 				address = AlterTSDictionary((AlterTSDictionaryStmt *) parsetree);
+				break;
+
+			case T_AlterEncodingContextStmt:
+				address = AlterEncodingContext((AlterEncodingContextStmt *) parsetree);
 				break;
 
 			case T_AlterTSConfigurationStmt:
@@ -2365,6 +2384,12 @@ AlterObjectTypeCommandTag(ObjectType objtype)
 		case OBJECT_STATISTIC_EXT:
 			tag = CMDTAG_ALTER_STATISTICS;
 			break;
+		case OBJECT_ENCODING_TYPE:
+			tag = CMDTAG_ALTER_ENCODING_TYPE;
+			break;
+		case OBJECT_ENCODING_CONTEXT:
+			tag = CMDTAG_ALTER_ENCODING_CONTEXT;
+			break;
 		default:
 			tag = CMDTAG_UNKNOWN;
 			break;
@@ -2673,6 +2698,12 @@ CreateCommandTag(Node *parsetree)
 				case OBJECT_STATISTIC_EXT:
 					tag = CMDTAG_DROP_STATISTICS;
 					break;
+				case OBJECT_ENCODING_TYPE:
+					tag = CMDTAG_DROP_ENCODING_TYPE;
+					break;
+				case OBJECT_ENCODING_CONTEXT:
+					tag = CMDTAG_DROP_ENCODING_CONTEXT;
+					break;
 				default:
 					tag = CMDTAG_UNKNOWN;
 			}
@@ -2795,6 +2826,12 @@ CreateCommandTag(Node *parsetree)
 					break;
 				case OBJECT_ACCESS_METHOD:
 					tag = CMDTAG_CREATE_ACCESS_METHOD;
+					break;
+				case OBJECT_ENCODING_TYPE:
+					tag = CMDTAG_CREATE_ENCODING_TYPE;
+					break;
+				case OBJECT_ENCODING_CONTEXT:
+					tag = CMDTAG_CREATE_ENCODING_CONTEXT;
 					break;
 				default:
 					tag = CMDTAG_UNKNOWN;
@@ -3057,6 +3094,10 @@ CreateCommandTag(Node *parsetree)
 
 		case T_AlterTSDictionaryStmt:
 			tag = CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY;
+			break;
+
+		case T_AlterEncodingContextStmt:
+			tag = CMDTAG_ALTER_ENCODING_CONTEXT;
 			break;
 
 		case T_AlterTSConfigurationStmt:
@@ -3685,6 +3726,10 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_AlterTSDictionaryStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
+		case T_AlterEncodingContextStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

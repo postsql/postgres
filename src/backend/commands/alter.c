@@ -24,6 +24,8 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_encoding_context.h"
+#include "catalog/pg_encoding_type.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
@@ -429,6 +431,8 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_TSTEMPLATE:
 		case OBJECT_PUBLICATION:
 		case OBJECT_SUBSCRIPTION:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 			{
 				ObjectAddress address;
 				Relation	catalog;
@@ -569,6 +573,8 @@ ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt,
 		case OBJECT_TSDICTIONARY:
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 			{
 				Relation	catalog;
 				Oid			classId;
@@ -651,6 +657,8 @@ AlterObjectNamespace_oid(Oid classId, Oid objid, Oid nspOid,
 		case TSDictionaryRelationId:
 		case TSTemplateRelationId:
 		case TSConfigRelationId:
+		case EncodingTypeRelationId:
+		case EncodingContextRelationId:
 			{
 				Relation	catalog;
 
@@ -881,6 +889,8 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 		case OBJECT_TABLESPACE:
 		case OBJECT_TSDICTIONARY:
 		case OBJECT_TSCONFIGURATION:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 			{
 				ObjectAddress address;
 

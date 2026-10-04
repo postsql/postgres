@@ -149,6 +149,13 @@ extern Oid	get_table_am_oid(const char *amname, bool missing_ok);
 extern Oid	get_am_oid(const char *amname, bool missing_ok);
 extern char *get_am_name(Oid amOid);
 
+/* commands/encodingcmds.c */
+extern ObjectAddress DefineEncodingType(ParseState *pstate, List *names,
+										List *parameters, bool if_not_exists);
+extern ObjectAddress DefineEncodingContext(ParseState *pstate, List *names,
+										   List *parameters, bool if_not_exists);
+extern ObjectAddress AlterEncodingContext(AlterEncodingContextStmt *stmt);
+
 /* support routines in commands/define.c */
 
 extern char *defGetString(DefElem *def);

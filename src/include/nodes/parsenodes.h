@@ -2382,6 +2382,8 @@ typedef enum ObjectType
 	OBJECT_DEFACL,
 	OBJECT_DOMAIN,
 	OBJECT_DOMCONSTRAINT,
+	OBJECT_ENCODING_CONTEXT,
+	OBJECT_ENCODING_TYPE,
 	OBJECT_EVENT_TRIGGER,
 	OBJECT_EXTENSION,
 	OBJECT_FDW,
@@ -2474,6 +2476,7 @@ typedef enum AlterTableType
 	AT_ResetOptions,			/* alter column reset ( options ) */
 	AT_SetStorage,				/* alter column set storage */
 	AT_SetCompression,			/* alter column set compression */
+	AT_SetEncodingContext,		/* alter column set encoding context */
 	AT_DropColumn,				/* drop column */
 	AT_AddIndex,				/* add index */
 	AT_ReAddIndex,				/* internal to commands/tablecmds.c */
@@ -4290,6 +4293,13 @@ typedef struct AlterTSDictionaryStmt
 	List	   *dictname;		/* qualified name (list of String) */
 	List	   *options;		/* List of DefElem nodes */
 } AlterTSDictionaryStmt;
+
+typedef struct AlterEncodingContextStmt
+{
+	NodeTag		type;
+	List	   *contextname;	/* qualified name (list of String) */
+	List	   *options;		/* List of DefElem nodes */
+} AlterEncodingContextStmt;
 
 /*
  * TS Configuration stmts: DefineStmt, RenameStmt and DropStmt are default

@@ -317,6 +317,20 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 				name = NameListToString(castNode(List, object));
 			}
 			break;
+		case OBJECT_ENCODING_TYPE:
+			if (!schema_does_not_exist_skipping(castNode(List, object), &msg, &name))
+			{
+				msg = gettext_noop("encoding type \"%s\" does not exist, skipping");
+				name = NameListToString(castNode(List, object));
+			}
+			break;
+		case OBJECT_ENCODING_CONTEXT:
+			if (!schema_does_not_exist_skipping(castNode(List, object), &msg, &name))
+			{
+				msg = gettext_noop("encoding context \"%s\" does not exist, skipping");
+				name = NameListToString(castNode(List, object));
+			}
+			break;
 		case OBJECT_EXTENSION:
 			msg = gettext_noop("extension \"%s\" does not exist, skipping");
 			name = strVal(object);

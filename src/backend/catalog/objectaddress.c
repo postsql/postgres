@@ -649,7 +649,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		Anum_pg_encoding_type_enctypnamespace,
 		Anum_pg_encoding_type_enctypowner,
 		InvalidAttrNumber,
-		-1,
+		OBJECT_ENCODING_TYPE,
 		true
 	},
 	{
@@ -663,7 +663,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		Anum_pg_encoding_context_ectxnamespace,
 		Anum_pg_encoding_context_ectxowner,
 		InvalidAttrNumber,
-		-1,
+		OBJECT_ENCODING_CONTEXT,
 		true
 	},
 };
@@ -866,10 +866,10 @@ static const struct object_type_map
 		"statistics object", OBJECT_STATISTIC_EXT
 	},
 	{
-		"encoding type", -1		/* unmapped */
+		"encoding type", OBJECT_ENCODING_TYPE
 	},
 	{
-		"encoding context", -1	/* unmapped */
+		"encoding context", OBJECT_ENCODING_CONTEXT
 	}
 };
 
@@ -1170,6 +1170,18 @@ get_object_address(ObjectType objtype, Node *object,
 				address.classId = StatisticExtRelationId;
 				address.objectId = get_statistics_object_oid(castNode(List, object),
 															 missing_ok);
+				address.objectSubId = 0;
+				break;
+			case OBJECT_ENCODING_TYPE:
+				address.classId = EncodingTypeRelationId;
+				address.objectId = get_encoding_type_oid(castNode(List, object),
+														 missing_ok);
+				address.objectSubId = 0;
+				break;
+			case OBJECT_ENCODING_CONTEXT:
+				address.classId = EncodingContextRelationId;
+				address.objectId = get_encoding_context_oid(castNode(List, object),
+															missing_ok);
 				address.objectSubId = 0;
 				break;
 				/* no default, to let compiler warn about missing case */
@@ -2380,6 +2392,8 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_TABCONSTRAINT:
 		case OBJECT_OPCLASS:
 		case OBJECT_OPFAMILY:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 			objnode = (Node *) name;
 			break;
 		case OBJECT_ACCESS_METHOD:
@@ -2552,6 +2566,8 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_STATISTIC_EXT:
 		case OBJECT_TSDICTIONARY:
 		case OBJECT_TSCONFIGURATION:
+		case OBJECT_ENCODING_TYPE:
+		case OBJECT_ENCODING_CONTEXT:
 			if (!object_ownercheck(address.classId, address.objectId, roleid))
 				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
 							   NameListToString(castNode(List, object)));
@@ -3642,6 +3658,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 			{
 				HeapTuple	tup;
 				Form_pg_encoding_type typForm;
+				char	   *nspname;
 
 				tup = SearchSysCache1(ENCODINGTYPEOID,
 									  ObjectIdGetDatum(object->objectId));
@@ -3653,8 +3670,13 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 					break;
 				}
 				typForm = (Form_pg_encoding_type) GETSTRUCT(tup);
+				if (EncodingTypeIsVisible(object->objectId))
+					nspname = NULL;
+				else
+					nspname = get_namespace_name(typForm->enctypnamespace);
 				appendStringInfo(&buffer, _("encoding type %s"),
-								 NameStr(typForm->enctypname));
+								 quote_qualified_identifier(nspname,
+															NameStr(typForm->enctypname)));
 				ReleaseSysCache(tup);
 				break;
 			}
@@ -3663,6 +3685,7 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 			{
 				HeapTuple	tup;
 				Form_pg_encoding_context ctxForm;
+				char	   *nspname;
 
 				tup = SearchSysCache1(ENCODINGCONTEXTOID,
 									  ObjectIdGetDatum(object->objectId));
@@ -3674,8 +3697,13 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 					break;
 				}
 				ctxForm = (Form_pg_encoding_context) GETSTRUCT(tup);
+				if (EncodingContextIsVisible(object->objectId))
+					nspname = NULL;
+				else
+					nspname = get_namespace_name(ctxForm->ectxnamespace);
 				appendStringInfo(&buffer, _("encoding context %s"),
-								 NameStr(ctxForm->ectxname));
+								 quote_qualified_identifier(nspname,
+															NameStr(ctxForm->ectxname)));
 				ReleaseSysCache(tup);
 				break;
 			}
