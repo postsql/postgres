@@ -55,6 +55,8 @@ toast_tuple_init(ToastTupleContext *ttc)
 		ttc->ttc_attr[i].tai_colflags = 0;
 		ttc->ttc_attr[i].tai_oldexternal = NULL;
 		ttc->ttc_attr[i].tai_compression = att->attcompression;
+		ttc->ttc_attr[i].tai_encoding_context = att->attencoding_context;
+		ttc->ttc_attr[i].tai_atttypid = att->atttypid;
 
 		if (ttc->ttc_oldvalues != NULL)
 		{
@@ -131,17 +133,26 @@ toast_tuple_init(ToastTupleContext *ttc)
 				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_IGNORE;
 
 			/*
+			 * If the column has an encoding context, skip standard inline
+			 * PGLZ/LZ4 compression so the datum is encoded by its context
+			 * when externalized to Direct TOAST.
+			 */
+			if (OidIsValid(att->attencoding_context))
+				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_INCOMPRESSIBLE;
+
+			/*
 			 * We took care of UPDATE above, so any external value we find
 			 * still in the tuple must be someone else's that we cannot reuse
 			 * (this includes the case of an out-of-line in-memory datum).
 			 * Fetch it back (without decompression, unless we are forcing
-			 * PLAIN storage).  If necessary, we'll push it out as a new
-			 * external value below.
+			 * PLAIN storage or re-encoding with an encoding context).  If
+			 * necessary, we'll push it out as a new external value below.
 			 */
 			if (VARATT_IS_EXTERNAL(new_value))
 			{
 				ttc->ttc_attr[i].tai_oldexternal = new_value;
-				if (att->attstorage == TYPSTORAGE_PLAIN)
+				if (att->attstorage == TYPSTORAGE_PLAIN ||
+					OidIsValid(att->attencoding_context))
 					new_value = detoast_attr(new_value);
 				else
 					new_value = detoast_external_attr(new_value);
@@ -276,8 +287,10 @@ toast_tuple_externalize(ToastTupleContext *ttc, int attribute, uint32 options)
 	ToastAttrInfo *attr = &ttc->ttc_attr[attribute];
 
 	attr->tai_colflags |= TOASTCOL_IGNORE;
-	*value = toast_save_datum(ttc->ttc_rel, old_value, attr->tai_oldexternal,
-							  options);
+	*value = toast_save_datum_context(ttc->ttc_rel, old_value,
+									  attr->tai_oldexternal, options,
+									  attr->tai_encoding_context,
+									  attr->tai_atttypid);
 	if ((attr->tai_colflags & TOASTCOL_NEEDS_FREE) != 0)
 		pfree(DatumGetPointer(old_value));
 	attr->tai_colflags |= TOASTCOL_NEEDS_FREE;

@@ -5367,6 +5367,7 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			ReorderBufferChange *cchange;
 			HeapTuple	ctup;
 			Pointer		chunk;
+			Oid			chunk_ectx_id = InvalidOid;
 
 			cchange = dlist_container(ReorderBufferChange, node, it.cur);
 			ctup = cchange->data.tp.newtuple;
@@ -5376,10 +5377,33 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			Assert(!VARATT_IS_EXTERNAL(chunk));
 			Assert(!VARATT_IS_SHORT(chunk));
 
-			memcpy(VARDATA(reconstructed) + data_done,
-				   VARDATA(chunk),
-				   VARSIZE(chunk) - VARHDRSZ);
-			data_done += VARSIZE(chunk) - VARHDRSZ;
+			if (toast_desc->natts >= 6)
+			{
+				bool		ectx_isnull;
+				Datum		ectx_datum = fastgetattr(ctup, 6, toast_desc, &ectx_isnull);
+
+				if (!ectx_isnull)
+					chunk_ectx_id = DatumGetObjectId(ectx_datum);
+			}
+
+			if (OidIsValid(chunk_ectx_id))
+			{
+				varlena    *decoded = toast_decode_chunk_with_context(chunk_ectx_id,
+																	  (varlena *) chunk);
+
+				memcpy(VARDATA(reconstructed) + data_done,
+					   VARDATA_ANY(decoded),
+					   VARSIZE_ANY_EXHDR(decoded));
+				data_done += VARSIZE_ANY_EXHDR(decoded);
+				pfree(decoded);
+			}
+			else
+			{
+				memcpy(VARDATA(reconstructed) + data_done,
+					   VARDATA(chunk),
+					   VARSIZE(chunk) - VARHDRSZ);
+				data_done += VARSIZE(chunk) - VARHDRSZ;
+			}
 		}
 		Assert(data_done == extsize);
 

@@ -737,3 +737,194 @@ SELECT count(*) FROM pg_encoding_context;
      0
 (1 row)
 
+-- =========================================================================
+-- 10. Direct TOAST Integration, Slicing & Online Context Switching
+-- =========================================================================
+CREATE ENCODING TYPE toast_pglz_type (
+    KIND = 'c',
+    TYPE = 'pglz',
+    ENCFUNC = pg_pglz_context_encode,
+    DECFUNC = pg_pglz_context_decode
+);
+CREATE ENCODING TYPE toast_dict_type (
+    KIND = 'd',
+    TYPE = 'xor_lut',
+    ENCFUNC = pg_bytea_dict_encode,
+    DECFUNC = pg_bytea_dict_decode
+);
+-- Root dictionary context v1: XOR key \xaa55aa55
+CREATE ENCODING CONTEXT toast_dict_v1_ctx
+    TYPE toast_dict_type
+    FOR TYPE text
+    WITH (
+        ENCTAB = '\xaa55aa55',
+        DECTAB = '\xaa55aa55',
+        LABEL = 'toast-dict-v1'
+    );
+-- Root dictionary context v2: XOR key \x0f0f0f0f
+CREATE ENCODING CONTEXT toast_dict_v2_ctx
+    TYPE toast_dict_type
+    FOR TYPE text
+    WITH (
+        ENCTAB = '\x0f0f0f0f',
+        DECTAB = '\x0f0f0f0f',
+        LABEL = 'toast-dict-v2'
+    );
+-- Composable child context: toast_dict_v1_ctx -> toast_child_pglz_ctx
+CREATE ENCODING CONTEXT toast_child_pglz_ctx
+    TYPE toast_pglz_type
+    PARENT toast_dict_v1_ctx
+    WITH (LABEL = 'toast-dict-v1-plus-pglz');
+-- 10a. Table with composed encoding context across Tier 1, Tier 2, and Tier 3
+CREATE TABLE toast_ectx_tiers (
+    id int PRIMARY KEY,
+    tier text,
+    payload text
+);
+ALTER TABLE toast_ectx_tiers ALTER COLUMN payload SET ENCODING CONTEXT toast_child_pglz_ctx;
+-- Verify TOAST table has 6 columns including chunk_ectx_id
+SELECT a.attnum, a.attname, format_type(a.atttypid, a.atttypmod) AS typname
+FROM pg_attribute a
+JOIN pg_class c ON c.reltoastrelid = a.attrelid
+WHERE c.relname = 'toast_ectx_tiers' AND a.attnum > 0
+ORDER BY a.attnum;
+ attnum |      attname      | typname  
+--------+-------------------+----------
+      1 | chunk_id          | oid
+      2 | chunk_seq         | integer
+      3 | chunk_data        | bytea
+      4 | chunk_tids        | tid[]
+      5 | chunk_tid_offsets | bigint[]
+      6 | chunk_ectx_id     | oid
+(6 rows)
+
+-- Insert Tier 1 (single chunk, ~320 bytes - even below normal TOAST_TUPLE_THRESHOLD!),
+-- Tier 2 (flat multi-chunk, ~16 KB), and Tier 3 (hierarchical tree > 100 chunks, ~240 KB)
+INSERT INTO toast_ectx_tiers VALUES
+    (1, 'tier1_single', repeat('{"service":"auth","status":"ok"}', 10)),
+    (2, 'tier2_flat',   repeat('{"service":"auth","status":"ok"}', 500)),
+    (3, 'tier3_tree',   repeat('{"service":"auth","status":"ok"}', 7500));
+-- Verify transparent round-trip decoding and physical compression via pg_column_raw_encoding
+SELECT id, tier,
+       length(payload) AS logical_len,
+       octet_length(pg_column_raw_encoding(payload)) < length(payload) AS physically_compressed,
+       left(payload, 32) AS prefix_sample,
+       right(payload, 32) AS suffix_sample
+FROM toast_ectx_tiers
+ORDER BY id;
+ id |     tier     | logical_len | physically_compressed |          prefix_sample           |          suffix_sample           
+----+--------------+-------------+-----------------------+----------------------------------+----------------------------------
+  1 | tier1_single |         320 | t                     | {"service":"auth","status":"ok"} | {"service":"auth","status":"ok"}
+  2 | tier2_flat   |       16000 | t                     | {"service":"auth","status":"ok"} | {"service":"auth","status":"ok"}
+  3 | tier3_tree   |      240000 | t                     | {"service":"auth","status":"ok"} | {"service":"auth","status":"ok"}
+(3 rows)
+
+-- For Tier 1 (single chunk), pg_decode_datum on pg_column_raw_encoding matches payload
+SELECT pg_decode_datum(
+           (SELECT oid FROM pg_encoding_context WHERE ectxname = 'toast_child_pglz_ctx'),
+           pg_column_raw_encoding(payload),
+           NULL::text
+       ) = payload AS single_chunk_raw_matches
+FROM toast_ectx_tiers
+WHERE id = 1;
+ single_chunk_raw_matches 
+--------------------------
+ t
+(1 row)
+
+-- Verify O(log N) substring slice retrieval across chunk boundaries for all 3 tiers
+SELECT id, tier,
+       substring(payload FROM 1 FOR 32) AS slice_start,
+       substring(payload FROM 1985 FOR 64) AS slice_cross_chunk_1,
+       substring(payload FROM 16001 FOR 32) AS slice_mid
+FROM toast_ectx_tiers
+ORDER BY id;
+ id |     tier     |           slice_start            |                       slice_cross_chunk_1                        |            slice_mid             
+----+--------------+----------------------------------+------------------------------------------------------------------+----------------------------------
+  1 | tier1_single | {"service":"auth","status":"ok"} |                                                                  | 
+  2 | tier2_flat   | {"service":"auth","status":"ok"} | {"service":"auth","status":"ok"}{"service":"auth","status":"ok"} | 
+  3 | tier3_tree   | {"service":"auth","status":"ok"} | {"service":"auth","status":"ok"}{"service":"auth","status":"ok"} | {"service":"auth","status":"ok"}
+(3 rows)
+
+SELECT substring(payload FROM 200001 FOR 64) AS tree_deep_slice
+FROM toast_ectx_tiers
+WHERE id = 3;
+                         tree_deep_slice                          
+------------------------------------------------------------------
+ {"service":"auth","status":"ok"}{"service":"auth","status":"ok"}
+(1 row)
+
+-- 10b. Online Context Switching (v1 and v2 coexisting in the same column without table rewrite)
+CREATE TABLE toast_ectx_evolution (
+    id int PRIMARY KEY,
+    payload text
+);
+ALTER TABLE toast_ectx_evolution ALTER COLUMN payload SET ENCODING CONTEXT toast_dict_v1_ctx;
+-- Insert row 1 encoded with toast_dict_v1_ctx (\xaa55aa55 key)
+INSERT INTO toast_ectx_evolution VALUES (1, '{"service":"auth","status":"ok"}-row1');
+-- Switch column encoding context online to toast_dict_v2_ctx (\x0f0f0f0f key)
+ALTER TABLE toast_ectx_evolution ALTER COLUMN payload SET ENCODING CONTEXT toast_dict_v2_ctx;
+-- Insert row 2 encoded with toast_dict_v2_ctx (\x0f0f0f0f key)
+INSERT INTO toast_ectx_evolution VALUES (2, '{"service":"auth","status":"ok"}-row2');
+-- Verify raw encoding bytes differ while decoded payloads are both accurate!
+SELECT id,
+       payload,
+       encode(pg_column_raw_encoding(payload), 'hex') AS raw_hex
+FROM toast_ectx_evolution
+ORDER BY id;
+ id |                payload                |                                  raw_hex                                   
+----+---------------------------------------+----------------------------------------------------------------------------
+  1 | {"service":"auth","status":"ok"}-row1 | d177d930d823c336cf779077cb20de3d88798826de34de20d9779077c53e88288727c5229b
+  2 | {"service":"auth","status":"ok"}-row2 | 742d7c6a7d79666c6a2d352d6e7a7b672d232d7c7b6e7b7a7c2d352d60642d72227d60783d
+(2 rows)
+
+-- Inspect the underlying TOAST table directly to confirm self-describing chunk_ectx_id
+DO $$
+DECLARE
+    v_toast_rel text;
+    v_cnt int;
+BEGIN
+    SELECT 'pg_toast.' || t.relname INTO v_toast_rel
+    FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+    WHERE c.relname = 'toast_ectx_evolution';
+
+    EXECUTE format('SELECT count(DISTINCT chunk_ectx_id) FROM %s', v_toast_rel) INTO v_cnt;
+    IF v_cnt <> 2 THEN
+        RAISE EXCEPTION 'expected 2 distinct chunk_ectx_id values in %, got %', v_toast_rel, v_cnt;
+    END IF;
+END;
+$$;
+-- Now run VACUUM FULL: all rows are rewritten using the column's active context (toast_dict_v2_ctx)
+VACUUM FULL toast_ectx_evolution;
+-- Both rows now use toast_dict_v2_ctx and decode identically
+SELECT id,
+       payload,
+       encode(pg_column_raw_encoding(payload), 'hex') AS raw_hex
+FROM toast_ectx_evolution
+ORDER BY id;
+ id |                payload                |                                  raw_hex                                   
+----+---------------------------------------+----------------------------------------------------------------------------
+  1 | {"service":"auth","status":"ok"}-row1 | 742d7c6a7d79666c6a2d352d6e7a7b672d232d7c7b6e7b7a7c2d352d60642d72227d60783e
+  2 | {"service":"auth","status":"ok"}-row2 | 742d7c6a7d79666c6a2d352d6e7a7b672d232d7c7b6e7b7a7c2d352d60642d72227d60783d
+(2 rows)
+
+-- Clean up Section 10 objects
+DROP TABLE toast_ectx_tiers;
+DROP TABLE toast_ectx_evolution;
+DROP ENCODING CONTEXT toast_child_pglz_ctx;
+DROP ENCODING CONTEXT toast_dict_v1_ctx;
+DROP ENCODING CONTEXT toast_dict_v2_ctx;
+DROP ENCODING TYPE toast_dict_type;
+DROP ENCODING TYPE toast_pglz_type;
+SELECT count(*) FROM pg_encoding_type;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pg_encoding_context;
+ count 
+-------
+     0
+(1 row)
+

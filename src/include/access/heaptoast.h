@@ -160,4 +160,6 @@ extern void heap_fetch_toast_slice(Relation toastrel, Oid8 valueid,
 								   int32 attrsize, int32 sliceoffset,
 								   int32 slicelength, varlena *result);
 
+extern bool RelationHasEncodingContext(Relation rel);
+
 #endif							/* HEAPTOAST_H */

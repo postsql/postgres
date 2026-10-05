@@ -40,6 +40,9 @@ extern Oid	toast_get_valid_index(Oid toastoid, LOCKMODE lock);
 extern void toast_delete_datum(Relation rel, Datum value, bool is_speculative);
 extern Datum toast_save_datum(Relation rel, Datum value,
 							  varlena *oldexternal, uint32 options);
+extern Datum toast_save_datum_context(Relation rel, Datum value,
+									  varlena *oldexternal, uint32 options,
+									  Oid ectx_id, Oid valtype);
 
 extern void toast_valueid_scankey_init(ScanKey entry, Oid toast_typid,
 									   Oid8 valueid);

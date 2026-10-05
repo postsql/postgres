@@ -5198,6 +5198,7 @@ TOAST table "pg_toast.pg_toast_2619"
  chunk_data        | bytea
  chunk_tids        | tid[]
  chunk_tid_offsets | bigint[]
+ chunk_ectx_id     | oid
 Owning table: "pg_catalog.pg_statistic"
 Indexes:
     "pg_toast_2619_index" PRIMARY KEY, btree (chunk_id, chunk_seq) WHERE chunk_id IS NOT NULL

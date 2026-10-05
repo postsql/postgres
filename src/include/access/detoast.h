@@ -123,6 +123,24 @@ extern varlena *detoast_attr_slice(varlena *attr,
 								   int32 slicelength);
 
 /* ----------
+ * detoast_attr_raw_encoding() -
+ *
+ *		Fetches the raw stored bytes of an attribute (concatenating raw
+ *		chunk_data bytes for Direct TOAST datums without invoking
+ *		EncodingContextDecode on chunks).
+ * ----------
+ */
+extern varlena *detoast_attr_raw_encoding(varlena *attr);
+
+/* ----------
+ * toast_decode_chunk_with_context() -
+ *
+ *		Decodes a single TOAST chunk using the specified pg_encoding_context OID.
+ * ----------
+ */
+extern varlena *toast_decode_chunk_with_context(Oid ectx_id, varlena *raw_chunk);
+
+/* ----------
  * toast_raw_datum_size -
  *
  *	Return the raw (detoasted) size of a varlena datum

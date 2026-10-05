@@ -1969,11 +1969,13 @@ check_tuple_attribute(HeapCheckContext *ctx)
 
 static void
 check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute *ta,
-										 ItemPointer tid, uint32 *total_data_bytes)
+										 ItemPointer tid, uint32 *total_data_bytes,
+										 bool *has_ectx)
 {
 	HeapTupleData tup;
 	Buffer		buffer = InvalidBuffer;
 	bool		isnull;
+	bool		has_ectx_chunk = false;
 	Pointer		chunk;
 	int32		chunksize;
 
@@ -1987,6 +1989,18 @@ check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute
 										 ItemPointerGetBlockNumber(tid),
 										 ItemPointerGetOffsetNumber(tid)));
 		return;
+	}
+
+	if (ctx->toast_rel->rd_att->natts >= 6)
+	{
+		bool		is_null_ectx;
+		Datum		ectx_datum = fastgetattr(&tup, 6, ctx->toast_rel->rd_att, &is_null_ectx);
+
+		if (!is_null_ectx && OidIsValid(DatumGetObjectId(ectx_datum)))
+		{
+			has_ectx_chunk = true;
+			*has_ectx = true;
+		}
 	}
 
 	/* Check chunk_data (attribute 3) */
@@ -2010,7 +2024,8 @@ check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute
 			return;
 		}
 
-		if (chunksize > TOAST_MAX_CHUNK_SIZE(TupleDescAttr(ctx->toast_rel->rd_att, 0)->atttypid))
+		if (!has_ectx_chunk &&
+			chunksize > TOAST_MAX_CHUNK_SIZE(TupleDescAttr(ctx->toast_rel->rd_att, 0)->atttypid))
 			report_toast_corruption(ctx, ta,
 									psprintf("direct toast chunk at TID (%u, %u) has oversized chunk (%d bytes)",
 											 ItemPointerGetBlockNumber(tid),
@@ -2038,8 +2053,7 @@ check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute
 				ItemPointer child_tid = (ItemPointer) DatumGetPointer(tids_elems[i]);
 
 				CHECK_FOR_INTERRUPTS();
-
-				check_toasted_attribute_direct_recursive(ctx, ta, child_tid, total_data_bytes);
+				check_toasted_attribute_direct_recursive(ctx, ta, child_tid, total_data_bytes, has_ectx);
 			}
 			pfree(tids_elems);
 		}
@@ -2053,10 +2067,12 @@ check_toasted_attribute_direct(HeapCheckContext *ctx, ToastedAttribute *ta)
 {
 	uint32		extsize = VARATT_DIRECT_GET_EXTSIZE(ta->toast_pointer_direct);
 	uint32		total_data_bytes = 0;
+	bool		has_ectx = false;
 
-	check_toasted_attribute_direct_recursive(ctx, ta, &ta->toast_pointer_direct.va_tid, &total_data_bytes);
+	check_toasted_attribute_direct_recursive(ctx, ta, &ta->toast_pointer_direct.va_tid,
+											 &total_data_bytes, &has_ectx);
 
-	if (total_data_bytes != extsize)
+	if (!has_ectx && total_data_bytes != extsize)
 	{
 		report_toast_corruption(ctx, ta,
 								psprintf("direct toast value was expected to have %u bytes, but found %u bytes across chunks",

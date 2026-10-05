@@ -34,6 +34,32 @@
 
 
 /* ----------
+ * RelationHasEncodingContext -
+ *
+ *	Returns true if the relation has a TOAST table and at least one
+ *	non-dropped column with an associated pg_encoding_context.
+ * ----------
+ */
+bool
+RelationHasEncodingContext(Relation rel)
+{
+	TupleDesc	tupdesc = rel->rd_att;
+
+	if (!OidIsValid(rel->rd_rel->reltoastrelid))
+		return false;
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (!att->attisdropped && OidIsValid(att->attencoding_context))
+			return true;
+	}
+	return false;
+}
+
+
+/* ----------
  * heap_toast_delete -
  *
  *	Cascaded delete toast-entries on DELETE
@@ -155,6 +181,23 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	}
 	ttc.ttc_attr = toast_attr;
 	toast_tuple_init(&ttc);
+
+	/*
+	 * Externalize any non-ignored attribute that has an encoding context bound
+	 * to it so its chunks are encoded by the context and stored in Direct TOAST
+	 * with chunk_ectx_id.
+	 */
+	if (rel->rd_rel->reltoastrelid != InvalidOid)
+	{
+		for (int i = 0; i < numAttrs; i++)
+		{
+			if (OidIsValid(toast_attr[i].tai_encoding_context) &&
+				(toast_attr[i].tai_colflags & TOASTCOL_IGNORE) == 0)
+			{
+				toast_tuple_externalize(&ttc, i, options);
+			}
+		}
+	}
 
 	/* ----------
 	 * Compress and/or save external until data fits into target length

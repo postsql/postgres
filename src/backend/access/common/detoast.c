@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/encoding_context.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/table.h"
@@ -23,6 +24,7 @@
 #include "catalog/pg_type.h"
 #include "common/int.h"
 #include "common/pg_lzcompress.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/expandeddatum.h"
@@ -421,6 +423,7 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 			Pointer		chunk;
 			int32		chunk_size;
 			char	   *chunk_data;
+			Oid			chunk_ectx_id = InvalidOid;
 
 			tup.t_self = meta.direct_tp.va_tid;
 			if (!heap_fetch(toastrel, get_toast_snapshot(), &tup, &buffer, false))
@@ -433,34 +436,75 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 				elog(ERROR, "unexpected NULL chunk_data in direct toast chunk");
 			}
 
-			if (!VARATT_IS_EXTENDED(chunk))
+			if (toastrel->rd_att->natts >= 6)
 			{
-				chunk_size = VARSIZE(chunk) - VARHDRSZ;
-				chunk_data = VARDATA(chunk);
+				bool		is_null_ectx;
+				Datum		ectx_datum;
+
+				ectx_datum = fastgetattr(&tup, 6, toastrel->rd_att, &is_null_ectx);
+				if (!is_null_ectx)
+					chunk_ectx_id = DatumGetObjectId(ectx_datum);
 			}
-			else if (VARATT_IS_SHORT(chunk))
+
+			if (OidIsValid(chunk_ectx_id))
 			{
-				chunk_size = VARSIZE_SHORT(chunk) - VARHDRSZ_SHORT;
-				chunk_data = VARDATA_SHORT(chunk);
+				Size		raw_len = VARSIZE_ANY(chunk);
+				varlena    *raw_copy = (varlena *) palloc(raw_len);
+				varlena    *decoded;
+
+				memcpy(raw_copy, chunk, raw_len);
+				ReleaseBuffer(buffer);
+
+				decoded = toast_decode_chunk_with_context(chunk_ectx_id, raw_copy);
+				pfree(raw_copy);
+
+				chunk_size = VARSIZE_ANY_EXHDR(decoded);
+				chunk_data = VARDATA_ANY(decoded);
+
+				if (sliceoffset >= chunk_size)
+				{
+					slicelength = 0;
+					sliceoffset = 0;
+				}
+				else if (sliceoffset + slicelength > chunk_size || slicelength < 0)
+					slicelength = chunk_size - sliceoffset;
+
+				if (slicelength > 0)
+					memcpy(VARDATA(result), chunk_data + sliceoffset, slicelength);
+
+				pfree(decoded);
 			}
 			else
 			{
+				if (!VARATT_IS_EXTENDED(chunk))
+				{
+					chunk_size = VARSIZE(chunk) - VARHDRSZ;
+					chunk_data = VARDATA(chunk);
+				}
+				else if (VARATT_IS_SHORT(chunk))
+				{
+					chunk_size = VARSIZE_SHORT(chunk) - VARHDRSZ_SHORT;
+					chunk_data = VARDATA_SHORT(chunk);
+				}
+				else
+				{
+					ReleaseBuffer(buffer);
+					elog(ERROR, "unexpected type of toast chunk");
+				}
+
+				if (sliceoffset >= chunk_size)
+				{
+					slicelength = 0;
+					sliceoffset = 0;
+				}
+				else if (sliceoffset + slicelength > chunk_size || slicelength < 0)
+					slicelength = chunk_size - sliceoffset;
+
+				if (slicelength > 0)
+					memcpy(VARDATA(result), chunk_data + sliceoffset, slicelength);
+
 				ReleaseBuffer(buffer);
-				elog(ERROR, "unexpected type of toast chunk");
 			}
-
-			if (sliceoffset >= chunk_size)
-			{
-				slicelength = 0;
-				sliceoffset = 0;
-			}
-			else if (sliceoffset + slicelength > chunk_size || slicelength < 0)
-				slicelength = chunk_size - sliceoffset;
-
-			if (slicelength > 0)
-				memcpy(VARDATA(result), chunk_data + sliceoffset, slicelength);
-
-			ReleaseBuffer(buffer);
 		}
 		else
 		{
@@ -673,6 +717,60 @@ toast_slice_copy_chunk(struct varlena *result, const char *chunk_data,
 }
 
 /*
+ * toast_decode_chunk_with_context -
+ *
+ * Decode a single TOAST chunk using the specified pg_encoding_context OID.
+ * Returns a newly palloc'd 4-byte header varlena containing the decoded chunk.
+ */
+varlena *
+toast_decode_chunk_with_context(Oid ectx_id, varlena *raw_chunk)
+{
+	EncodingContext ectx;
+	varlena    *aligned_chunk;
+	Datum		decoded_datum;
+	varlena    *decoded_varlena;
+
+	if (!OidIsValid(ectx_id))
+		elog(ERROR, "invalid encoding context OID in toast chunk");
+
+	ectx = GetEncodingContext(ectx_id);
+
+	if (VARATT_IS_SHORT(raw_chunk))
+	{
+		Size		sz = VARSIZE_SHORT(raw_chunk) - VARHDRSZ_SHORT;
+
+		aligned_chunk = (varlena *) palloc(sz + VARHDRSZ);
+		SET_VARSIZE(aligned_chunk, sz + VARHDRSZ);
+		if (sz > 0)
+			memcpy(VARDATA(aligned_chunk), VARDATA_SHORT(raw_chunk), sz);
+	}
+	else if (!VARATT_IS_EXTENDED(raw_chunk))
+	{
+		Size		sz = VARSIZE(raw_chunk) - VARHDRSZ;
+
+		aligned_chunk = (varlena *) palloc(sz + VARHDRSZ);
+		SET_VARSIZE(aligned_chunk, sz + VARHDRSZ);
+		if (sz > 0)
+			memcpy(VARDATA(aligned_chunk), VARDATA(raw_chunk), sz);
+	}
+	else
+	{
+		elog(ERROR, "unexpected extended varlena in toast chunk");
+		return NULL;
+	}
+
+	decoded_datum = EncodingContextDecode(ectx,
+										  PointerGetDatum(aligned_chunk),
+										  InvalidOid);
+	decoded_varlena = (varlena *) DatumGetPointer(decoded_datum);
+
+	if (decoded_varlena != aligned_chunk)
+		pfree(aligned_chunk);
+
+	return decoded_varlena;
+}
+
+/*
  * toast_fetch_datum_direct_slice_recursive -
  *
  * Traverse a Direct TOAST tree/DAG to retrieve full datums or partial slices.
@@ -682,7 +780,7 @@ toast_slice_copy_chunk(struct varlena *result, const char *chunk_data,
  * (both chunk_tids and chunk_tid_offsets populated).
  *
  * - Leaf chunks (chunk_tids IS NULL) copy their slice payload directly into
- *   the result buffer at *logical_offset.
+ *   the result buffer at *logical_offset (decoding first if chunk_ectx_id is set).
  * - Flat multi-chunk roots iterate through all child TIDs in chunk_tids.
  * - Interior tree chunks inspect chunk_tid_offsets to prune any subtrees that
  *   do not overlap the requested range [sliceoffset, sliceoffset + slicelength),
@@ -716,15 +814,51 @@ toast_fetch_datum_direct_slice_recursive(Relation toastrel, ItemPointer tid,
 		/* Leaf chunk: copy data slice */
 		if (!is_null_data)
 		{
-			struct varlena *data_val = PG_DETOAST_DATUM(data_datum);
-			int32		chunk_size = VARSIZE_ANY_EXHDR(data_val);
+			Oid			chunk_ectx_id = InvalidOid;
 			int32		req_start = sliceoffset;
 			int32		req_end = sliceoffset + slicelength;
 
-			toast_slice_copy_chunk(result, VARDATA_ANY(data_val), chunk_size,
-								   logical_offset, req_start, req_end);
+			if (toastrel->rd_att->natts >= 6)
+			{
+				bool		is_null_ectx;
+				Datum		ectx_datum = slot_getattr(slot, 6, &is_null_ectx);
+
+				if (!is_null_ectx)
+					chunk_ectx_id = DatumGetObjectId(ectx_datum);
+			}
+
+			if (OidIsValid(chunk_ectx_id))
+			{
+				struct varlena *raw_val = PG_DETOAST_DATUM_COPY(data_datum);
+				struct varlena *decoded;
+				int32		chunk_size;
+
+				ExecClearTuple(slot);
+
+				decoded = toast_decode_chunk_with_context(chunk_ectx_id, raw_val);
+				pfree(raw_val);
+
+				chunk_size = VARSIZE_ANY_EXHDR(decoded);
+				toast_slice_copy_chunk(result, VARDATA_ANY(decoded), chunk_size,
+									   logical_offset, req_start, req_end);
+				pfree(decoded);
+			}
+			else
+			{
+				struct varlena *data_val = PG_DETOAST_DATUM(data_datum);
+				int32		chunk_size = VARSIZE_ANY_EXHDR(data_val);
+
+				toast_slice_copy_chunk(result, VARDATA_ANY(data_val), chunk_size,
+									   logical_offset, req_start, req_end);
+				if ((Pointer) data_val != DatumGetPointer(data_datum))
+					pfree(data_val);
+				ExecClearTuple(slot);
+			}
 		}
-		ExecClearTuple(slot);
+		else
+		{
+			ExecClearTuple(slot);
+		}
 	}
 	else
 	{
@@ -794,14 +928,21 @@ toast_fetch_datum_direct_slice_recursive(Relation toastrel, ItemPointer tid,
 			int32		chunk_size = 0;
 			char	   *chunk_data = NULL;
 			struct varlena *data_val = NULL;
+			Oid			root_ectx_id = InvalidOid;
 			int64		req_start = sliceoffset;
 			int64		req_end = (slicelength < 0) ? PG_INT64_MAX : ((int64) sliceoffset + slicelength);
 
 			if (!is_null_data)
 			{
 				data_val = PG_DETOAST_DATUM_COPY(data_datum);
-				chunk_size = VARSIZE_ANY_EXHDR(data_val);
-				chunk_data = VARDATA_ANY(data_val);
+				if (toastrel->rd_att->natts >= 6)
+				{
+					bool		is_null_ectx;
+					Datum		ectx_datum = slot_getattr(slot, 6, &is_null_ectx);
+
+					if (!is_null_ectx)
+						root_ectx_id = DatumGetObjectId(ectx_datum);
+				}
 			}
 
 			ExecClearTuple(slot);
@@ -829,29 +970,162 @@ toast_fetch_datum_direct_slice_recursive(Relation toastrel, ItemPointer tid,
 				*logical_offset = (int32) child_end;
 			}
 
-			if (chunk_size > 0)
+			if (data_val != NULL)
 			{
 				int64		root_start = (int64) nelems * max_chunk_size;
-				int64		root_end = root_start + chunk_size;
 
-				if (root_end > req_start && root_start < req_end)
+				if (root_start < req_end)
 				{
-					int32		copy_req_end = (slicelength < 0) ? PG_INT32_MAX : (sliceoffset + slicelength);
+					if (OidIsValid(root_ectx_id))
+					{
+						struct varlena *decoded = toast_decode_chunk_with_context(root_ectx_id, data_val);
 
-					*logical_offset = (int32) root_start;
-					toast_slice_copy_chunk(result, chunk_data, chunk_size,
-										   logical_offset, sliceoffset, copy_req_end);
+						pfree(data_val);
+						data_val = decoded;
+					}
+
+					chunk_size = VARSIZE_ANY_EXHDR(data_val);
+					chunk_data = VARDATA_ANY(data_val);
+
+					if (chunk_size > 0)
+					{
+						int64		root_end = root_start + chunk_size;
+
+						if (root_end > req_start && root_start < req_end)
+						{
+							int32		copy_req_end = (slicelength < 0) ? PG_INT32_MAX : (sliceoffset + slicelength);
+
+							*logical_offset = (int32) root_start;
+							toast_slice_copy_chunk(result, chunk_data, chunk_size,
+												   logical_offset, sliceoffset, copy_req_end);
+						}
+						else
+							*logical_offset = (int32) root_end;
+					}
 				}
-				else
-					*logical_offset = (int32) root_end;
-			}
 
-			if (data_val)
 				pfree(data_val);
+			}
 		}
 
 		pfree(elems);
 		pfree(nulls);
 		pfree(arr);
 	}
+}
+
+/*
+ * toast_fetch_datum_direct_raw_recursive -
+ *
+ * Traverse a Direct TOAST tree/DAG and append raw stored chunk_data bytes
+ * (without invoking toast_decode_chunk_with_context) into buf.
+ */
+static void
+toast_fetch_datum_direct_raw_recursive(Relation toastrel, ItemPointer tid,
+									   StringInfo buf, TupleTableSlot *slot)
+{
+	Snapshot	snapshot = get_toast_snapshot();
+	Datum		data_datum;
+	Datum		tids_datum;
+	bool		is_null_data;
+	bool		is_null_tids;
+
+	if (!table_tuple_fetch_row_version(toastrel, tid, snapshot, slot))
+		elog(ERROR, "failed to fetch toast tuple by TID");
+
+	data_datum = slot_getattr(slot, 3, &is_null_data);
+	tids_datum = slot_getattr(slot, 4, &is_null_tids);
+	if (is_null_tids)
+	{
+		if (!is_null_data)
+		{
+			struct varlena *data_val = PG_DETOAST_DATUM(data_datum);
+
+			appendBinaryStringInfo(buf, VARDATA_ANY(data_val), VARSIZE_ANY_EXHDR(data_val));
+			if ((Pointer) data_val != DatumGetPointer(data_datum))
+				pfree(data_val);
+		}
+		ExecClearTuple(slot);
+	}
+	else
+	{
+		ArrayType  *arr = DatumGetArrayTypePCopy(tids_datum);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		struct varlena *tail_val = NULL;
+
+		if (!is_null_data)
+			tail_val = PG_DETOAST_DATUM_COPY(data_datum);
+
+		ExecClearTuple(slot);
+
+		deconstruct_array_builtin(arr, TIDOID, &elems, &nulls, &nelems);
+		for (int i = 0; i < nelems; i++)
+		{
+			toast_fetch_datum_direct_raw_recursive(toastrel,
+												   (ItemPointer) DatumGetPointer(elems[i]),
+												   buf, slot);
+		}
+
+		if (tail_val != NULL)
+		{
+			appendBinaryStringInfo(buf, VARDATA_ANY(tail_val), VARSIZE_ANY_EXHDR(tail_val));
+			pfree(tail_val);
+		}
+
+		pfree(elems);
+		pfree(nulls);
+		pfree(arr);
+	}
+}
+
+/* ----------
+ * detoast_attr_raw_encoding() -
+ *
+ *		Fetches the raw stored bytes of an attribute (concatenating raw
+ *		chunk_data bytes for Direct TOAST datums without invoking
+ *		EncodingContextDecode on chunks).
+ * ----------
+ */
+varlena *
+detoast_attr_raw_encoding(varlena *attr)
+{
+	if (VARATT_IS_EXTERNAL_DIRECT(attr))
+	{
+		ToastExternalMetadata meta;
+		Relation	toastrel;
+		TupleTableSlot *slot;
+		StringInfoData buf;
+		varlena    *result;
+
+		toast_get_external_metadata(attr, &meta);
+		initStringInfo(&buf);
+
+		toastrel = table_open(meta.toastrelid, AccessShareLock);
+		slot = table_slot_create(toastrel, NULL);
+
+		toast_fetch_datum_direct_raw_recursive(toastrel, &meta.direct_tp.va_tid,
+											   &buf, slot);
+
+		ExecDropSingleTupleTableSlot(slot);
+		table_close(toastrel, AccessShareLock);
+
+		result = (varlena *) palloc(buf.len + VARHDRSZ);
+		SET_VARSIZE(result, buf.len + VARHDRSZ);
+		if (buf.len > 0)
+			memcpy(VARDATA(result), buf.data, buf.len);
+
+		pfree(buf.data);
+		return result;
+	}
+	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
+	{
+		varatt_indirect redirect;
+
+		VARATT_EXTERNAL_GET_POINTER(redirect, attr);
+		return detoast_attr_raw_encoding(redirect.pointer);
+	}
+
+	return detoast_attr(attr);
 }

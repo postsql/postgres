@@ -449,6 +449,8 @@ static Datum
 EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype)
 {
 	LOCAL_FCINFO(fcinfo, 2);
+	Oid			actual_valtype;
+	List	   *fargs;
 	FuncExpr   *fexpr;
 	Node	   *old_expr;
 	Datum		result;
@@ -469,11 +471,13 @@ EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype)
 						format_type_be(ectx->target_typid),
 						format_type_be(valtype))));
 
+	actual_valtype = OidIsValid(valtype) ? valtype :
+		(OidIsValid(ectx->target_typid) ? ectx->target_typid : BYTEAOID);
+	fargs = list_make2(makeNullConst(INTERNALOID, -1, InvalidOid),
+					   makeNullConst(actual_valtype, -1, InvalidOid));
 	fexpr = makeFuncExpr(ectx->enc_fn,
 						 BYTEAOID,
-						 list_make2(makeNullConst(INTERNALOID, -1, InvalidOid),
-									makeNullConst(OidIsValid(valtype) ? valtype : BYTEAOID,
-												  -1, InvalidOid)),
+						 fargs,
 						 InvalidOid,
 						 InvalidOid,
 						 COERCE_EXPLICIT_CALL);
@@ -489,6 +493,8 @@ EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype)
 
 	result = FunctionCallInvoke(fcinfo);
 	ectx->enc_flinfo.fn_expr = old_expr;
+	pfree(fexpr);
+	list_free_deep(fargs);
 
 	if (fcinfo->isnull)
 		ereport(ERROR,
@@ -507,6 +513,8 @@ static Datum
 EncodingContextInvokeSingleDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype)
 {
 	LOCAL_FCINFO(fcinfo, 2);
+	Oid			actual_resulttype;
+	List	   *fargs;
 	FuncExpr   *fexpr;
 	Node	   *old_expr;
 	Datum		result;
@@ -527,10 +535,13 @@ EncodingContextInvokeSingleDecode(EncodingContext ectx, Datum encoded_bytea, Oid
 						format_type_be(ectx->target_typid),
 						format_type_be(resulttype))));
 
+	actual_resulttype = OidIsValid(resulttype) ? resulttype :
+		(OidIsValid(ectx->target_typid) ? ectx->target_typid : BYTEAOID);
+	fargs = list_make2(makeNullConst(INTERNALOID, -1, InvalidOid),
+					   makeNullConst(BYTEAOID, -1, InvalidOid));
 	fexpr = makeFuncExpr(ectx->dec_fn,
-						 OidIsValid(resulttype) ? resulttype : BYTEAOID,
-						 list_make2(makeNullConst(INTERNALOID, -1, InvalidOid),
-									makeNullConst(BYTEAOID, -1, InvalidOid)),
+						 actual_resulttype,
+						 fargs,
 						 InvalidOid,
 						 InvalidOid,
 						 COERCE_EXPLICIT_CALL);
@@ -546,6 +557,8 @@ EncodingContextInvokeSingleDecode(EncodingContext ectx, Datum encoded_bytea, Oid
 
 	result = FunctionCallInvoke(fcinfo);
 	ectx->dec_flinfo.fn_expr = old_expr;
+	pfree(fexpr);
+	list_free_deep(fargs);
 
 	if (fcinfo->isnull)
 		ereport(ERROR,
@@ -591,8 +604,12 @@ EncodingContextEncode(EncodingContext ectx, Datum val, Oid valtype)
 	/* Execute from root parent (nstages - 1) down to leaf (0) */
 	for (int i = nstages - 1; i >= 0; i--)
 	{
+		Datum		prev_datum = cur_datum;
+
 		CHECK_FOR_INTERRUPTS();
 		cur_datum = EncodingContextInvokeSingleEncode(chain[i], cur_datum, cur_type);
+		if (prev_datum != val && DatumGetPointer(prev_datum) != DatumGetPointer(cur_datum))
+			pfree(DatumGetPointer(prev_datum));
 		cur_type = BYTEAOID;
 	}
 
@@ -620,6 +637,7 @@ EncodingContextDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype)
 	while (curr != NULL)
 	{
 		Oid			stage_resulttype;
+		Datum		prev_datum = cur_datum;
 
 		CHECK_FOR_INTERRUPTS();
 		if (depth >= MAX_ENCODING_CONTEXT_DEPTH)
@@ -631,6 +649,8 @@ EncodingContextDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype)
 		/* Intermediate stages output BYTEAOID; only the root stage outputs resulttype */
 		stage_resulttype = (curr->parent != NULL) ? BYTEAOID : resulttype;
 		cur_datum = EncodingContextInvokeSingleDecode(curr, cur_datum, stage_resulttype);
+		if (prev_datum != encoded_bytea && DatumGetPointer(prev_datum) != DatumGetPointer(cur_datum))
+			pfree(DatumGetPointer(prev_datum));
 
 		curr = curr->parent;
 		depth++;
@@ -1992,7 +2012,7 @@ pg_column_raw_encoding(PG_FUNCTION_ARGS)
 	if (typlen == -1)
 	{
 		struct varlena *v = (struct varlena *) DatumGetPointer(val);
-		struct varlena *detoasted = detoast_attr(v);
+		struct varlena *detoasted = detoast_attr_raw_encoding(v);
 		Size		len = VARSIZE_ANY_EXHDR(detoasted);
 
 		result = (bytea *) palloc(VARHDRSZ + len);

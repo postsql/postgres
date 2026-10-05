@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/encoding_context.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
@@ -61,7 +62,8 @@ typedef struct DirectToastItem
 static bool toastrel_valueid_exists(Relation toastrel, Oid8 valueid);
 static bool toastid_valueid_exists(Oid toastrelid, Oid8 valueid);
 static Datum toast_save_datum_direct(Relation rel, Datum value,
-									 varlena *oldexternal, int options);
+									 varlena *oldexternal, int options,
+									 Oid ectx_id, Oid valtype);
 static void toast_delete_datum_direct(Relation rel, Datum value, bool is_speculative);
 static void toast_delete_datum_direct_recursive(Relation toastrel, ItemPointer tid, bool is_speculative);
 
@@ -225,6 +227,15 @@ Datum
 toast_save_datum(Relation rel, Datum value,
 				 varlena *oldexternal, uint32 options)
 {
+	return toast_save_datum_context(rel, value, oldexternal, options,
+									InvalidOid, InvalidOid);
+}
+
+Datum
+toast_save_datum_context(Relation rel, Datum value,
+						 varlena *oldexternal, uint32 options,
+						 Oid ectx_id, Oid valtype)
+{
 	Relation	toastrel;
 	Relation   *toastidxs;
 	TupleDesc	toasttupDesc;
@@ -247,8 +258,9 @@ toast_save_datum(Relation rel, Datum value,
 
 	Assert(!VARATT_IS_EXTERNAL(dval));
 
-	if (RelationGetToastFlavour(rel) == TOAST_FLAVOUR_DIRECT)
-		return toast_save_datum_direct(rel, value, oldexternal, options);
+	if (RelationGetToastFlavour(rel) == TOAST_FLAVOUR_DIRECT || OidIsValid(ectx_id))
+		return toast_save_datum_direct(rel, value, oldexternal, options,
+									   ectx_id, valtype);
 
 	/*
 	 * Open the toast relation and its indexes.  We can use the index to check
@@ -359,8 +371,8 @@ toast_save_datum(Relation rel, Datum value,
 	while (data_todo > 0)
 	{
 		HeapTuple	toasttup;
-		Datum		t_values[5];
-		bool		t_isnull[5] = {0};
+		Datum		t_values[6];
+		bool		t_isnull[6] = {0};
 		union
 		{
 			alignas(int32) varlena hdr;
@@ -393,6 +405,8 @@ toast_save_datum(Relation rel, Datum value,
 		t_isnull[3] = true;
 		t_values[4] = PointerGetDatum(NULL);
 		t_isnull[4] = true;
+		t_values[5] = (Datum) 0;
+		t_isnull[5] = true;
 
 		toasttup = heap_form_tuple(toasttupDesc, t_values, t_isnull);
 
@@ -790,11 +804,14 @@ typedef struct DirectToastWriteState
 	int			options;
 	int32		chunk_seq;
 	int32		max_chunk_size;
+	EncodingContext ectx;
+	Oid			valtype;
 } DirectToastWriteState;
 
 /*
  * Helper to form and insert a direct TOAST chunk tuple into the toast table.
- * Encapsulates array construction and memory management for child TIDs and offsets.
+ * Encapsulates array construction, per-chunk encoding context evaluation,
+ * and memory management for child TIDs and offsets.
  */
 static inline ItemPointerData
 toast_direct_insert_chunk(DirectToastWriteState *state,
@@ -802,12 +819,14 @@ toast_direct_insert_chunk(DirectToastWriteState *state,
 						  const ItemPointerData *tids, int num_tids,
 						  const int64 *offsets, int num_offsets)
 {
-	Datum		t_values[5];
-	bool		t_isnull[5];
+	Datum		t_values[6];
+	bool		t_isnull[6];
 	HeapTuple	toasttup;
 	ItemPointerData tid;
 	ArrayType  *tid_array = NULL;
 	ArrayType  *offset_array = NULL;
+	Datum		encoded_datum = (Datum) 0;
+	bool		free_encoded = false;
 	union
 	{
 		struct varlena hdr;
@@ -821,11 +840,24 @@ toast_direct_insert_chunk(DirectToastWriteState *state,
 	t_values[1] = Int32GetDatum(state->chunk_seq++);
 	t_isnull[1] = false;
 
-	if (chunk_data_p && chunk_size > 0)
+	if (chunk_data_p != NULL)
 	{
 		SET_VARSIZE(&chunk_buf, chunk_size + VARHDRSZ);
-		memcpy(VARDATA(&chunk_buf), chunk_data_p, chunk_size);
-		t_values[2] = PointerGetDatum(&chunk_buf);
+		if (chunk_size > 0)
+			memcpy(VARDATA(&chunk_buf), chunk_data_p, chunk_size);
+
+		if (state->ectx != NULL)
+		{
+			encoded_datum = EncodingContextEncode(state->ectx,
+												  PointerGetDatum(&chunk_buf),
+												  state->valtype);
+			t_values[2] = encoded_datum;
+			free_encoded = (DatumGetPointer(encoded_datum) != (Pointer) &chunk_buf);
+		}
+		else
+		{
+			t_values[2] = PointerGetDatum(&chunk_buf);
+		}
 		t_isnull[2] = false;
 	}
 	else
@@ -870,11 +902,24 @@ toast_direct_insert_chunk(DirectToastWriteState *state,
 		t_isnull[4] = true;
 	}
 
+	if (chunk_data_p != NULL && state->ectx != NULL)
+	{
+		t_values[5] = ObjectIdGetDatum(state->ectx->context_id);
+		t_isnull[5] = false;
+	}
+	else
+	{
+		t_values[5] = (Datum) 0;
+		t_isnull[5] = true;
+	}
+
 	toasttup = heap_form_tuple(state->toasttupDesc, t_values, t_isnull);
 	heap_insert(state->toastrel, toasttup, state->mycid, state->options, NULL);
 	tid = toasttup->t_self;
 	heap_freetuple(toasttup);
 
+	if (free_encoded)
+		pfree(DatumGetPointer(encoded_datum));
 	if (tid_array)
 		pfree(tid_array);
 	if (offset_array)
@@ -1010,7 +1055,8 @@ toast_save_direct_tree(DirectToastWriteState *state,
  */
 static Datum
 toast_save_datum_direct(Relation rel, Datum value,
-						struct varlena *oldexternal, int options)
+						struct varlena *oldexternal, int options,
+						Oid ectx_id, Oid valtype)
 {
 	DirectToastWriteState state;
 	struct varatt_direct toast_pointer;
@@ -1029,8 +1075,11 @@ toast_save_datum_direct(Relation rel, Datum value,
 	state.options = options;
 	state.chunk_seq = 0;
 	state.max_chunk_size = TOAST_MAX_CHUNK_SIZE(TupleDescAttr(state.toasttupDesc, 0)->atttypid);
+	state.ectx = OidIsValid(ectx_id) ? GetEncodingContext(ectx_id) : NULL;
+	state.valtype = valtype;
 
-	if (state.toasttupDesc->natts < 5)
+	if (state.toasttupDesc->natts < 5 ||
+		(state.ectx != NULL && state.toasttupDesc->natts < 6))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot write direct TOAST datum to legacy TOAST table \"%s\"",
@@ -1068,7 +1117,7 @@ toast_save_datum_direct(Relation rel, Datum value,
 	else
 		toast_pointer.va_toastrelid = RelationGetRelid(state.toastrel);
 
-	total_chunks = ((data_todo - 1) / state.max_chunk_size) + 1;
+	total_chunks = (data_todo <= 0) ? 1 : (((data_todo - 1) / state.max_chunk_size) + 1);
 
 	if (total_chunks == 1)
 		toast_pointer.va_tid = toast_save_direct_single(&state, data_p, data_todo);

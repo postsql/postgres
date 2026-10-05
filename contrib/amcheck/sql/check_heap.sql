@@ -174,6 +174,22 @@ INSERT INTO direct_toast_check SELECT i, string_agg(md5(i::text), '') FROM gener
 SELECT * FROM verify_heapam('direct_toast_check', check_toast := true);
 DROP TABLE direct_toast_check;
 
+-- Check that Direct TOAST tables with encoding context chunks pass verification
+CREATE ENCODING TYPE amcheck_pglz_type (
+	KIND = 'c',
+	TYPE = 'pglz',
+	ENCFUNC = pg_pglz_context_encode,
+	DECFUNC = pg_pglz_context_decode
+);
+CREATE ENCODING CONTEXT amcheck_pglz_ctx TYPE amcheck_pglz_type FOR TYPE text;
+CREATE TABLE direct_toast_ectx_check (id int, val text);
+ALTER TABLE direct_toast_ectx_check ALTER COLUMN val SET ENCODING CONTEXT amcheck_pglz_ctx;
+INSERT INTO direct_toast_ectx_check VALUES (1, repeat('amcheck_direct_toast_ectx_', 500));
+SELECT * FROM verify_heapam('direct_toast_ectx_check', check_toast := true);
+DROP TABLE direct_toast_ectx_check;
+DROP ENCODING CONTEXT amcheck_pglz_ctx;
+DROP ENCODING TYPE amcheck_pglz_type;
+
 -- cleanup
 DROP TABLE test_toast_oid;
 DROP TABLE test_toast_oid8;

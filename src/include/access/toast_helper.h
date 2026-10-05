@@ -33,6 +33,8 @@ typedef struct
 	int32		tai_size;
 	uint8		tai_colflags;
 	char		tai_compression;
+	Oid			tai_encoding_context;
+	Oid			tai_atttypid;
 } ToastAttrInfo;
 
 /*

@@ -260,7 +260,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	}
 
 	/* this is pretty painful...  need a tuple descriptor */
-	tupdesc = CreateTemplateTupleDesc(5);
+	tupdesc = CreateTemplateTupleDesc(6);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1,
 					   "chunk_id",
 					   toast_chunkid_typid,
@@ -277,7 +277,8 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 * Direct TOAST columns:
 	 * chunk_tids stores child chunk TIDs for flat multi-chunk roots and interior DAG nodes.
 	 * chunk_tid_offsets stores byte offsets within chunk_tids for binary-search slicing.
-	 * Both columns are NULL for simple leaf chunks or legacy plain TOAST rows.
+	 * chunk_ectx_id stores the pg_encoding_context OID used to encode chunk_data.
+	 * These columns are NULL for legacy plain TOAST rows.
 	 */
 	TupleDescInitEntry(tupdesc, (AttrNumber) 4,
 					   "chunk_tids",
@@ -286,6 +287,10 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	TupleDescInitEntry(tupdesc, (AttrNumber) 5,
 					   "chunk_tid_offsets",
 					   INT8ARRAYOID,
+					   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6,
+					   "chunk_ectx_id",
+					   OIDOID,
 					   -1, 0);
 
 	/*
@@ -298,6 +303,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	TupleDescAttr(tupdesc, 2)->attstorage = TYPSTORAGE_PLAIN;
 	TupleDescAttr(tupdesc, 3)->attstorage = TYPSTORAGE_PLAIN;
 	TupleDescAttr(tupdesc, 4)->attstorage = TYPSTORAGE_PLAIN;
+	TupleDescAttr(tupdesc, 5)->attstorage = TYPSTORAGE_PLAIN;
 
 	/* Toast field should not be compressed */
 	TupleDescAttr(tupdesc, 0)->attcompression = InvalidCompressionMethod;
@@ -305,12 +311,14 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	TupleDescAttr(tupdesc, 2)->attcompression = InvalidCompressionMethod;
 	TupleDescAttr(tupdesc, 3)->attcompression = InvalidCompressionMethod;
 	TupleDescAttr(tupdesc, 4)->attcompression = InvalidCompressionMethod;
+	TupleDescAttr(tupdesc, 5)->attcompression = InvalidCompressionMethod;
 
 	populate_compact_attribute(tupdesc, 0);
 	populate_compact_attribute(tupdesc, 1);
 	populate_compact_attribute(tupdesc, 2);
 	populate_compact_attribute(tupdesc, 3);
 	populate_compact_attribute(tupdesc, 4);
+	populate_compact_attribute(tupdesc, 5);
 
 	TupleDescFinalize(tupdesc);
 
@@ -613,41 +621,72 @@ ensure_direct_toast(Oid relid)
 		elog(ERROR, "relation %u is not a TOAST table", toastrelid);
 
 	/*
-	 * Step 1: Add missing columns chunk_tids and chunk_tid_offsets if needed.
+	 * Step 1a: Add missing columns chunk_tids and chunk_tid_offsets if needed
+	 * (upgrading a 3-column legacy TOAST table).
 	 */
 	if (toastrel->rd_att->natts < 5)
 	{
-		td = CreateTemplateTupleDesc(2);
-		TupleDescInitEntry(td, (AttrNumber) 1,
-						   "chunk_tids",
-						   TIDARRAYOID,
-						   -1, 0);
-		TupleDescInitEntry(td, (AttrNumber) 2,
-						   "chunk_tid_offsets",
-						   INT8ARRAYOID,
-						   -1, 0);
-		TupleDescAttr(td, 0)->attnum = 4;
-		TupleDescAttr(td, 0)->attstorage = TYPSTORAGE_PLAIN;
-		TupleDescAttr(td, 0)->attcompression = InvalidCompressionMethod;
-		TupleDescAttr(td, 1)->attnum = 5;
-		TupleDescAttr(td, 1)->attstorage = TYPSTORAGE_PLAIN;
-		TupleDescAttr(td, 1)->attcompression = InvalidCompressionMethod;
+		if (!SearchSysCacheExists2(ATTNUM, ObjectIdGetDatum(toastrelid), Int16GetDatum(4)))
+		{
+			td = CreateTemplateTupleDesc(2);
+			TupleDescInitEntry(td, (AttrNumber) 1,
+							   "chunk_tids",
+							   TIDARRAYOID,
+							   -1, 0);
+			TupleDescInitEntry(td, (AttrNumber) 2,
+							   "chunk_tid_offsets",
+							   INT8ARRAYOID,
+							   -1, 0);
+			TupleDescAttr(td, 0)->attnum = 4;
+			TupleDescAttr(td, 0)->attstorage = TYPSTORAGE_PLAIN;
+			TupleDescAttr(td, 0)->attcompression = InvalidCompressionMethod;
+			TupleDescAttr(td, 1)->attnum = 5;
+			TupleDescAttr(td, 1)->attstorage = TYPSTORAGE_PLAIN;
+			TupleDescAttr(td, 1)->attcompression = InvalidCompressionMethod;
 
-		populate_compact_attribute(td, 0);
-		populate_compact_attribute(td, 1);
-		TupleDescFinalize(td);
+			populate_compact_attribute(td, 0);
+			populate_compact_attribute(td, 1);
+			TupleDescFinalize(td);
 
-		pg_attribute_rel = table_open(AttributeRelationId, RowExclusiveLock);
-		InsertPgAttributeTuples(pg_attribute_rel, td, toastrelid, NULL, NULL);
-		table_close(pg_attribute_rel, RowExclusiveLock);
-		FreeTupleDesc(td);
+			pg_attribute_rel = table_open(AttributeRelationId, RowExclusiveLock);
+			InsertPgAttributeTuples(pg_attribute_rel, td, toastrelid, NULL, NULL);
+			table_close(pg_attribute_rel, RowExclusiveLock);
+			FreeTupleDesc(td);
+		}
+	}
 
-		/* Update pg_class.relnatts = 5 */
+	/*
+	 * Step 1b: Add missing column chunk_ectx_id if needed (upgrading a
+	 * 3-column or 5-column TOAST table to the 6-column Direct TOAST schema).
+	 */
+	if (toastrel->rd_att->natts < 6)
+	{
+		if (!SearchSysCacheExists2(ATTNUM, ObjectIdGetDatum(toastrelid), Int16GetDatum(6)))
+		{
+			td = CreateTemplateTupleDesc(1);
+			TupleDescInitEntry(td, (AttrNumber) 1,
+							   "chunk_ectx_id",
+							   OIDOID,
+							   -1, 0);
+			TupleDescAttr(td, 0)->attnum = 6;
+			TupleDescAttr(td, 0)->attstorage = TYPSTORAGE_PLAIN;
+			TupleDescAttr(td, 0)->attcompression = InvalidCompressionMethod;
+
+			populate_compact_attribute(td, 0);
+			TupleDescFinalize(td);
+
+			pg_attribute_rel = table_open(AttributeRelationId, RowExclusiveLock);
+			InsertPgAttributeTuples(pg_attribute_rel, td, toastrelid, NULL, NULL);
+			table_close(pg_attribute_rel, RowExclusiveLock);
+			FreeTupleDesc(td);
+		}
+
+		/* Update pg_class.relnatts = 6 */
 		pg_class_rel = table_open(RelationRelationId, RowExclusiveLock);
 		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(toastrelid));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for relation %u", toastrelid);
-		((Form_pg_class) GETSTRUCT(tuple))->relnatts = 5;
+		((Form_pg_class) GETSTRUCT(tuple))->relnatts = 6;
 		CatalogTupleUpdate(pg_class_rel, &tuple->t_self, tuple);
 		heap_freetuple(tuple);
 		table_close(pg_class_rel, RowExclusiveLock);
