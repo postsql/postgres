@@ -28,6 +28,7 @@
 #include "access/tableam.h"
 #include "access/tupconvert.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "commands/copyapi.h"
 #include "commands/copyfrom_internal.h"
@@ -561,42 +562,75 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 						   buffer->bistate);
 		MemoryContextSwitchTo(oldcontext);
 
-		for (i = 0; i < nused; i++)
 		{
-			/*
-			 * If there are any indexes, update them for all the inserted
-			 * tuples, and run AFTER ROW INSERT triggers.
-			 */
-			if (resultRelInfo->ri_NumIndices > 0)
-			{
-				List	   *recheckIndexes;
+			bool		immediate_vis =
+				RelationHasImmediateInsertVisibility(resultRelInfo->ri_RelationDesc);
+			XLogRecPtr	last_freeze_lsn = InvalidXLogRecPtr;
 
-				cstate->cur_lineno = buffer->linenos[i];
-				recheckIndexes =
-					ExecInsertIndexTuples(resultRelInfo,
-										  estate, 0, buffer->slots[i],
-										  NIL, NULL);
-				ExecARInsertTriggers(estate, resultRelInfo,
-									 slots[i], recheckIndexes,
-									 cstate->transition_capture);
-				list_free(recheckIndexes);
+			for (i = 0; i < nused; i++)
+			{
+				/*
+				 * If there are any indexes, update them for all the inserted
+				 * tuples, and run AFTER ROW INSERT triggers.
+				 */
+				if (resultRelInfo->ri_NumIndices > 0)
+				{
+					List	   *recheckIndexes;
+
+					cstate->cur_lineno = buffer->linenos[i];
+					recheckIndexes =
+						ExecInsertIndexTuples(resultRelInfo,
+											  estate, 0, buffer->slots[i],
+											  NIL, NULL);
+					if (immediate_vis)
+					{
+						XLogRecPtr	lsn;
+
+						lsn = heap_freeze_inserted_tuple(resultRelInfo->ri_RelationDesc,
+														 &slots[i]->tts_tid,
+														 false);
+						if (lsn > last_freeze_lsn)
+							last_freeze_lsn = lsn;
+					}
+					ExecARInsertTriggers(estate, resultRelInfo,
+										 slots[i], recheckIndexes,
+										 cstate->transition_capture);
+					list_free(recheckIndexes);
+				}
+
+				/*
+				 * There's no indexes, but see if we need to run AFTER ROW
+				 * INSERT triggers anyway.
+				 */
+				else
+				{
+					if (immediate_vis)
+					{
+						XLogRecPtr	lsn;
+
+						lsn = heap_freeze_inserted_tuple(resultRelInfo->ri_RelationDesc,
+														 &slots[i]->tts_tid,
+														 false);
+						if (lsn > last_freeze_lsn)
+							last_freeze_lsn = lsn;
+					}
+
+					if (resultRelInfo->ri_TrigDesc != NULL &&
+						(resultRelInfo->ri_TrigDesc->trig_insert_after_row ||
+						 resultRelInfo->ri_TrigDesc->trig_insert_new_table))
+					{
+						cstate->cur_lineno = buffer->linenos[i];
+						ExecARInsertTriggers(estate, resultRelInfo,
+											 slots[i], NIL,
+											 cstate->transition_capture);
+					}
+				}
+
+				ExecClearTuple(slots[i]);
 			}
 
-			/*
-			 * There's no indexes, but see if we need to run AFTER ROW INSERT
-			 * triggers anyway.
-			 */
-			else if (resultRelInfo->ri_TrigDesc != NULL &&
-					 (resultRelInfo->ri_TrigDesc->trig_insert_after_row ||
-					  resultRelInfo->ri_TrigDesc->trig_insert_new_table))
-			{
-				cstate->cur_lineno = buffer->linenos[i];
-				ExecARInsertTriggers(estate, resultRelInfo,
-									 slots[i], NIL,
-									 cstate->transition_capture);
-			}
-
-			ExecClearTuple(slots[i]);
+			if (immediate_insert_wal_flush && XLogRecPtrIsValid(last_freeze_lsn))
+				XLogFlush(last_freeze_lsn);
 		}
 
 		/* Update the row counter and progress of the COPY command */
@@ -1434,6 +1468,10 @@ CopyFrom(CopyFromState cstate)
 																   estate, 0,
 																   myslot, NIL,
 																   NULL);
+
+						if (RelationHasImmediateInsertVisibility(resultRelInfo->ri_RelationDesc))
+							heap_freeze_inserted_tuple(resultRelInfo->ri_RelationDesc,
+													   &myslot->tts_tid, true);
 					}
 
 					/* AFTER ROW INSERT Triggers */

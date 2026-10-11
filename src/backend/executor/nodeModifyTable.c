@@ -53,6 +53,7 @@
 
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
@@ -1259,6 +1260,8 @@ ExecInsert(ModifyTableContext *context,
 			}
 
 			/* Since there was no insertion conflict, we're done */
+			if (RelationHasImmediateInsertVisibility(resultRelationDesc))
+				heap_freeze_inserted_tuple(resultRelationDesc, &slot->tts_tid, true);
 		}
 		else
 		{
@@ -1272,6 +1275,9 @@ ExecInsert(ModifyTableContext *context,
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo, estate,
 													   0, slot, NIL,
 													   NULL);
+
+			if (RelationHasImmediateInsertVisibility(resultRelationDesc))
+				heap_freeze_inserted_tuple(resultRelationDesc, &slot->tts_tid, true);
 		}
 	}
 

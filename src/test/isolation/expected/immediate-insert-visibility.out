@@ -1,0 +1,94 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_begin_rr s1_begin s1_insert s2_select s1_rollback s2_select s2_commit
+step s2_begin_rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM imm_iso_tab;
+count
+-----
+    0
+(1 row)
+
+step s1_begin: BEGIN; SET LOCAL immediate_insert_visibility = 'imm_iso_tab';
+step s1_insert: INSERT INTO imm_iso_tab VALUES (1, 'imm_row_1'); INSERT INTO norm_iso_tab VALUES (1, 'norm_row_1');
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val      |xmin_status
+--+---------+-----------
+ 1|imm_row_1|in progress
+(1 row)
+
+id|val
+--+---
+(0 rows)
+
+step s1_rollback: ROLLBACK;
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val      |xmin_status
+--+---------+-----------
+ 1|imm_row_1|aborted    
+(1 row)
+
+id|val
+--+---
+(0 rows)
+
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s1_insert_2pc s2_select s1_delete_2pc s2_select s1_commit s2_select
+step s1_begin: BEGIN; SET LOCAL immediate_insert_visibility = 'imm_iso_tab';
+step s1_insert_2pc: INSERT INTO imm_iso_tab VALUES (2, 'gid_2pc');
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val    |xmin_status
+--+-------+-----------
+ 2|gid_2pc|in progress
+(1 row)
+
+id|val
+--+---
+(0 rows)
+
+step s1_delete_2pc: DELETE FROM imm_iso_tab WHERE id = 2;
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val    |xmin_status
+--+-------+-----------
+ 2|gid_2pc|in progress
+(1 row)
+
+id|val
+--+---
+(0 rows)
+
+step s1_commit: COMMIT;
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val|xmin_status
+--+---+-----------
+(0 rows)
+
+id|val
+--+---
+(0 rows)
+
+
+starting permutation: s1_begin s1_insert_2pc s1_delete_2pc s2_select s1_rollback s2_select
+step s1_begin: BEGIN; SET LOCAL immediate_insert_visibility = 'imm_iso_tab';
+step s1_insert_2pc: INSERT INTO imm_iso_tab VALUES (2, 'gid_2pc');
+step s1_delete_2pc: DELETE FROM imm_iso_tab WHERE id = 2;
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val    |xmin_status
+--+-------+-----------
+ 2|gid_2pc|in progress
+(1 row)
+
+id|val
+--+---
+(0 rows)
+
+step s1_rollback: ROLLBACK;
+step s2_select: SELECT id, val, pg_xact_status(xmin::text::xid8) AS xmin_status FROM imm_iso_tab ORDER BY id; SELECT id, val FROM norm_iso_tab ORDER BY id;
+id|val    |xmin_status
+--+-------+-----------
+ 2|gid_2pc|aborted    
+(1 row)
+
+id|val
+--+---
+(0 rows)
+

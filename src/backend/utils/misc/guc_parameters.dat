@@ -1344,6 +1344,22 @@
   boot_val => 'false',
 },
 
+{ name => 'immediate_insert_visibility', type => 'string', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Lists tables where inserts are immediately frozen and visible globally.',
+  flags => 'GUC_LIST_INPUT | GUC_LOCAL_ONLY | GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_DISALLOW_IN_AUTO_FILE',
+  variable => 'immediate_insert_visibility',
+  boot_val => '""',
+  check_hook => 'check_immediate_insert_visibility',
+  assign_hook => 'assign_immediate_insert_visibility',
+},
+
+{ name => 'immediate_insert_wal_flush', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Controls whether immediate insert visibility flushes WAL immediately.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'immediate_insert_wal_flush',
+  boot_val => 'true',
+},
+
 { name => 'in_hot_standby', type => 'bool', context => 'PGC_INTERNAL', group => 'PRESET_OPTIONS',
   short_desc => 'Shows whether hot standby is currently active.',
   flags => 'GUC_REPORT | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE',

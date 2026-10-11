@@ -50,11 +50,33 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_inherits.h"
+#include "nodes/makefuncs.h"
+#include "nodes/miscnodes.h"
+#include "parser/scansup.h"
 #include "utils/datum.h"
+#include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+
+
+/* GUC variables and state for immediate_insert_visibility */
+char	   *immediate_insert_visibility = NULL;
+bool		immediate_insert_wal_flush = true;
+bool		immediate_insert_visibility_active = false;
+
+typedef struct
+{
+	int			numRels;
+	Oid			relOids[FLEXIBLE_ARRAY_MEMBER];
+} immediate_insert_visibility_extra;
+
+static immediate_insert_visibility_extra *current_immediate_vis_extra = NULL;
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
@@ -2094,7 +2116,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * Don't set it if we are in bootstrap mode or we are inserting a frozen
 	 * tuple, as there is no further pruning/freezing needed in those cases.
 	 */
-	if (TransactionIdIsNormal(xid) && !(options & HEAP_INSERT_FROZEN))
+	if (TransactionIdIsNormal(xid) &&
+		!(options & (HEAP_INSERT_FROZEN | HEAP_INSERT_IMMEDIATE_FROZEN)))
 		PageSetPrunable(page, xid);
 
 	MarkBufferDirty(buffer);
@@ -2245,7 +2268,7 @@ heap_prepare_insert(Relation relation, HeapTuple tup, TransactionId xid,
 	tup->t_data->t_infomask2 &= ~(HEAP2_XACT_MASK);
 	tup->t_data->t_infomask |= HEAP_XMAX_INVALID;
 	HeapTupleHeaderSetXmin(tup->t_data, xid);
-	if (options & HEAP_INSERT_FROZEN)
+	if (options & (HEAP_INSERT_FROZEN | HEAP_INSERT_IMMEDIATE_FROZEN))
 		HeapTupleHeaderSetXminFrozen(tup->t_data);
 
 	HeapTupleHeaderSetCmin(tup->t_data, cid);
@@ -2265,7 +2288,13 @@ heap_prepare_insert(Relation relation, HeapTuple tup, TransactionId xid,
 	}
 	else if (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD ||
 			 RelationHasEncodingContext(relation))
-		return heap_toast_insert_or_update(relation, tup, NULL, options);
+	{
+		uint32		toast_options = options;
+
+		if (RelationHasImmediateInsertVisibility(relation))
+			toast_options |= HEAP_INSERT_IMMEDIATE_FROZEN;
+		return heap_toast_insert_or_update(relation, tup, NULL, toast_options);
+	}
 	else
 		return tup;
 }
@@ -6378,6 +6407,265 @@ heap_finish_speculative(Relation relation, const ItemPointerData *tid)
 	END_CRIT_SECTION();
 
 	UnlockReleaseBuffer(buffer);
+}
+
+/*
+ * check_hook: validate new immediate_insert_visibility and eagerly
+ * resolve relation OIDs.
+ */
+bool
+check_immediate_insert_visibility(char **newval, void **extra,
+								  GucSource source)
+{
+	char	   *rawstring;
+	char	   *nextp;
+	List	   *oidlist = NIL;
+
+	if (*newval == NULL || (*newval)[0] == '\0')
+	{
+		*extra = NULL;
+		return true;
+	}
+
+	if (!IsTransactionState() || MyDatabaseId == InvalidOid)
+	{
+		*extra = NULL;
+		return true;
+	}
+
+	rawstring = pstrdup(*newval);
+	nextp = rawstring;
+
+	while (scanner_isspace(*nextp))
+		nextp++;
+
+	if (*nextp != '\0')
+	{
+		bool		done = false;
+
+		do
+		{
+			char	   *item_start = nextp;
+			char	   *item_end = nextp;
+			bool		in_quotes = false;
+			List	   *names;
+			RangeVar   *rv;
+			Oid			relid;
+			char		relkind;
+			ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+			CHECK_FOR_INTERRUPTS();
+
+			while (*nextp != '\0' && (in_quotes || *nextp != ','))
+			{
+				if (*nextp == '"')
+					in_quotes = !in_quotes;
+				if (!scanner_isspace(*nextp) || in_quotes)
+					item_end = nextp + 1;
+				nextp++;
+			}
+
+			if (in_quotes || item_start == item_end)
+			{
+				GUC_check_errdetail("List syntax is invalid.");
+				pfree(rawstring);
+				list_free(oidlist);
+				return false;
+			}
+
+			if (*nextp == ',')
+			{
+				nextp++;
+				while (scanner_isspace(*nextp))
+					nextp++;
+				if (*nextp == '\0')
+				{
+					GUC_check_errdetail("List syntax is invalid.");
+					pfree(rawstring);
+					list_free(oidlist);
+					return false;
+				}
+			}
+			else if (*nextp == '\0')
+				done = true;
+
+			*item_end = '\0';
+
+			names = stringToQualifiedNameList(item_start, (Node *) &escontext);
+			if (names == NIL || escontext.error_occurred)
+			{
+				GUC_check_errdetail("List syntax is invalid.");
+				pfree(rawstring);
+				list_free(oidlist);
+				return false;
+			}
+
+			rv = makeRangeVarFromNameList(names);
+			relid = RangeVarGetRelid(rv, NoLock, true);
+			if (!OidIsValid(relid))
+			{
+				GUC_check_errcode(ERRCODE_UNDEFINED_TABLE);
+				GUC_check_errmsg("relation \"%s\" does not exist", item_start);
+				pfree(rawstring);
+				list_free(oidlist);
+				return false;
+			}
+
+			relkind = get_rel_relkind(relid);
+			if (relkind == RELKIND_RELATION)
+			{
+				oidlist = list_append_unique_oid(oidlist, relid);
+			}
+			else if (relkind == RELKIND_PARTITIONED_TABLE)
+			{
+				List	   *children = find_all_inheritors(relid, NoLock, NULL);
+
+				oidlist = list_concat_unique_oid(oidlist, children);
+				list_free(children);
+			}
+			else
+			{
+				GUC_check_errcode(ERRCODE_WRONG_OBJECT_TYPE);
+				GUC_check_errmsg("\"%s\" is not a table", item_start);
+				pfree(rawstring);
+				list_free(oidlist);
+				return false;
+			}
+		} while (!done);
+	}
+
+	if (oidlist != NIL)
+	{
+		immediate_insert_visibility_extra *myextra;
+		int			numRels = list_length(oidlist);
+		int			i = 0;
+		ListCell   *lc;
+
+		myextra = guc_malloc(LOG,
+							 offsetof(immediate_insert_visibility_extra, relOids) +
+							 numRels * sizeof(Oid));
+		if (!myextra)
+		{
+			pfree(rawstring);
+			list_free(oidlist);
+			return false;
+		}
+		myextra->numRels = numRels;
+		foreach(lc, oidlist)
+			myextra->relOids[i++] = lfirst_oid(lc);
+		*extra = myextra;
+	}
+	else
+		*extra = NULL;
+
+	pfree(rawstring);
+	list_free(oidlist);
+	return true;
+}
+
+/*
+ * assign_hook: update active immediate insert visibility OID list.
+ */
+void
+assign_immediate_insert_visibility(const char *newval, void *extra)
+{
+	current_immediate_vis_extra = (immediate_insert_visibility_extra *) extra;
+	immediate_insert_visibility_active =
+		(current_immediate_vis_extra != NULL &&
+		 current_immediate_vis_extra->numRels > 0);
+}
+
+/*
+ * Check whether the given relation is currently listed in
+ * immediate_insert_visibility.
+ */
+bool
+RelationHasImmediateInsertVisibility(Relation relation)
+{
+	Oid			relid;
+
+	if (likely(!immediate_insert_visibility_active))
+		return false;
+
+	relid = RelationGetRelid(relation);
+	for (int i = 0; i < current_immediate_vis_extra->numRels; i++)
+	{
+		if (current_immediate_vis_extra->relOids[i] == relid)
+			return true;
+	}
+	return false;
+}
+
+/*
+ *	heap_freeze_inserted_tuple - freeze a newly inserted tuple in place
+ *
+ * Used by immediate_insert_visibility right after index tuple insertion
+ * succeeds, so that the tuple's xmin becomes immediately visible to all
+ * transactions and survives if the inserting transaction later rolls back.
+ * If 'flush' is true, immediate_insert_wal_flush is true, and the relation is
+ * WAL-logged, flushes WAL up to the freeze record's LSN.  Returns the LSN of
+ * the WAL record (or InvalidXLogRecPtr if unlogged).
+ */
+XLogRecPtr
+heap_freeze_inserted_tuple(Relation relation, const ItemPointerData *tid,
+						   bool flush)
+{
+	Buffer		buffer;
+	Page		page;
+	OffsetNumber offnum;
+	ItemId		lp;
+	HeapTupleHeader htup;
+	HeapTupleFreeze frz;
+	XLogRecPtr	recptr = InvalidXLogRecPtr;
+
+	buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+
+	offnum = ItemPointerGetOffsetNumber(tid);
+	if (offnum < 1 || offnum > PageGetMaxOffsetNumber(page))
+		elog(ERROR, "offnum out of range");
+	lp = PageGetItemId(page, offnum);
+	if (!ItemIdIsNormal(lp))
+		elog(ERROR, "invalid lp");
+
+	htup = (HeapTupleHeader) PageGetItem(page, lp);
+
+	frz.xmax = HeapTupleHeaderGetRawXmax(htup);
+	frz.t_infomask2 = htup->t_infomask2;
+	frz.t_infomask = htup->t_infomask | HEAP_XMIN_FROZEN;
+	frz.frzflags = 0;
+	frz.checkflags = 0;
+	frz.offset = offnum;
+
+	/* NO EREPORT(ERROR) from here till changes are logged */
+	START_CRIT_SECTION();
+
+	heap_execute_freeze_tuple(htup, &frz);
+	MarkBufferDirty(buffer);
+
+	if (RelationNeedsWAL(relation))
+	{
+		log_heap_prune_and_freeze(relation, buffer,
+								  InvalidBuffer, 0,
+								  InvalidTransactionId,
+								  false,
+								  PRUNE_ON_ACCESS,
+								  &frz, 1,
+								  NULL, 0,
+								  NULL, 0,
+								  NULL, 0);
+		recptr = PageGetLSN(page);
+	}
+
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buffer);
+
+	if (flush && immediate_insert_wal_flush && XLogRecPtrIsValid(recptr))
+		XLogFlush(recptr);
+
+	return recptr;
 }
 
 /*

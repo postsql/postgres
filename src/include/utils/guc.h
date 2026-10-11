@@ -229,6 +229,7 @@ typedef enum
 #define GUC_RUNTIME_COMPUTED   0x004000 /* delay processing in 'postgres -C' */
 #define GUC_ALLOW_IN_PARALLEL  0x008000 /* allow setting in parallel mode */
 #define GUC_SHOW_IN_OCTAL	   0x010000 /* show integer variable in octal */
+#define GUC_LOCAL_ONLY		   0x020000 /* can only be set with SET LOCAL */
 
 #define GUC_UNIT_KB			 0x01000000 /* value is in kilobytes */
 #define GUC_UNIT_BLOCKS		 0x02000000 /* value is in blocks */
