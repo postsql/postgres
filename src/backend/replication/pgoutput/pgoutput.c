@@ -1361,7 +1361,7 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 	 *
 	 * For deletes, we only have the old tuple.
 	 */
-	if (!new_slot || !old_slot)
+	if (!new_slot || !old_slot || TTS_EMPTY(old_slot))
 	{
 		ecxt->ecxt_scantuple = new_slot ? new_slot : old_slot;
 		result = pgoutput_row_filter_exec_expr(filter_exprstate, ecxt);
@@ -1530,7 +1530,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			 * identity is not defined for a table. Since the DELETE action
 			 * can't be published, we simply return.
 			 */
-			if (!change->data.tp.oldtuple)
+			if (!change->data.tp.oldtuple && relation->rd_rel->relreplident != REPLICA_IDENTITY_ROWID)
 			{
 				elog(DEBUG1, "didn't send DELETE change because of missing oldtuple");
 				return;
@@ -1564,6 +1564,11 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 			old_slot = execute_attr_map_slot(relentry->attrmap, old_slot, slot);
 		}
+	}
+	else if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+	{
+		old_slot = relentry->old_slot;
+		ExecClearTuple(old_slot);
 	}
 
 	if (change->data.tp.newtuple)
@@ -1614,17 +1619,21 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_INSERT:
 			logicalrep_write_insert(ctx->out, xid, targetrel, new_slot,
 									data->binary, relentry->columns,
-									relentry->include_gencols_type);
+									relentry->include_gencols_type,
+									&change->data.tp.new_tid);
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			logicalrep_write_update(ctx->out, xid, targetrel, old_slot,
 									new_slot, data->binary, relentry->columns,
-									relentry->include_gencols_type);
+									relentry->include_gencols_type,
+									&change->data.tp.old_tid,
+									&change->data.tp.new_tid);
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			logicalrep_write_delete(ctx->out, xid, targetrel, old_slot,
 									data->binary, relentry->columns,
-									relentry->include_gencols_type);
+									relentry->include_gencols_type,
+									&change->data.tp.old_tid);
 			break;
 		default:
 			Assert(false);

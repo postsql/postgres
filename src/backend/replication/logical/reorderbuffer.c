@@ -242,6 +242,7 @@ static const Size max_changes_in_memory = 4096; /* XXX for restore only */
 
 /* GUC variable */
 int			debug_logical_replication_streaming = DEBUG_LOGICAL_REP_STREAMING_BUFFERED;
+bool		logical_decoding_expose_headers = false;
 
 /* ---------------------------------------
  * primary reorderbuffer support routines
@@ -3345,6 +3346,18 @@ ReorderBufferProcessXid(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn)
 	/* many records won't have an xid assigned, centralize check here */
 	if (xid != InvalidTransactionId)
 		ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
+}
+
+/*
+ * Dispatch a page prune event to the registered prune callback.
+ */
+void
+ReorderBufferProcessPrune(ReorderBuffer *rb, Relation relation,
+						  XLogRecPtr lsn, XLogRecPtr end_lsn,
+						  const struct LogicalDecodePruneData *prune)
+{
+	if (rb->prune)
+		rb->prune(rb, relation, lsn, end_lsn, prune);
 }
 
 /*

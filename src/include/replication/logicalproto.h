@@ -225,20 +225,23 @@ extern char *logicalrep_read_origin(StringInfo in, XLogRecPtr *origin_lsn);
 extern void logicalrep_write_insert(StringInfo out, TransactionId xid,
 									Relation rel, TupleTableSlot *newslot,
 									bool binary, Bitmapset *columns,
-									PublishGencolsType include_gencols_type);
+									PublishGencolsType include_gencols_type,
+									ItemPointer new_tid);
 extern LogicalRepRelId logicalrep_read_insert(StringInfo in, LogicalRepTupleData *newtup);
 extern void logicalrep_write_update(StringInfo out, TransactionId xid,
 									Relation rel, TupleTableSlot *oldslot,
 									TupleTableSlot *newslot, bool binary,
 									Bitmapset *columns,
-									PublishGencolsType include_gencols_type);
+									PublishGencolsType include_gencols_type,
+									ItemPointer old_tid, ItemPointer new_tid);
 extern LogicalRepRelId logicalrep_read_update(StringInfo in,
 											  bool *has_oldtuple, LogicalRepTupleData *oldtup,
 											  LogicalRepTupleData *newtup);
 extern void logicalrep_write_delete(StringInfo out, TransactionId xid,
 									Relation rel, TupleTableSlot *oldslot,
 									bool binary, Bitmapset *columns,
-									PublishGencolsType include_gencols_type);
+									PublishGencolsType include_gencols_type,
+									ItemPointer old_tid);
 extern LogicalRepRelId logicalrep_read_delete(StringInfo in,
 											  LogicalRepTupleData *oldtup);
 extern void logicalrep_write_truncate(StringInfo out, TransactionId xid,

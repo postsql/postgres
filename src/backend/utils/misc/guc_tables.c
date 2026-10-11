@@ -459,6 +459,7 @@ static const struct config_enum_entry debug_logical_replication_streaming_option
 	{NULL, 0, false}
 };
 
+
 StaticAssertDecl(lengthof(ssl_protocol_versions_info) == (PG_TLS1_3_VERSION + 2),
 				 "array length mismatch");
 

@@ -32,6 +32,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* GUC parameter */
+bool		logical_decoding_prune_records = false;
+
 /* Working data for heap_page_prune_and_freeze() and subroutines */
 typedef struct
 {
@@ -2702,6 +2705,9 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 
 	xlrec.flags = 0;
 	regbuf_flags_heap = REGBUF_STANDARD;
+
+	if (logical_decoding_prune_records && RelationIsLogicallyLogged(relation))
+		regbuf_flags_heap |= REGBUF_KEEP_DATA;
 
 	/*
 	 * We can avoid an FPI of the heap page if the only modification we are

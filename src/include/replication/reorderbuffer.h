@@ -26,6 +26,8 @@
 /* GUC variables */
 extern PGDLLIMPORT int logical_decoding_work_mem;
 extern PGDLLIMPORT int debug_logical_replication_streaming;
+extern PGDLLIMPORT bool logical_decoding_expose_headers;
+extern PGDLLIMPORT bool logical_decoding_prune_records;
 
 /* possible values for debug_logical_replication_streaming */
 typedef enum
@@ -104,6 +106,10 @@ typedef struct ReorderBufferChange
 			HeapTuple	oldtuple;
 			/* valid for INSERT || UPDATE */
 			HeapTuple	newtuple;
+
+			/* TIDs of the changes, valid even if tuple data is not logged */
+			ItemPointerData old_tid;
+			ItemPointerData new_tid;
 		}			tp;
 
 		/*
@@ -500,6 +506,15 @@ typedef void (*ReorderBufferMessageCB) (ReorderBuffer *rb,
 										const char *prefix, Size sz,
 										const char *message);
 
+struct LogicalDecodePruneData;
+
+/* prune callback signature */
+typedef void (*ReorderBufferPruneCB) (ReorderBuffer *rb,
+									  Relation relation,
+									  XLogRecPtr lsn,
+									  XLogRecPtr end_lsn,
+									  const struct LogicalDecodePruneData *prune);
+
 /* begin prepare callback signature */
 typedef void (*ReorderBufferBeginPrepareCB) (ReorderBuffer *rb,
 											 ReorderBufferTXN *txn);
@@ -613,6 +628,7 @@ struct ReorderBuffer
 	ReorderBufferApplyTruncateCB apply_truncate;
 	ReorderBufferCommitCB commit;
 	ReorderBufferMessageCB message;
+	ReorderBufferPruneCB prune;
 
 	/*
 	 * Callbacks to be called when streaming a transaction at prepare time.
@@ -760,6 +776,9 @@ extern void ReorderBufferAddDistributedInvalidations(ReorderBuffer *rb, Transact
 extern void ReorderBufferImmediateInvalidation(ReorderBuffer *rb, uint32 ninvalidations,
 											   SharedInvalidationMessage *invalidations);
 extern void ReorderBufferProcessXid(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn);
+extern void ReorderBufferProcessPrune(ReorderBuffer *rb, Relation relation,
+									  XLogRecPtr lsn, XLogRecPtr end_lsn,
+									  const struct LogicalDecodePruneData *prune);
 
 extern void ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn);
 extern bool ReorderBufferXidHasCatalogChanges(ReorderBuffer *rb, TransactionId xid);
