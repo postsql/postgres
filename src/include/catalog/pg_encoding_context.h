@@ -64,7 +64,7 @@ CATALOG(pg_encoding_context,9431,EncodingContextRelationId)
 	bytea		ectxdectab BKI_DEFAULT(_null_);
 
 	/* options (level, strategy, etc.) */
-	text		ectxoptions[1] BKI_DEFAULT(_null_);
+	text		ectxoptions[] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_encoding_context;
 
