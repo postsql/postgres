@@ -362,6 +362,8 @@
 #wal_keep_size = 0              # in megabytes; 0 disables
 #max_slot_wal_keep_size = -1    # in megabytes; -1 disables
 #idle_replication_slot_timeout = 0      # in seconds; 0 disables
+#logical_decoding_expose_headers = off
+#logical_decoding_prune_records = off
 #wal_sender_timeout = 60s       # in milliseconds; 0 disables
 #wal_sender_shutdown_timeout = -1      # in milliseconds
                                 # -1 disables the timeout and waits for catch-up
@@ -418,6 +420,7 @@
                                         # (change requires restart)
 #max_sync_workers_per_subscription = 2  # taken from max_logical_replication_workers
 #max_parallel_apply_workers_per_subscription = 2        # taken from max_logical_replication_workers
+#logical_replication_index_only_rowid = on
 
 
 #------------------------------------------------------------------------------
