@@ -89,6 +89,7 @@ populate_result_table_from_hash(RecursiveUnionState *rustate)
 	tuplehash_start_iterate(hashtable->hashtab, &iter);
 	while ((entry = tuplehash_iterate(hashtable->hashtab, &iter)) != NULL)
 	{
+		CHECK_FOR_INTERRUPTS();
 		ExecStoreMinimalTuple(entry->firstTuple, slot, false);
 		tuplestore_puttupleslot(rustate->result_table, slot);
 		ExecClearTuple(slot);
@@ -118,6 +119,7 @@ ExecRecursiveUnion(PlanState *pstate)
 			/* 1. Process non-recursive term */
 			for (;;)
 			{
+				CHECK_FOR_INTERRUPTS();
 				slot = ExecProcNode(outerPlan);
 				if (TupIsNull(slot))
 					break;
@@ -144,6 +146,7 @@ ExecRecursiveUnion(PlanState *pstate)
 			node->recursing = true;
 			for (;;)
 			{
+				CHECK_FOR_INTERRUPTS();
 				slot = ExecProcNode(innerPlan);
 				if (TupIsNull(slot))
 				{

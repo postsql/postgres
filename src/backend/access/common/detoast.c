@@ -1030,6 +1030,8 @@ toast_fetch_datum_direct_raw_recursive(Relation toastrel, ItemPointer tid,
 	bool		is_null_data;
 	bool		is_null_tids;
 
+	check_stack_depth();
+
 	if (!table_tuple_fetch_row_version(toastrel, tid, snapshot, slot))
 		elog(ERROR, "failed to fetch toast tuple by TID");
 
@@ -1063,6 +1065,7 @@ toast_fetch_datum_direct_raw_recursive(Relation toastrel, ItemPointer tid,
 		deconstruct_array_builtin(arr, TIDOID, &elems, &nulls, &nelems);
 		for (int i = 0; i < nelems; i++)
 		{
+			CHECK_FOR_INTERRUPTS();
 			toast_fetch_datum_direct_raw_recursive(toastrel,
 												   (ItemPointer) DatumGetPointer(elems[i]),
 												   buf, slot);

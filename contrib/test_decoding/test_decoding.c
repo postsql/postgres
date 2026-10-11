@@ -618,7 +618,7 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 		/* print data */
 		if (isnull)
 			appendStringInfoString(s, "null");
-		else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(origval)))
+		else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK_OR_DIRECT(DatumGetPointer(origval)))
 			appendStringInfoString(s, "unchanged-toast-datum");
 		else if (!typisvarlena)
 			print_literal(s, typid,

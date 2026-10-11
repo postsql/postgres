@@ -5382,6 +5382,8 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			Pointer		chunk;
 			Oid			chunk_ectx_id = InvalidOid;
 
+			CHECK_FOR_INTERRUPTS();
+
 			cchange = dlist_container(ReorderBufferChange, node, it.cur);
 			ctup = cchange->data.tp.newtuple;
 			chunk = DatumGetPointer(fastgetattr(ctup, 3, toast_desc, &cisnull));
