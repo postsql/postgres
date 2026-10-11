@@ -1445,6 +1445,10 @@ DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &rlocator, NULL, &blkno);
 
+	/* catalog tables are never logically logged or decoded */
+	if (xlrec->flags & XLHP_IS_CATALOG_REL)
+		return;
+
 	/* If output plugin hasn't registered a prune callback, nothing to do */
 	if (ctx->callbacks.prune_cb == NULL)
 		return;
@@ -1509,10 +1513,19 @@ DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 	}
 
-	snapshot = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder);
-	SetupHistoricSnapshot(snapshot, NULL);
 	{
+		bool		using_subtxn = IsTransactionOrTransactionBlock();
+		MemoryContext ccxt = CurrentMemoryContext;
+		ResourceOwner cowner = CurrentResourceOwner;
 		Relation	relation = NULL;
+
+		if (using_subtxn)
+			BeginInternalSubTransaction("prune");
+		else
+			StartTransactionCommand();
+
+		snapshot = SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder);
+		SetupHistoricSnapshot(snapshot, NULL);
 
 		PG_TRY();
 		{
@@ -1539,12 +1552,26 @@ DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			}
 
 			TeardownHistoricSnapshot(false);
+			AbortCurrentTransaction();
+			if (using_subtxn)
+			{
+				RollbackAndReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(ccxt);
+				CurrentResourceOwner = cowner;
+			}
 		}
 		PG_CATCH();
 		{
 			if (RelationIsValid(relation))
 				RelationClose(relation);
 			TeardownHistoricSnapshot(true);
+			AbortCurrentTransaction();
+			if (using_subtxn)
+			{
+				RollbackAndReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(ccxt);
+				CurrentResourceOwner = cowner;
+			}
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
