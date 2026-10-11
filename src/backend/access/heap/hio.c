@@ -18,7 +18,9 @@
 #include "access/heapam.h"
 #include "access/hio.h"
 #include "access/htup_details.h"
+#include "access/toast_internals.h"
 #include "access/visibilitymap.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
@@ -615,6 +617,12 @@ loop:
 		{
 			/* easy case */
 			buffer = ReadBufferBI(relation, targetBlock, RBM_NORMAL, bistate);
+			if (relation->rd_rel->relkind == RELKIND_TOASTVALUE &&
+				RelationGetDirectToastSelfPrune(relation) &&
+				PageGetHeapFreeSpace(BufferGetPage(buffer)) < targetFreeSpace &&
+				TransactionIdIsValid(PageGetPruneXid(BufferGetPage(buffer))) &&
+				PageGetPruneXid(BufferGetPage(buffer)) != GetCurrentTransactionIdIfAny())
+				heap_page_prune_opt(relation, buffer, vmbuffer, false);
 			if (PageIsAllVisible(BufferGetPage(buffer)))
 				visibilitymap_pin(relation, targetBlock, vmbuffer);
 
@@ -759,6 +767,114 @@ loop:
 														targetBlock,
 														pageFreeSpace,
 														targetFreeSpace);
+		}
+	}
+
+	/*
+	 * Before extending a TOAST relation when direct_toast_self_prune is
+	 * enabled, probe a bounded batch of blocks from rd_toast_prune_hand to
+	 * reclaim pages whose Direct TOAST deletes committed after their FSM
+	 * entries were cleared.
+	 */
+	if (use_fsm && otherBuffer == InvalidBuffer &&
+		relation->rd_rel->relkind == RELKIND_TOASTVALUE &&
+		RelationGetDirectToastSelfPrune(relation))
+	{
+		static Oid	last_probe_relid = InvalidOid;
+		static TransactionId last_probe_xid = InvalidTransactionId;
+		static uint64 last_probe_delete_count = 0;
+		static BlockNumber unprunable_probes = 0;
+		static bool rel_exhausted = false;
+		static bool saw_inprogress_delete = false;
+		TransactionId cur_xid = GetCurrentTransactionIdIfAny();
+		BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
+
+		if (RelationGetRelid(relation) != last_probe_relid)
+		{
+			last_probe_relid = RelationGetRelid(relation);
+			last_probe_xid = cur_xid;
+			last_probe_delete_count = direct_toast_delete_count;
+			unprunable_probes = 0;
+			rel_exhausted = false;
+			saw_inprogress_delete = false;
+		}
+		else if (!TransactionIdIsValid(cur_xid) || cur_xid != last_probe_xid)
+		{
+			last_probe_xid = cur_xid;
+			if (direct_toast_delete_count != last_probe_delete_count ||
+				saw_inprogress_delete)
+			{
+				last_probe_delete_count = direct_toast_delete_count;
+				unprunable_probes = 0;
+				rel_exhausted = false;
+				saw_inprogress_delete = false;
+			}
+		}
+
+		if (nblocks > 0 && !rel_exhausted)
+		{
+			BlockNumber target_unprunable = (direct_toast_delete_count == 0 && !saw_inprogress_delete) ? 1 : nblocks;
+			BlockNumber max_probes = Min(target_unprunable, (BlockNumber) 256);
+			int			pruned_count = 0;
+
+			for (BlockNumber i = 0; i < max_probes; i++)
+			{
+				BlockNumber probeBlk;
+				Buffer		probeBuf;
+				Page		probePage;
+				TransactionId prune_xid;
+
+				CHECK_FOR_INTERRUPTS();
+
+				if (relation->rd_toast_prune_hand >= nblocks)
+					relation->rd_toast_prune_hand = 0;
+				probeBlk = relation->rd_toast_prune_hand++;
+
+				probeBuf = ReadBuffer(relation, probeBlk);
+				probePage = BufferGetPage(probeBuf);
+				prune_xid = PageGetPruneXid(probePage);
+
+				if (TransactionIdIsValid(prune_xid))
+				{
+					target_unprunable = nblocks;
+					max_probes = Min(nblocks, (BlockNumber) 256);
+					if (prune_xid != cur_xid)
+					{
+						heap_page_prune_opt(relation, probeBuf, vmbuffer, false);
+						if (TransactionIdIsValid(PageGetPruneXid(probePage)))
+							saw_inprogress_delete = true;
+						if (GetRecordedFreeSpace(relation, probeBlk) >= targetFreeSpace)
+						{
+							pruned_count++;
+							unprunable_probes = 0;
+							if (targetBlock == InvalidBlockNumber)
+								targetBlock = probeBlk;
+						}
+						else
+							unprunable_probes++;
+					}
+					else
+					{
+						saw_inprogress_delete = true;
+						unprunable_probes++;
+					}
+				}
+				else
+					unprunable_probes++;
+
+				ReleaseBuffer(probeBuf);
+
+				if (pruned_count >= 8 ||
+					(pruned_count == 0 && unprunable_probes >= target_unprunable))
+					break;
+			}
+
+			if (targetBlock != InvalidBlockNumber)
+				goto loop;
+
+			if (unprunable_probes >= target_unprunable &&
+				TransactionIdIsValid(cur_xid))
+				rel_exhausted = true;
 		}
 	}
 

@@ -16,6 +16,23 @@
 #include "storage/lockdefs.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+#include "utils/rel.h"
+
+#define RelationGetToastFlavour(relation) \
+	((relation)->rd_options ? \
+	 (((StdRdOptions *) (relation)->rd_options)->toast_flavour != TOAST_FLAVOUR_NOT_SET ? \
+	  ((StdRdOptions *) (relation)->rd_options)->toast_flavour : (ToastFlavour) toast_flavour) \
+	 : (ToastFlavour) toast_flavour)
+
+#define RelationGetDirectToastSelfPrune(relation) \
+	((relation)->rd_options ? \
+	 (((StdRdOptions *) (relation)->rd_options)->direct_toast_self_prune != PG_TERNARY_UNSET ? \
+	  (((StdRdOptions *) (relation)->rd_options)->direct_toast_self_prune == PG_TERNARY_TRUE) : direct_toast_self_prune) \
+	 : direct_toast_self_prune)
+
+extern PGDLLIMPORT int toast_flavour;
+extern PGDLLIMPORT bool direct_toast_self_prune;
+extern PGDLLIMPORT uint64 direct_toast_delete_count;
 
 extern Datum toast_compress_datum(Datum value, char cmethod);
 extern Oid	toast_get_valid_index(Oid toastoid, LOCKMODE lock);
