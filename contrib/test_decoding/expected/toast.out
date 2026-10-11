@@ -433,6 +433,85 @@ SELECT regexp_replace(data, '^(.{60}).*(.{20})$', '\1..\2') AS shortened,
 
 DROP TABLE toasted_oid8;
 RESET default_toast_compression;
+-- Test decoding of Direct TOAST values with pg_encoding_context under
+-- both direct_toast_chunk_compression = on (per-chunk) and off (whole-datum)
+CREATE ENCODING TYPE td_zstd_type (KIND = 'c', TYPE = 'zstd');
+CREATE ENCODING CONTEXT td_zstd_ctx TYPE td_zstd_type FOR TYPE text WITH (level = 3);
+CREATE TABLE toasted_direct_ectx (id int primary key, data text);
+ALTER TABLE toasted_direct_ectx ALTER COLUMN data SET ENCODING CONTEXT td_zstd_ctx;
+-- Row 1: chunk-wise compression (direct_toast_chunk_compression = on), deleted in same xact
+BEGIN;
+INSERT INTO toasted_direct_ectx
+SELECT 1, string_agg('chunk_on_' || g || '_' || md5(g::text), ' ')
+FROM generate_series(1, 200) g;
+DELETE FROM toasted_direct_ectx WHERE id = 1;
+COMMIT;
+-- Row 2: whole-datum compression (direct_toast_chunk_compression = off), deleted in same xact
+SET direct_toast_chunk_compression = off;
+BEGIN;
+INSERT INTO toasted_direct_ectx
+SELECT 2, string_agg('chunk_off_' || g || '_' || md5(g::text), ' ')
+FROM generate_series(1, 200) g;
+DELETE FROM toasted_direct_ectx WHERE id = 2;
+COMMIT;
+RESET direct_toast_chunk_compression;
+-- Row 3: Tier 3 (>100 chunks, interior tree nodes with chunk_data IS NULL) under chunk-wise and whole-datum modes
+BEGIN;
+INSERT INTO toasted_direct_ectx
+SELECT 3, string_agg('tier3_on_' || g || '_' || md5(g::text), ' ')
+FROM generate_series(1, 5000) g;
+DELETE FROM toasted_direct_ectx WHERE id = 3;
+COMMIT;
+SET direct_toast_chunk_compression = off;
+BEGIN;
+INSERT INTO toasted_direct_ectx
+SELECT 4, string_agg('tier3_off_' || g || '_' || md5(g::text), ' ')
+FROM generate_series(1, 5000) g;
+DELETE FROM toasted_direct_ectx WHERE id = 4;
+COMMIT;
+RESET direct_toast_chunk_compression;
+-- Row 5: 0-byte context-encoded chunk (Avro "null" schema produces 0-byte payload)
+CREATE ENCODING TYPE td_avro_type (KIND = 's', TYPE = 'avro');
+CREATE ENCODING CONTEXT td_avro_null_ctx TYPE td_avro_type FOR TYPE jsonb WITH (schema = '["null", "string"]');
+CREATE TABLE toasted_direct_avro (id int primary key, doc jsonb);
+ALTER TABLE toasted_direct_avro ALTER COLUMN doc SET ENCODING CONTEXT td_avro_null_ctx;
+BEGIN;
+INSERT INTO toasted_direct_avro VALUES (1, 'null'::jsonb);
+DELETE FROM toasted_direct_avro WHERE id = 1;
+COMMIT;
+SELECT regexp_replace(data, '^(.{65}).*(.{20})$', '\1..\2') AS shortened,
+       length(data) AS len
+  FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+                                        shortened                                        |  len   
+-----------------------------------------------------------------------------------------+--------
+ BEGIN                                                                                   |      5
+ table public.toasted_direct_ectx: INSERT: id[integer]:1 data[text..8fe223c713b77189a77' |   9160
+ table public.toasted_direct_ectx: DELETE: id[integer]:1                                 |     55
+ COMMIT                                                                                  |      6
+ BEGIN                                                                                   |      5
+ table public.toasted_direct_ectx: INSERT: id[integer]:2 data[text..8fe223c713b77189a77' |   9360
+ table public.toasted_direct_ectx: DELETE: id[integer]:2                                 |     55
+ COMMIT                                                                                  |      6
+ BEGIN                                                                                   |      5
+ table public.toasted_direct_ectx: INSERT: id[integer]:3 data[text..7b4369a0af4244d1fca' | 233961
+ table public.toasted_direct_ectx: DELETE: id[integer]:3                                 |     55
+ COMMIT                                                                                  |      6
+ BEGIN                                                                                   |      5
+ table public.toasted_direct_ectx: INSERT: id[integer]:4 data[text..7b4369a0af4244d1fca' | 238961
+ table public.toasted_direct_ectx: DELETE: id[integer]:4                                 |     55
+ COMMIT                                                                                  |      6
+ BEGIN                                                                                   |      5
+ table public.toasted_direct_avro: INSERT: id[integer]:1 doc[jsonb]:'null'               |     73
+ table public.toasted_direct_avro: DELETE: id[integer]:1                                 |     55
+ COMMIT                                                                                  |      6
+(20 rows)
+
+DROP TABLE toasted_direct_avro;
+DROP ENCODING CONTEXT td_avro_null_ctx;
+DROP ENCODING TYPE td_avro_type;
+DROP TABLE toasted_direct_ectx;
+DROP ENCODING CONTEXT td_zstd_ctx;
+DROP ENCODING TYPE td_zstd_type;
 SELECT pg_drop_replication_slot('regression_slot');
  pg_drop_replication_slot 
 --------------------------

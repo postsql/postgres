@@ -5211,11 +5211,21 @@ ReorderBufferToastAppendChunk(ReorderBuffer *rb, ReorderBufferTXN *txn,
 	}
 
 	ent->last_chunk_seq = chunk_seq;
-	if (chunksize > 0)
+	if (!isnull)
 	{
 		ent->size += chunksize;
 		ent->num_chunks++;
 		dlist_push_tail(&ent->chunks, &change->node);
+	}
+	else
+	{
+		/*
+		 * Interior tree node in Direct TOAST (chunk_data IS NULL): its child
+		 * chunk lists have already been merged into ent->chunks above, and
+		 * change was unlinked from txn->changes by the caller, so free it now
+		 * to keep memory and txn->size accounting exact.
+		 */
+		ReorderBufferFreeChange(rb, change, true);
 	}
 }
 
@@ -5311,6 +5321,8 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		int32		rawsize;
 		uint32		extsize pg_attribute_unused();
 		bool		is_compressed;
+		bool		is_whole_datum_ectx = false;
+		Oid			whole_ectx_id = InvalidOid;
 
 		if (attr->attisdropped)
 			continue;
@@ -5342,6 +5354,7 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			rawsize = toast_pointer_direct.va_rawsize;
 			extsize = VARATT_DIRECT_GET_EXTSIZE(toast_pointer_direct);
 			is_compressed = VARATT_DIRECT_IS_COMPRESSED(toast_pointer_direct);
+			is_whole_datum_ectx = (VARATT_DIRECT_GET_COMPRESS_METHOD(toast_pointer_direct) == 3);
 		}
 		else
 		{
@@ -5390,7 +5403,6 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 			Assert(!cisnull);
 			Assert(!VARATT_IS_EXTERNAL(chunk));
-			Assert(!VARATT_IS_SHORT(chunk));
 
 			if (toast_desc->natts >= 6)
 			{
@@ -5401,7 +5413,7 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					chunk_ectx_id = DatumGetObjectId(ectx_datum);
 			}
 
-			if (OidIsValid(chunk_ectx_id))
+			if (OidIsValid(chunk_ectx_id) && !is_whole_datum_ectx)
 			{
 				varlena    *decoded = toast_decode_chunk_with_context(chunk_ectx_id,
 																	  (varlena *) chunk);
@@ -5414,16 +5426,30 @@ ReorderBufferToastReplace(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			}
 			else
 			{
-				memcpy(VARDATA(reconstructed) + data_done,
-					   VARDATA(chunk),
-					   VARSIZE(chunk) - VARHDRSZ);
-				data_done += VARSIZE(chunk) - VARHDRSZ;
+				Size		chunk_len = VARSIZE_ANY_EXHDR(chunk);
+
+				if (OidIsValid(chunk_ectx_id))
+					whole_ectx_id = chunk_ectx_id;
+				if (chunk_len > 0)
+					memcpy(VARDATA(reconstructed) + data_done,
+						   VARDATA_ANY(chunk),
+						   chunk_len);
+				data_done += chunk_len;
 			}
 		}
 		Assert(data_done == extsize);
 
-		/* make sure its marked as compressed or not */
-		if (is_compressed)
+		if (is_whole_datum_ectx && OidIsValid(whole_ectx_id))
+		{
+			varlena    *decoded;
+
+			SET_VARSIZE(reconstructed, data_done + VARHDRSZ);
+			decoded = toast_decode_chunk_with_context(whole_ectx_id, reconstructed);
+			pfree(reconstructed);
+			reconstructed = decoded;
+			ent->reconstructed = reconstructed;
+		}
+		else if (is_compressed)
 			SET_VARSIZE_COMPRESSED(reconstructed, data_done + VARHDRSZ);
 		else
 			SET_VARSIZE(reconstructed, data_done + VARHDRSZ);

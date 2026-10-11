@@ -32,6 +32,7 @@
 
 extern PGDLLIMPORT int toast_flavour;
 extern PGDLLIMPORT bool direct_toast_self_prune;
+extern PGDLLIMPORT bool direct_toast_chunk_compression;
 extern PGDLLIMPORT uint64 direct_toast_delete_count;
 
 extern Datum toast_compress_datum(Datum value, char cmethod);

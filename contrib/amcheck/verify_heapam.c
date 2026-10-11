@@ -1967,19 +1967,38 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	return true;
 }
 
+#ifndef DIRECT_TOAST_MAX_DEPTH
+#define DIRECT_TOAST_MAX_DEPTH	16
+#endif
+
 static void
 check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute *ta,
 										 ItemPointer tid, uint32 *total_data_bytes,
-										 bool *has_ectx)
+										 int depth, bool *has_ectx)
 {
 	HeapTupleData tup;
 	Buffer		buffer = InvalidBuffer;
 	bool		isnull;
 	bool		has_ectx_chunk = false;
+	Datum		chunk_seq_datum;
 	Pointer		chunk;
 	int32		chunksize;
+	Datum		tids_datum;
+	Datum		offsets_datum = (Datum) 0;
+	bool		is_null_tids;
+	bool		is_null_offsets = true;
 
 	check_stack_depth();
+
+	if (depth >= DIRECT_TOAST_MAX_DEPTH)
+	{
+		report_toast_corruption(ctx, ta,
+								psprintf("direct toast chunk at TID (%u, %u) exceeds maximum tree depth %d",
+										 ItemPointerGetBlockNumber(tid),
+										 ItemPointerGetOffsetNumber(tid),
+										 DIRECT_TOAST_MAX_DEPTH));
+		return;
+	}
 
 	tup.t_self = *tid;
 	if (!heap_fetch(ctx->toast_rel, get_toast_snapshot(), &tup, &buffer, false))
@@ -1990,6 +2009,28 @@ check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute
 										 ItemPointerGetOffsetNumber(tid)));
 		return;
 	}
+
+	/* Check chunk_id (attribute 1) is NULL */
+	(void) fastgetattr(&tup, 1, ctx->toast_rel->rd_att, &isnull);
+	if (!isnull)
+		report_toast_corruption(ctx, ta,
+								psprintf("direct toast chunk at TID (%u, %u) has non-null chunk_id",
+										 ItemPointerGetBlockNumber(tid),
+										 ItemPointerGetOffsetNumber(tid)));
+
+	/* Check chunk_seq (attribute 2) is non-null and >= 0 */
+	chunk_seq_datum = fastgetattr(&tup, 2, ctx->toast_rel->rd_att, &isnull);
+	if (isnull)
+		report_toast_corruption(ctx, ta,
+								psprintf("direct toast chunk at TID (%u, %u) has null sequence number",
+										 ItemPointerGetBlockNumber(tid),
+										 ItemPointerGetOffsetNumber(tid)));
+	else if (DatumGetInt32(chunk_seq_datum) < 0)
+		report_toast_corruption(ctx, ta,
+								psprintf("direct toast chunk at TID (%u, %u) has negative sequence number %d",
+										 ItemPointerGetBlockNumber(tid),
+										 ItemPointerGetOffsetNumber(tid),
+										 DatumGetInt32(chunk_seq_datum)));
 
 	if (ctx->toast_rel->rd_att->natts >= 6)
 	{
@@ -2024,7 +2065,8 @@ check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute
 			return;
 		}
 
-		if (!has_ectx_chunk &&
+		if ((!has_ectx_chunk ||
+			 VARATT_DIRECT_GET_COMPRESS_METHOD(ta->toast_pointer_direct) == 3) &&
 			chunksize > TOAST_MAX_CHUNK_SIZE(TupleDescAttr(ctx->toast_rel->rd_att, 0)->atttypid))
 			report_toast_corruption(ctx, ta,
 									psprintf("direct toast chunk at TID (%u, %u) has oversized chunk (%d bytes)",
@@ -2035,31 +2077,102 @@ check_toasted_attribute_direct_recursive(HeapCheckContext *ctx, ToastedAttribute
 		*total_data_bytes += chunksize;
 	}
 
-	/* Check chunk_tids (attribute 4) if present */
+	/* Check chunk_tids (attribute 4) and chunk_tid_offsets (attribute 5) */
+	tids_datum = fastgetattr(&tup, 4, ctx->toast_rel->rd_att, &is_null_tids);
+	if (ctx->toast_rel->rd_att->natts >= 5)
+		offsets_datum = fastgetattr(&tup, 5, ctx->toast_rel->rd_att, &is_null_offsets);
+
+	if (!is_null_tids)
 	{
-		Datum		tids_datum;
-		ArrayType  *tids_arr;
+		ArrayType  *tids_arr = DatumGetArrayTypePCopy(tids_datum);
+		ArrayType  *offsets_arr = is_null_offsets ? NULL : DatumGetArrayTypePCopy(offsets_datum);
 		Datum	   *tids_elems;
+		bool	   *tids_nulls;
 		int			num_tids;
 		int			i;
 
-		tids_datum = fastgetattr(&tup, 4, ctx->toast_rel->rd_att, &isnull);
-		if (!isnull)
+		ReleaseBuffer(buffer);
+
+		deconstruct_array_builtin(tids_arr, TIDOID, &tids_elems, &tids_nulls, &num_tids);
+
+		if (offsets_arr != NULL)
 		{
-			tids_arr = DatumGetArrayTypeP(tids_datum);
-			deconstruct_array_builtin(tids_arr, TIDOID, &tids_elems, NULL, &num_tids);
-			for (i = 0; i < num_tids; i++)
+			Datum	   *offsets_elems;
+			bool	   *offsets_nulls;
+			int			num_offsets;
+
+			deconstruct_array_builtin(offsets_arr, INT8OID, &offsets_elems, &offsets_nulls, &num_offsets);
+			if (num_offsets != num_tids + 1)
 			{
-				ItemPointer child_tid = (ItemPointer) DatumGetPointer(tids_elems[i]);
-
-				CHECK_FOR_INTERRUPTS();
-				check_toasted_attribute_direct_recursive(ctx, ta, child_tid, total_data_bytes, has_ectx);
+				report_toast_corruption(ctx, ta,
+										psprintf("direct toast chunk at TID (%u, %u) has %d offsets for %d child TIDs",
+												 ItemPointerGetBlockNumber(tid),
+												 ItemPointerGetOffsetNumber(tid),
+												 num_offsets, num_tids));
 			}
-			pfree(tids_elems);
+			else
+			{
+				for (i = 0; i < num_tids; i++)
+				{
+					if (offsets_nulls[i] || offsets_nulls[i + 1] ||
+						DatumGetInt64(offsets_elems[i]) < 0 ||
+						DatumGetInt64(offsets_elems[i]) >= DatumGetInt64(offsets_elems[i + 1]))
+					{
+						report_toast_corruption(ctx, ta,
+												psprintf("direct toast chunk at TID (%u, %u) has invalid or non-monotonic chunk_tid_offsets",
+														 ItemPointerGetBlockNumber(tid),
+														 ItemPointerGetOffsetNumber(tid)));
+						break;
+					}
+				}
+			}
+			pfree(offsets_elems);
+			pfree(offsets_nulls);
+			pfree(offsets_arr);
 		}
-	}
 
-	ReleaseBuffer(buffer);
+		for (i = 0; i < num_tids; i++)
+		{
+			ItemPointer child_tid;
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (tids_nulls[i])
+			{
+				report_toast_corruption(ctx, ta,
+										psprintf("direct toast chunk at TID (%u, %u) has null child TID",
+												 ItemPointerGetBlockNumber(tid),
+												 ItemPointerGetOffsetNumber(tid)));
+				continue;
+			}
+
+			child_tid = (ItemPointer) DatumGetPointer(tids_elems[i]);
+			if (ItemPointerEquals(child_tid, tid))
+			{
+				report_toast_corruption(ctx, ta,
+										psprintf("direct toast chunk at TID (%u, %u) references itself in chunk_tids",
+												 ItemPointerGetBlockNumber(tid),
+												 ItemPointerGetOffsetNumber(tid)));
+				continue;
+			}
+
+			check_toasted_attribute_direct_recursive(ctx, ta, child_tid,
+													 total_data_bytes, depth + 1,
+													 has_ectx);
+		}
+		pfree(tids_elems);
+		pfree(tids_nulls);
+		pfree(tids_arr);
+	}
+	else
+	{
+		if (!is_null_offsets)
+			report_toast_corruption(ctx, ta,
+									psprintf("direct toast chunk at TID (%u, %u) has chunk_tid_offsets without chunk_tids",
+											 ItemPointerGetBlockNumber(tid),
+											 ItemPointerGetOffsetNumber(tid)));
+		ReleaseBuffer(buffer);
+	}
 }
 
 static void
@@ -2070,9 +2183,11 @@ check_toasted_attribute_direct(HeapCheckContext *ctx, ToastedAttribute *ta)
 	bool		has_ectx = false;
 
 	check_toasted_attribute_direct_recursive(ctx, ta, &ta->toast_pointer_direct.va_tid,
-											 &total_data_bytes, &has_ectx);
+											 &total_data_bytes, 0, &has_ectx);
 
-	if (!has_ectx && total_data_bytes != extsize)
+	if ((!has_ectx ||
+		 VARATT_DIRECT_GET_COMPRESS_METHOD(ta->toast_pointer_direct) == 3) &&
+		total_data_bytes != extsize)
 	{
 		report_toast_corruption(ctx, ta,
 								psprintf("direct toast value was expected to have %u bytes, but found %u bytes across chunks",

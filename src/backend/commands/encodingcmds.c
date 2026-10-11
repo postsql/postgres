@@ -28,7 +28,22 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/syscache.h"
+
+static bytea *
+string_to_context_bytea(const char *str)
+{
+	const char *p = str;
+
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+
+	if (*p == '{' || *p == '[')
+		return (bytea *) cstring_to_text(str);
+
+	return DatumGetByteaPP(DirectFunctionCall1(byteain, CStringGetDatum(str)));
+}
 
 /*
  * resolve_encoding_handler_func
@@ -228,6 +243,61 @@ DefineEncodingType(ParseState *pstate, List *names, List *parameters,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("encoding type algorithm (TYPE) is required")));
 
+	/*
+	 * If neither ENCFUNC nor DECFUNC was specified, resolve built-in or
+	 * extension-installed default handler functions for the algorithm
+	 * (pg_<algorithm>_context_encode / pg_<algorithm>_context_decode).
+	 */
+	if (encfuncEl == NULL && decfuncEl == NULL && algorithm != NULL)
+	{
+		if (pg_strcasecmp(algorithm, "pglz") == 0)
+		{
+			encFuncId = F_PG_PGLZ_CONTEXT_ENCODE;
+			decFuncId = F_PG_PGLZ_CONTEXT_DECODE;
+		}
+		else
+		{
+			char	   *alg_lower = pstrdup(algorithm);
+			char	   *enc_name;
+			char	   *dec_name;
+			List	   *fn_names;
+			int			fgc_flags;
+			FuncCandidateList clist;
+
+			for (char *p = alg_lower; *p != '\0'; p++)
+				*p = pg_ascii_tolower((unsigned char) *p);
+
+			enc_name = psprintf("pg_%s_context_encode", alg_lower);
+			fn_names = list_make1(makeString(enc_name));
+			clist = FuncnameGetCandidates(fn_names, 2, NIL, false, false, false, true,
+										  &fgc_flags);
+			for (FuncCandidateList c = clist; c != NULL; c = c->next)
+			{
+				if (c->args[0] == INTERNALOID)
+				{
+					encFuncId = c->oid;
+					break;
+				}
+			}
+			list_free_deep(fn_names);
+
+			dec_name = psprintf("pg_%s_context_decode", alg_lower);
+			fn_names = list_make1(makeString(dec_name));
+			clist = FuncnameGetCandidates(fn_names, 2, NIL, false, false, false, true,
+										  &fgc_flags);
+			for (FuncCandidateList c = clist; c != NULL; c = c->next)
+			{
+				if (c->args[0] == INTERNALOID && c->args[1] == BYTEAOID)
+				{
+					decFuncId = c->oid;
+					break;
+				}
+			}
+			list_free_deep(fn_names);
+			pfree(alg_lower);
+		}
+	}
+
 	typeOid = EncodingTypeCreate(enctypname,
 								 namespaceId,
 								 GetUserId(),
@@ -255,6 +325,7 @@ DefineEncodingContext(ParseState *pstate, List *names, List *parameters,
 	DefElem    *forTypeEl = NULL;
 	DefElem    *enctabEl = NULL;
 	DefElem    *dectabEl = NULL;
+	DefElem    *dictEl = NULL;
 	DefElem    *labelEl = NULL;
 	Oid			typeId = InvalidOid;
 	Oid			parentId = InvalidOid;
@@ -321,8 +392,7 @@ DefineEncodingContext(ParseState *pstate, List *names, List *parameters,
 				errorConflictingDefElem(defel, pstate);
 			enctabEl = defel;
 			str = defGetString(defel);
-			enctab = DatumGetByteaPP(DirectFunctionCall1(byteain,
-														 CStringGetDatum(str)));
+			enctab = string_to_context_bytea(str);
 		}
 		else if (strcmp(defel->defname, "dectab") == 0)
 		{
@@ -332,8 +402,33 @@ DefineEncodingContext(ParseState *pstate, List *names, List *parameters,
 				errorConflictingDefElem(defel, pstate);
 			dectabEl = defel;
 			str = defGetString(defel);
-			dectab = DatumGetByteaPP(DirectFunctionCall1(byteain,
-														 CStringGetDatum(str)));
+			dectab = string_to_context_bytea(str);
+		}
+		else if (strcmp(defel->defname, "dictionary") == 0)
+		{
+			char	   *str = defGetString(defel);
+
+			dictEl = defel;
+			if (enctabEl == NULL)
+				enctab = string_to_context_bytea(str);
+			extra_options = lappend(extra_options, defel);
+		}
+		else if (strcmp(defel->defname, "schema") == 0 ||
+				 strcmp(defel->defname, "writer_schema") == 0)
+		{
+			char	   *str = defGetString(defel);
+
+			if (enctabEl == NULL && dictEl == NULL && enctab == NULL)
+				enctab = (bytea *) cstring_to_text(str);
+			extra_options = lappend(extra_options, defel);
+		}
+		else if (strcmp(defel->defname, "reader_schema") == 0)
+		{
+			char	   *str = defGetString(defel);
+
+			if (dectabEl == NULL && dectab == NULL)
+				dectab = (bytea *) cstring_to_text(str);
+			extra_options = lappend(extra_options, defel);
 		}
 		else if (strcmp(defel->defname, "label") == 0)
 		{
@@ -380,6 +475,7 @@ AlterEncodingContext(AlterEncodingContextStmt *stmt)
 	Oid			contextId;
 	DefElem    *enctabEl = NULL;
 	DefElem    *dectabEl = NULL;
+	DefElem    *dictEl = NULL;
 	DefElem    *labelEl = NULL;
 	bytea	   *enctab = NULL;
 	bool		update_enctab = false;
@@ -414,14 +510,14 @@ AlterEncodingContext(AlterEncodingContextStmt *stmt)
 				errorConflictingDefElem(defel, NULL);
 			enctabEl = defel;
 			update_enctab = true;
+			enctab = NULL;
 			if (defel->arg != NULL)
 			{
 				char	   *str = defGetString(defel);
 
 				if (pg_strcasecmp(str, "null") != 0 &&
 					pg_strcasecmp(str, "none") != 0)
-					enctab = DatumGetByteaPP(DirectFunctionCall1(byteain,
-																 CStringGetDatum(str)));
+					enctab = string_to_context_bytea(str);
 			}
 		}
 		else if (strcmp(defel->defname, "dectab") == 0)
@@ -430,15 +526,65 @@ AlterEncodingContext(AlterEncodingContextStmt *stmt)
 				errorConflictingDefElem(defel, NULL);
 			dectabEl = defel;
 			update_dectab = true;
+			dectab = NULL;
 			if (defel->arg != NULL)
 			{
 				char	   *str = defGetString(defel);
 
 				if (pg_strcasecmp(str, "null") != 0 &&
 					pg_strcasecmp(str, "none") != 0)
-					dectab = DatumGetByteaPP(DirectFunctionCall1(byteain,
-																 CStringGetDatum(str)));
+					dectab = string_to_context_bytea(str);
 			}
+		}
+		else if (strcmp(defel->defname, "dictionary") == 0)
+		{
+			dictEl = defel;
+			if (defel->arg != NULL && enctabEl == NULL)
+			{
+				char	   *str = defGetString(defel);
+
+				update_enctab = true;
+				enctab = NULL;
+				if (pg_strcasecmp(str, "null") != 0 &&
+					pg_strcasecmp(str, "none") != 0)
+					enctab = string_to_context_bytea(str);
+			}
+			extra_options = lappend(extra_options, defel);
+		}
+		else if (strcmp(defel->defname, "schema") == 0 ||
+				 strcmp(defel->defname, "writer_schema") == 0)
+		{
+			if (defel->arg != NULL)
+			{
+				char	   *str = defGetString(defel);
+
+				if (enctabEl == NULL && dictEl == NULL)
+				{
+					update_enctab = true;
+					enctab = NULL;
+					if (pg_strcasecmp(str, "null") != 0 &&
+						pg_strcasecmp(str, "none") != 0)
+						enctab = (bytea *) cstring_to_text(str);
+				}
+			}
+			extra_options = lappend(extra_options, defel);
+		}
+		else if (strcmp(defel->defname, "reader_schema") == 0)
+		{
+			if (defel->arg != NULL)
+			{
+				char	   *str = defGetString(defel);
+
+				if (dectabEl == NULL)
+				{
+					update_dectab = true;
+					dectab = NULL;
+					if (pg_strcasecmp(str, "null") != 0 &&
+						pg_strcasecmp(str, "none") != 0)
+						dectab = (bytea *) cstring_to_text(str);
+				}
+			}
+			extra_options = lappend(extra_options, defel);
 		}
 		else if (strcmp(defel->defname, "label") == 0)
 		{

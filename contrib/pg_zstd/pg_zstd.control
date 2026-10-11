@@ -1,0 +1,5 @@
+# pg_zstd extension
+comment = 'Zstandard (zstd) context compression and dictionary training for encoding contexts'
+default_version = '1.0'
+module_pathname = '$libdir/pg_zstd'
+relocatable = true

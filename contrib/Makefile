@@ -30,9 +30,12 @@ SUBDIRS = \
 		oid2name	\
 		pageinspect	\
 		passwordcheck	\
+		pg_avro		\
 		pg_buffercache	\
+		pg_cascade	\
 		pg_freespacemap \
 		pg_logicalinspect \
+		pg_lz4		\
 		pg_overexplain \
 		pg_plan_advice \
 		pg_prewarm	\
@@ -44,6 +47,7 @@ SUBDIRS = \
 		pgstattuple	\
 		pg_visibility	\
 		pg_walinspect	\
+		pg_zstd		\
 		pgbench		\
 		postgres_fdw	\
 		seg		\

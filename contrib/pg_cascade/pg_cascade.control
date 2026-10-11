@@ -1,0 +1,5 @@
+# pg_cascade extension
+comment = 'Multi-stage cascade and fused Avro+Zstd encoding context handlers for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/pg_cascade'
+relocatable = true

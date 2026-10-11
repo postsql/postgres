@@ -286,10 +286,20 @@ SELECT * FROM verify_heapam('test_foreign_table',
 							endblock := NULL);
 ERROR:  cannot check relation "test_foreign_table"
 DETAIL:  This operation is not supported for foreign tables.
--- Check that Direct TOAST tables are verified without reporting false corruption
-CREATE TABLE direct_toast_check (id int, val text) WITH (toast_flavour = 'direct');
-INSERT INTO direct_toast_check SELECT i, string_agg(md5(i::text), '') FROM generate_series(1, 10) i GROUP BY i;
+-- Check that Direct TOAST tables (single-chunk, flat multi-chunk, and tree DAG)
+-- are verified without reporting false corruption
+CREATE TABLE direct_toast_check (id int, val text) WITH (toast_flavour = 'direct', toast_tuple_target = 128);
+ALTER TABLE direct_toast_check ALTER COLUMN val SET STORAGE EXTERNAL;
+INSERT INTO direct_toast_check VALUES
+  (1, repeat(md5('tier1'), 50)),
+  (2, repeat(md5('tier2'), 1000)),
+  (3, repeat(md5('tier3'), 10000));
 SELECT * FROM verify_heapam('direct_toast_check', check_toast := true);
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
+SELECT * FROM verify_heapam((SELECT reltoastrelid FROM pg_class WHERE relname = 'direct_toast_check'));
  blkno | offnum | attnum | msg 
 -------+--------+--------+-----
 (0 rows)
@@ -314,6 +324,76 @@ SELECT * FROM verify_heapam('direct_toast_ectx_check', check_toast := true);
 DROP TABLE direct_toast_ectx_check;
 DROP ENCODING CONTEXT amcheck_pglz_ctx;
 DROP ENCODING TYPE amcheck_pglz_type;
+-- Check that Direct TOAST tables with zstd, lz4, avro, and avro_zstd encoding contexts pass verification
+CREATE ENCODING TYPE amcheck_zstd_type (KIND = 'c', TYPE = 'zstd');
+CREATE ENCODING TYPE amcheck_lz4_type (KIND = 'c', TYPE = 'lz4');
+CREATE ENCODING TYPE amcheck_avro_type (KIND = 's', TYPE = 'avro');
+CREATE ENCODING TYPE amcheck_avro_zstd_type (KIND = 's', TYPE = 'avro_zstd');
+CREATE ENCODING CONTEXT amcheck_zstd_ctx TYPE amcheck_zstd_type FOR TYPE text WITH (level = 3);
+CREATE ENCODING CONTEXT amcheck_lz4_ctx TYPE amcheck_lz4_type FOR TYPE text WITH (acceleration = 1);
+CREATE ENCODING CONTEXT amcheck_avro_ctx TYPE amcheck_avro_type FOR TYPE jsonb WITH (
+	schema = '{"type":"record","name":"AmcheckDoc","fields":[{"name":"k","type":"string"},{"name":"v","type":"string"}]}'
+);
+CREATE ENCODING CONTEXT amcheck_avro_zstd_ctx TYPE amcheck_avro_zstd_type FOR TYPE jsonb WITH (
+	level = 3,
+	schema = '{"type":"record","name":"AmcheckDoc","fields":[{"name":"k","type":"string"},{"name":"v","type":"string"}]}'
+);
+CREATE TABLE direct_toast_multi_ectx_check (
+	id int,
+	zstd_col text,
+	lz4_col text,
+	avro_col jsonb,
+	avro_zstd_col jsonb
+);
+ALTER TABLE direct_toast_multi_ectx_check ALTER COLUMN zstd_col SET ENCODING CONTEXT amcheck_zstd_ctx;
+ALTER TABLE direct_toast_multi_ectx_check ALTER COLUMN lz4_col SET ENCODING CONTEXT amcheck_lz4_ctx;
+ALTER TABLE direct_toast_multi_ectx_check ALTER COLUMN avro_col SET ENCODING CONTEXT amcheck_avro_ctx;
+ALTER TABLE direct_toast_multi_ectx_check ALTER COLUMN avro_zstd_col SET ENCODING CONTEXT amcheck_avro_zstd_ctx;
+INSERT INTO direct_toast_multi_ectx_check VALUES (
+	1,
+	repeat('zstd_toast_verification_payload_', 400),
+	repeat('lz4_toast_verification_payload_', 400),
+	jsonb_build_object('k', 'avro_key', 'v', repeat('avro_toast_payload_', 300)),
+	jsonb_build_object('k', 'avro_zstd_key', 'v', repeat('avro_zstd_toast_payload_', 300))
+);
+SET direct_toast_chunk_compression = off;
+INSERT INTO direct_toast_multi_ectx_check
+SELECT 2,
+	   string_agg('zstd_whole_datum_' || g || '_' || md5(g::text), ' '),
+	   string_agg('lz4_whole_datum_' || g || '_' || md5(g::text), ' '),
+	   jsonb_build_object('k', 'avro_key_2', 'v', repeat('avro_toast_payload_', 300)),
+	   jsonb_build_object('k', 'avro_zstd_key_2', 'v', repeat('avro_zstd_toast_payload_', 300))
+FROM generate_series(1, 200) g;
+RESET direct_toast_chunk_compression;
+SELECT * FROM verify_heapam('direct_toast_multi_ectx_check', check_toast := true);
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
+SELECT * FROM verify_heapam((SELECT reltoastrelid FROM pg_class WHERE relname = 'direct_toast_multi_ectx_check'));
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
+DROP TABLE direct_toast_multi_ectx_check;
+DROP ENCODING CONTEXT amcheck_avro_zstd_ctx;
+DROP ENCODING CONTEXT amcheck_avro_ctx;
+DROP ENCODING CONTEXT amcheck_lz4_ctx;
+DROP ENCODING CONTEXT amcheck_zstd_ctx;
+DROP ENCODING TYPE amcheck_avro_zstd_type;
+DROP ENCODING TYPE amcheck_avro_type;
+DROP ENCODING TYPE amcheck_lz4_type;
+DROP ENCODING TYPE amcheck_zstd_type;
+-- Check that VACUUM FULL on a 3-column TOAST table while toast_default_flavour = 'direct'
+-- preserves the 3-column TOAST table format without corruption
+SET toast_flavour = 'direct';
+VACUUM FULL test_toast_oid;
+RESET toast_flavour;
+SELECT * FROM verify_heapam((SELECT reltoastrelid FROM pg_class WHERE relname = 'test_toast_oid'));
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
 -- cleanup
 DROP TABLE test_toast_oid;
 DROP TABLE test_toast_oid8;

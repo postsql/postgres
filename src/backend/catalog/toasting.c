@@ -758,6 +758,18 @@ ensure_direct_toast(Oid relid)
 }
 
 /*
+ * ensure_direct_toast_ectx
+ *
+ * Ensures that the table's TOAST table (if any) is upgraded to Direct TOAST
+ * format and includes the 6th column (chunk_ectx_id OID).
+ */
+void
+ensure_direct_toast_ectx(Oid relid)
+{
+	ensure_direct_toast(relid);
+}
+
+/*
  * SQL-callable function
  */
 Datum

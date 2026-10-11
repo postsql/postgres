@@ -1,0 +1,224 @@
+--
+-- pg_zstd: Zstandard Dictionary Training & Compression Encoding Contexts
+--
+
+CREATE EXTENSION pg_zstd;
+
+-- 1. Verify default 'zstd' encoding type created by extension
+SELECT enctypname, enctypkind, enctyptype, enctypencfunc, enctypdecfunc
+FROM pg_encoding_type
+WHERE enctypname = 'zstd';
+
+-- 2. Verify auto-resolved ENCFUNC / DECFUNC when TYPE = 'zstd'
+CREATE ENCODING TYPE zstd_enc_type (
+    KIND = 'c',
+    TYPE = 'zstd'
+);
+
+SELECT enctypname, enctypkind, enctyptype, enctypencfunc, enctypdecfunc
+FROM pg_encoding_type
+WHERE enctypname = 'zstd_enc_type';
+
+-- 3. Negative tests for pg_zstd_train_dictionary
+SELECT pg_zstd_train_dictionary(ARRAY['sample'::bytea], 10);
+SELECT pg_zstd_train_dictionary(ARRAY[]::bytea[], 1024);
+
+-- 4. Train a Zstandard dictionary from structured JSON telemetry samples
+CREATE TEMP TABLE zstd_training_corpus AS
+SELECT i,
+       convert_to(
+           format('{"cluster":"prod-us-east-1","service":"checkout-api","host":"node-%s.internal.corp","status":"HTTP_200_OK","latency_ms":%s,"protocol":"gRPC/TLSv1.3","region":"us-east"}',
+                  (i % 8), 10 + (i % 50)),
+           'UTF8'
+       ) AS sample_bytes
+FROM generate_series(1, 80) g(i);
+
+CREATE ENCODING CONTEXT zstd_nodict_ctx
+    TYPE zstd
+    FOR TYPE text
+    WITH (LABEL = 'zstd-no-dict', level = 3);
+
+DO $$
+DECLARE
+    v_dict bytea;
+BEGIN
+    SELECT pg_zstd_train_dictionary(array_agg(sample_bytes), 16384)
+    INTO v_dict
+    FROM zstd_training_corpus;
+
+    IF v_dict IS NULL OR octet_length(v_dict) = 0 THEN
+        RAISE EXCEPTION 'pg_zstd_train_dictionary returned empty dictionary';
+    END IF;
+
+    PERFORM pg_create_encoding_context(
+        'zstd_dict_ctx',
+        (SELECT oid FROM pg_encoding_type WHERE enctypname = 'zstd'),
+        0,
+        'text'::regtype,
+        v_dict,
+        NULL,
+        'zstd-trained-dict-v1',
+        ARRAY['level=5']
+    );
+END;
+$$;
+
+-- 5. Verify Zstd dictionary compression shrinks individual small records
+--    dramatically compared to both raw text and dictionary-less Zstd
+WITH test_msg AS (
+    SELECT '{"cluster":"prod-us-east-1","service":"checkout-api","host":"node-3.internal.corp","status":"HTTP_200_OK","latency_ms":27,"protocol":"gRPC/TLSv1.3","region":"us-east"}'::text AS msg
+),
+sizes AS (
+    SELECT msg,
+           octet_length(msg) AS raw_len,
+           pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_nodict_ctx'), msg) AS nodict_enc,
+           pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'), msg) AS dict_enc
+    FROM test_msg
+)
+SELECT octet_length(dict_enc) < octet_length(nodict_enc) AS dict_beats_nodict,
+       octet_length(dict_enc) < raw_len / 2 AS dict_over_2x_compression,
+       pg_decode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_nodict_ctx'), nodict_enc, NULL::text) = msg AS nodict_roundtrip_ok,
+       pg_decode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'), dict_enc, NULL::text) = msg AS dict_roundtrip_ok
+FROM sizes;
+
+-- 6. Edge case: 0-byte empty string and fixed-length int8 round-trip
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'),
+    pg_encode_datum(
+        (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'),
+        ''::text
+    ),
+    NULL::text
+) = '' AS zstd_empty_roundtrip;
+
+CREATE ENCODING CONTEXT zstd_any_ctx TYPE zstd WITH (level = 3);
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_any_ctx'),
+    pg_encode_datum(
+        (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_any_ctx'),
+        123456789012345::int8
+    ),
+    NULL::int8
+) = 123456789012345::int8 AS zstd_int8_roundtrip;
+DROP ENCODING CONTEXT zstd_any_ctx;
+
+-- 7. Negative tests: invalid Zstd compression level, invalid boolean option, corrupted frame
+CREATE ENCODING CONTEXT zstd_bad_lvl_ctx
+    TYPE zstd
+    FOR TYPE text
+    WITH (level = 999);
+SELECT pg_encode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_bad_lvl_ctx'),
+    'hello'::text
+);
+DROP ENCODING CONTEXT zstd_bad_lvl_ctx;
+
+CREATE ENCODING CONTEXT zstd_bad_bool_ctx
+    TYPE zstd
+    FOR TYPE text
+    WITH (checksum = 'not_a_bool');
+SELECT pg_encode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_bad_bool_ctx'),
+    'hello'::text
+);
+DROP ENCODING CONTEXT zstd_bad_bool_ctx;
+
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'),
+    '\xdeadbeef01020304'::bytea,
+    NULL::text
+);
+
+-- 8. Zstd Frame Flags: checksum=true (+4 bytes) and dict_id_flag=false (-4 bytes), plus small-sample trainer
+CREATE ENCODING CONTEXT zstd_checksum_ctx TYPE zstd WITH (
+    level = 3,
+    checksum = true
+);
+SELECT pg_create_encoding_context(
+    'zstd_nodictid_ctx',
+    (SELECT oid FROM pg_encoding_type WHERE enctypname = 'zstd'),
+    0,
+    0,
+    (SELECT ectxenctab FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'),
+    NULL,
+    'zstd-no-dict-id',
+    ARRAY['level=3', 'dict_id_flag=false']
+) IS NOT NULL AS created_nodictid_ctx;
+
+SELECT octet_length(pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_checksum_ctx'), 'zstd-checksum-payload'::text)) -
+       octet_length(pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_nodict_ctx'), 'zstd-checksum-payload'::text))
+       AS checksum_adds_4_bytes,
+       pg_decode_datum(
+           (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_checksum_ctx'),
+           pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_checksum_ctx'), 'zstd-checksum-payload'::text),
+           NULL::text
+       ) = 'zstd-checksum-payload' AS checksum_roundtrip_ok,
+       octet_length(pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_dict_ctx'), 'zstd-dictid-payload'::text)) -
+       octet_length(pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_nodictid_ctx'), 'zstd-dictid-payload'::text))
+       AS no_dictid_saves_4_bytes,
+       pg_decode_datum(
+           (SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_nodictid_ctx'),
+           pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'zstd_nodictid_ctx'), 'zstd-dictid-payload'::text),
+           NULL::text
+       ) = 'zstd-dictid-payload' AS nodictid_roundtrip_ok,
+       octet_length(pg_zstd_train_dictionary(ARRAY[convert_to('tiny_sample_16b!', 'UTF8')], 512)) > 0 AS small_corpus_trained;
+
+DROP ENCODING CONTEXT zstd_checksum_ctx;
+DROP ENCODING CONTEXT zstd_nodictid_ctx;
+
+-- 9. Direct TOAST table column with Zstd dictionary across Tier 1, Tier 2, Tier 3, slicing & GUC modes
+CREATE TABLE zstd_toast_tbl (
+    id int PRIMARY KEY,
+    log_line text
+);
+
+ALTER TABLE zstd_toast_tbl ALTER COLUMN log_line SET ENCODING CONTEXT zstd_dict_ctx;
+
+INSERT INTO zstd_toast_tbl VALUES
+    (1, '{"cluster":"prod-us-east-1","service":"checkout-api","host":"node-1.internal.corp","status":"HTTP_200_OK","latency_ms":15,"protocol":"gRPC/TLSv1.3","region":"us-east"}'),
+    (2, repeat('{"cluster":"prod-us-east-1","service":"checkout-api","host":"node-2.internal.corp","status":"HTTP_200_OK","latency_ms":22,"protocol":"gRPC/TLSv1.3","region":"us-east"}', 120)),
+    (3, repeat('{"cluster":"prod-us-east-1","service":"checkout-api","host":"node-5.internal.corp","status":"HTTP_200_OK","latency_ms":41,"protocol":"gRPC/TLSv1.3","region":"us-east"}', 1500));
+
+SET direct_toast_chunk_compression = off;
+INSERT INTO zstd_toast_tbl VALUES
+    (12, repeat('{"cluster":"prod-us-east-1","service":"checkout-api","host":"node-2.internal.corp","status":"HTTP_200_OK","latency_ms":22,"protocol":"gRPC/TLSv1.3","region":"us-east"}', 120));
+RESET direct_toast_chunk_compression;
+
+SELECT id,
+       length(log_line) AS char_len,
+       octet_length(pg_column_raw_encoding(log_line)) < length(log_line) AS toast_compressed,
+       substring(log_line FROM 1 FOR 48) AS prefix_slice,
+       substring(log_line FROM 1990 FOR 40) AS cross_chunk_slice
+FROM zstd_toast_tbl
+WHERE id IN (1, 2, 3)
+ORDER BY id;
+
+SELECT octet_length(pg_column_raw_encoding(off_r.log_line)) <
+       octet_length(pg_column_raw_encoding(on_r.log_line)) AS whole_zstd_smaller_than_chunked,
+       on_r.log_line = off_r.log_line AS full_eq,
+       substring(on_r.log_line FROM 1990 FOR 40) = substring(off_r.log_line FROM 1990 FOR 40) AS slice_eq
+FROM zstd_toast_tbl on_r, zstd_toast_tbl off_r
+WHERE on_r.id = 2 AND off_r.id = 12;
+
+-- 10. Unprivileged role security check
+CREATE ROLE regress_zstd_unpriv;
+GRANT SELECT, INSERT ON zstd_toast_tbl TO regress_zstd_unpriv;
+SET ROLE regress_zstd_unpriv;
+
+-- Unprivileged user can read/insert rows and use pg_encode_datum/pg_decode_datum,
+-- but cannot create/alter/drop encoding types or contexts
+SELECT id, length(log_line), substring(log_line FROM 1 FOR 32) FROM zstd_toast_tbl WHERE id = 1;
+CREATE ENCODING CONTEXT unpriv_zstd_ctx TYPE zstd;
+DROP ENCODING CONTEXT zstd_dict_ctx;
+
+RESET ROLE;
+REVOKE ALL ON zstd_toast_tbl FROM regress_zstd_unpriv;
+DROP ROLE regress_zstd_unpriv;
+
+-- Clean up
+DROP TABLE zstd_toast_tbl;
+DROP TABLE zstd_training_corpus;
+DROP ENCODING CONTEXT zstd_dict_ctx;
+DROP ENCODING CONTEXT zstd_nodict_ctx;
+DROP ENCODING TYPE zstd_enc_type;
+DROP EXTENSION pg_zstd;

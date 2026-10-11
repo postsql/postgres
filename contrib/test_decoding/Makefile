@@ -25,6 +25,7 @@ ISOLATION_OPTS = --temp-config $(top_srcdir)/contrib/test_decoding/logical.conf
 NO_INSTALLCHECK = 1
 
 TAP_TESTS = 1
+EXTRA_INSTALL = contrib/pg_avro contrib/pg_cascade contrib/pg_lz4 contrib/pg_zstd
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

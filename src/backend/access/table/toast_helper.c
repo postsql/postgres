@@ -160,6 +160,14 @@ toast_tuple_init(ToastTupleContext *ttc)
 				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_NEEDS_FREE;
 				ttc->ttc_flags |= (TOAST_NEEDS_CHANGE | TOAST_NEEDS_FREE);
 			}
+			else if (VARATT_IS_COMPRESSED(new_value) &&
+					 OidIsValid(att->attencoding_context))
+			{
+				new_value = detoast_attr(new_value);
+				ttc->ttc_values[i] = PointerGetDatum(new_value);
+				ttc->ttc_attr[i].tai_colflags |= TOASTCOL_NEEDS_FREE;
+				ttc->ttc_flags |= (TOAST_NEEDS_CHANGE | TOAST_NEEDS_FREE);
+			}
 
 			/*
 			 * Remember the size of this attribute

@@ -1,0 +1,206 @@
+--
+-- pg_lz4: LZ4 Dictionary Training & Compression Encoding Contexts
+--
+CREATE EXTENSION pg_lz4;
+-- 1. Verify default 'lz4' encoding type created by extension
+SELECT enctypname, enctypkind, enctyptype, enctypencfunc, enctypdecfunc
+FROM pg_encoding_type
+WHERE enctypname = 'lz4';
+ enctypname | enctypkind | enctyptype |     enctypencfunc     |     enctypdecfunc     
+------------+------------+------------+-----------------------+-----------------------
+ lz4        | c          | lz4        | pg_lz4_context_encode | pg_lz4_context_decode
+(1 row)
+
+-- 2. Verify auto-resolved ENCFUNC / DECFUNC when TYPE = 'lz4'
+CREATE ENCODING TYPE lz4_enc_type (
+    KIND = 'c',
+    TYPE = 'lz4'
+);
+SELECT enctypname, enctypkind, enctyptype, enctypencfunc, enctypdecfunc
+FROM pg_encoding_type
+WHERE enctypname = 'lz4_enc_type';
+  enctypname  | enctypkind | enctyptype |     enctypencfunc     |     enctypdecfunc     
+--------------+------------+------------+-----------------------+-----------------------
+ lz4_enc_type | c          | lz4        | pg_lz4_context_encode | pg_lz4_context_decode
+(1 row)
+
+-- 3. Negative tests for pg_lz4_train_dictionary
+SELECT pg_lz4_train_dictionary(ARRAY['sample'::bytea], 0);
+ERROR:  invalid lz4 max_dict_size 0 (must be between 1 and 104857600)
+SELECT pg_lz4_train_dictionary(ARRAY[]::bytea[], 1024);
+ pg_lz4_train_dictionary 
+-------------------------
+ \x
+(1 row)
+
+-- 4. Train an LZ4 dictionary from structured log samples
+CREATE TEMP TABLE lz4_training_corpus AS
+SELECT i,
+       convert_to(
+           format('{"cluster":"prod-eu-west-1","service":"payment-gateway","merchant":"acct-%s","currency":"EUR","status":"SETTLED","auth_scheme":"OAUTH2_BEARER_JWT"}',
+                  1000 + (i % 10)),
+           'UTF8'
+       ) AS sample_bytes
+FROM generate_series(1, 50) g(i);
+CREATE ENCODING CONTEXT lz4_nodict_ctx
+    TYPE lz4
+    FOR TYPE text
+    WITH (LABEL = 'lz4-no-dict', acceleration = 1);
+DO $$
+DECLARE
+    v_dict bytea;
+BEGIN
+    SELECT pg_lz4_train_dictionary(array_agg(sample_bytes), 16384)
+    INTO v_dict
+    FROM lz4_training_corpus;
+
+    IF v_dict IS NULL OR octet_length(v_dict) = 0 THEN
+        RAISE EXCEPTION 'pg_lz4_train_dictionary returned empty dictionary';
+    END IF;
+
+    PERFORM pg_create_encoding_context(
+        'lz4_dict_ctx',
+        (SELECT oid FROM pg_encoding_type WHERE enctypname = 'lz4'),
+        0,
+        'text'::regtype,
+        v_dict,
+        NULL,
+        'lz4-trained-dict-v1',
+        ARRAY['acceleration=1']
+    );
+END;
+$$;
+-- 5. Verify LZ4 dictionary compression outperforms dictionary-less LZ4 on single messages
+WITH test_msg AS (
+    SELECT '{"cluster":"prod-eu-west-1","service":"payment-gateway","merchant":"acct-1004","currency":"EUR","status":"SETTLED","auth_scheme":"OAUTH2_BEARER_JWT"}'::text AS msg
+),
+sizes AS (
+    SELECT msg,
+           octet_length(msg) AS raw_len,
+           pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_nodict_ctx'), msg) AS nodict_enc,
+           pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_dict_ctx'), msg) AS dict_enc
+    FROM test_msg
+)
+SELECT octet_length(dict_enc) < octet_length(nodict_enc) AS lz4_dict_beats_nodict,
+       octet_length(dict_enc) < raw_len AS lz4_dict_smaller_than_raw,
+       pg_decode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_nodict_ctx'), nodict_enc, NULL::text) = msg AS nodict_roundtrip_ok,
+       pg_decode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_dict_ctx'), dict_enc, NULL::text) = msg AS dict_roundtrip_ok
+FROM sizes;
+ lz4_dict_beats_nodict | lz4_dict_smaller_than_raw | nodict_roundtrip_ok | dict_roundtrip_ok 
+-----------------------+---------------------------+---------------------+-------------------
+ t                     | t                         | t                   | t
+(1 row)
+
+-- 6. Edge case: 0-byte empty string and compression_level option alias
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_dict_ctx'),
+    pg_encode_datum(
+        (SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_dict_ctx'),
+        ''::text
+    ),
+    NULL::text
+) = '' AS lz4_empty_roundtrip;
+ lz4_empty_roundtrip 
+---------------------
+ t
+(1 row)
+
+CREATE ENCODING CONTEXT lz4_clevel_ctx TYPE lz4 WITH (
+    compression_level = 2
+);
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_clevel_ctx'),
+    pg_encode_datum((SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_clevel_ctx'), 'lz4-clevel-payload'::text),
+    NULL::text
+) = 'lz4-clevel-payload' AS lz4_clevel_roundtrip_ok;
+ lz4_clevel_roundtrip_ok 
+-------------------------
+ t
+(1 row)
+
+DROP ENCODING CONTEXT lz4_clevel_ctx;
+-- 7. Negative tests: invalid acceleration and corrupted LZ4 payload
+CREATE ENCODING CONTEXT lz4_bad_accel_ctx
+    TYPE lz4
+    FOR TYPE text
+    WITH (acceleration = 0);
+SELECT pg_encode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_bad_accel_ctx'),
+    'hello'::text
+);
+ERROR:  invalid lz4 acceleration "0" (expected integer >= 1)
+DROP ENCODING CONTEXT lz4_bad_accel_ctx;
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_dict_ctx'),
+    '\x10000000deadbeef'::bytea,
+    NULL::text
+);
+ERROR:  lz4 context decompression failed (expected 16 bytes, got -2)
+SELECT pg_decode_datum(
+    (SELECT oid FROM pg_encoding_context WHERE ectxname = 'lz4_dict_ctx'),
+    '\x0102'::bytea,
+    NULL::text
+);
+ERROR:  corrupted lz4 context payload (length 2 < 4)
+-- 8. Direct TOAST table column with LZ4 dictionary, partial slicing, and GUC modes
+CREATE TABLE lz4_toast_tbl (
+    id int PRIMARY KEY,
+    log_line text
+);
+ALTER TABLE lz4_toast_tbl ALTER COLUMN log_line SET ENCODING CONTEXT lz4_dict_ctx;
+INSERT INTO lz4_toast_tbl VALUES
+    (1, '{"cluster":"prod-eu-west-1","service":"payment-gateway","merchant":"acct-1001","currency":"EUR","status":"SETTLED","auth_scheme":"OAUTH2_BEARER_JWT"}'),
+    (2, repeat('{"cluster":"prod-eu-west-1","service":"payment-gateway","merchant":"acct-1002","currency":"EUR","status":"SETTLED","auth_scheme":"OAUTH2_BEARER_JWT"}', 100));
+SET direct_toast_chunk_compression = off;
+INSERT INTO lz4_toast_tbl VALUES
+    (12, repeat('{"cluster":"prod-eu-west-1","service":"payment-gateway","merchant":"acct-1002","currency":"EUR","status":"SETTLED","auth_scheme":"OAUTH2_BEARER_JWT"}', 100));
+RESET direct_toast_chunk_compression;
+SELECT id,
+       length(log_line) AS char_len,
+       octet_length(pg_column_raw_encoding(log_line)) < length(log_line) AS toast_compressed,
+       substring(log_line FROM 1 FOR 52) AS prefix_slice,
+       substring(log_line FROM 1995 FOR 45) AS cross_chunk_slice
+FROM lz4_toast_tbl
+WHERE id IN (1, 2)
+ORDER BY id;
+ id | char_len | toast_compressed |                     prefix_slice                     |               cross_chunk_slice               
+----+----------+------------------+------------------------------------------------------+-----------------------------------------------
+  1 |      149 | t                | {"cluster":"prod-eu-west-1","service":"payment-gatew | 
+  2 |    14900 | t                | {"cluster":"prod-eu-west-1","service":"payment-gatew | merchant":"acct-1002","currency":"EUR","statu
+(2 rows)
+
+SELECT octet_length(pg_column_raw_encoding(off_r.log_line)) <
+       octet_length(pg_column_raw_encoding(on_r.log_line)) AS whole_lz4_smaller_than_chunked,
+       on_r.log_line = off_r.log_line AS full_eq,
+       substring(on_r.log_line FROM 1995 FOR 45) = substring(off_r.log_line FROM 1995 FOR 45) AS slice_eq
+FROM lz4_toast_tbl on_r, lz4_toast_tbl off_r
+WHERE on_r.id = 2 AND off_r.id = 12;
+ whole_lz4_smaller_than_chunked | full_eq | slice_eq 
+--------------------------------+---------+----------
+ t                              | t       | t
+(1 row)
+
+-- 9. Unprivileged role security check
+CREATE ROLE regress_lz4_unpriv;
+GRANT SELECT, INSERT ON lz4_toast_tbl TO regress_lz4_unpriv;
+SET ROLE regress_lz4_unpriv;
+SELECT id, length(log_line), substring(log_line FROM 1 FOR 32) FROM lz4_toast_tbl WHERE id = 1;
+ id | length |            substring             
+----+--------+----------------------------------
+  1 |    149 | {"cluster":"prod-eu-west-1","ser
+(1 row)
+
+CREATE ENCODING CONTEXT unpriv_lz4_ctx TYPE lz4;
+ERROR:  must be superuser to create encoding contexts
+DROP ENCODING CONTEXT lz4_dict_ctx;
+ERROR:  must be owner of encoding context lz4_dict_ctx
+RESET ROLE;
+REVOKE ALL ON lz4_toast_tbl FROM regress_lz4_unpriv;
+DROP ROLE regress_lz4_unpriv;
+-- Clean up
+DROP TABLE lz4_toast_tbl;
+DROP TABLE lz4_training_corpus;
+DROP ENCODING CONTEXT lz4_dict_ctx;
+DROP ENCODING CONTEXT lz4_nodict_ctx;
+DROP ENCODING TYPE lz4_enc_type;
+DROP EXTENSION pg_lz4;

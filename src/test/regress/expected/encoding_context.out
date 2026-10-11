@@ -928,3 +928,134 @@ SELECT count(*) FROM pg_encoding_context;
      0
 (1 row)
 
+-- =========================================================================
+-- 11. GUC Control of Chunk-Wise vs. Whole-Datum Compression (Core pglz)
+--     (direct_toast_chunk_compression = on | off)
+-- =========================================================================
+SHOW direct_toast_chunk_compression;
+ direct_toast_chunk_compression 
+--------------------------------
+ on
+(1 row)
+
+CREATE ENCODING TYPE core_pglz_type (
+    KIND = 'c',
+    TYPE = 'pglz'
+);
+CREATE ENCODING CONTEXT core_pglz_ctx
+    TYPE core_pglz_type
+    FOR TYPE text
+    WITH (LABEL = 'core-pglz-guc-test');
+CREATE TABLE chunk_comp_guc_tbl (
+    id int PRIMARY KEY,
+    mode text,
+    pglz_col text
+);
+ALTER TABLE chunk_comp_guc_tbl ALTER COLUMN pglz_col SET ENCODING CONTEXT core_pglz_ctx;
+-- 11a. Insert Tier 1, Tier 2, and Tier 3 rows with direct_toast_chunk_compression = on (default)
+INSERT INTO chunk_comp_guc_tbl VALUES (
+    1, 'chunk_on_tier1',
+    repeat('{"service":"checkout-api","region":"us-east-1","status":200} ', 15)
+);
+INSERT INTO chunk_comp_guc_tbl VALUES (
+    2, 'chunk_on_tier2',
+    repeat('{"service":"checkout-api","region":"us-east-1","status":200} ', 350)
+);
+INSERT INTO chunk_comp_guc_tbl
+SELECT 3, 'chunk_on_tier3',
+       string_agg('{"service":"checkout-api","seq":' || g || '}', E'\n')
+FROM generate_series(1, 3200) g;
+-- 11b. Switch direct_toast_chunk_compression = off (whole-datum compression)
+SET direct_toast_chunk_compression = off;
+SHOW direct_toast_chunk_compression;
+ direct_toast_chunk_compression 
+--------------------------------
+ off
+(1 row)
+
+INSERT INTO chunk_comp_guc_tbl VALUES (
+    11, 'chunk_off_tier1',
+    repeat('{"service":"checkout-api","region":"us-east-1","status":200} ', 15)
+);
+INSERT INTO chunk_comp_guc_tbl VALUES (
+    12, 'chunk_off_tier2',
+    repeat('{"service":"checkout-api","region":"us-east-1","status":200} ', 350)
+);
+INSERT INTO chunk_comp_guc_tbl
+SELECT 13, 'chunk_off_tier3',
+       string_agg('{"service":"checkout-api","seq":' || g || '}', E'\n')
+FROM generate_series(1, 3200) g;
+SELECT on_r.id AS on_id, off_r.id AS off_id,
+       on_r.pglz_col = off_r.pglz_col AS pglz_full_eq,
+       octet_length(on_r.pglz_col) = octet_length(off_r.pglz_col) AS oct_len_eq,
+       substring(on_r.pglz_col FROM 1 FOR 40) = substring(off_r.pglz_col FROM 1 FOR 40) AS slice_head_eq,
+       substring(on_r.pglz_col FROM 4500 FOR 120) = substring(off_r.pglz_col FROM 4500 FOR 120) AS slice_mid_eq,
+       substring(on_r.pglz_col FROM 999999 FOR 10) = '' AND substring(off_r.pglz_col FROM 999999 FOR 10) = '' AS slice_oob_empty
+FROM chunk_comp_guc_tbl on_r
+JOIN chunk_comp_guc_tbl off_r ON off_r.id = on_r.id + 10
+ORDER BY on_r.id;
+ on_id | off_id | pglz_full_eq | oct_len_eq | slice_head_eq | slice_mid_eq | slice_oob_empty 
+-------+--------+--------------+------------+---------------+--------------+-----------------
+     1 |     11 | t            | t          | t             | t            | t
+     2 |     12 | t            | t          | t             | t            | t
+     3 |     13 | t            | t          | t             | t            | t
+(3 rows)
+
+RESET direct_toast_chunk_compression;
+SHOW direct_toast_chunk_compression;
+ direct_toast_chunk_compression 
+--------------------------------
+ on
+(1 row)
+
+VACUUM FULL chunk_comp_guc_tbl;
+SELECT count(*) AS total_rows_after_vac_full
+FROM chunk_comp_guc_tbl;
+ total_rows_after_vac_full 
+---------------------------
+                         6
+(1 row)
+
+DROP TABLE chunk_comp_guc_tbl;
+-- 11c. Migration of inline-compressed (VARATT_IS_COMPRESSED) datums to encoding context
+CREATE TABLE inline_comp_migrate_tbl (
+    id int PRIMARY KEY,
+    val text
+);
+INSERT INTO inline_comp_migrate_tbl VALUES (1, repeat('abcd', 750));
+SELECT pg_column_compression(val) IS NOT NULL AS is_inline_compressed,
+       pg_column_size(val) < 200 AS inline_small
+FROM inline_comp_migrate_tbl WHERE id = 1;
+ is_inline_compressed | inline_small 
+----------------------+--------------
+ t                    | t
+(1 row)
+
+SET direct_toast_chunk_compression = on;
+ALTER TABLE inline_comp_migrate_tbl ALTER COLUMN val SET ENCODING CONTEXT core_pglz_ctx;
+VACUUM FULL inline_comp_migrate_tbl;
+SELECT id,
+       length(val) AS len_after_chunk_on,
+       val = repeat('abcd', 750) AS exact_match_chunk_on,
+       substring(val FROM 1995 FOR 20) = substring(repeat('abcd', 750) FROM 1995 FOR 20) AS cross_chunk_slice_ok
+FROM inline_comp_migrate_tbl;
+ id | len_after_chunk_on | exact_match_chunk_on | cross_chunk_slice_ok 
+----+--------------------+----------------------+----------------------
+  1 |               3000 | t                    | t
+(1 row)
+
+DROP TABLE inline_comp_migrate_tbl;
+DROP ENCODING CONTEXT core_pglz_ctx;
+DROP ENCODING TYPE core_pglz_type;
+SELECT count(*) FROM pg_encoding_type;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pg_encoding_context;
+ count 
+-------
+     0
+(1 row)
+

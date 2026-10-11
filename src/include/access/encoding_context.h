@@ -105,6 +105,9 @@ typedef struct EncodingContextData
 	bytea	   *dectab;				/* Raw decoding table / dictionary */
 	int32		dectab_size;		/* Size of decoding table */
 	void	   *dec_opaque;			/* Algorithm-specific prepared decoder state */
+
+	/* Optional key=value options array from pg_encoding_context.ectxoptions */
+	struct ArrayType *options;
 } EncodingContextData;
 
 typedef EncodingContextData *EncodingContext;
@@ -124,65 +127,70 @@ typedef EncodingContextData *EncodingContext;
  * or repeated dictionary preparation. Invalidating a parent context
  * cascades invalidation to any cached child contexts.
  */
-extern void InitEncodingContextCache(void);
-extern EncodingContext GetEncodingContext(Oid context_id);
-extern void InvalidateEncodingContext(Oid context_id);
+extern PGDLLIMPORT void InitEncodingContextCache(void);
+extern PGDLLIMPORT EncodingContext GetEncodingContext(Oid context_id);
+extern PGDLLIMPORT void InvalidateEncodingContext(Oid context_id);
+extern PGDLLIMPORT const char *EncodingContextGetOption(EncodingContext ectx, const char *optname);
+extern PGDLLIMPORT bool EncodingContextIsWholeDatum(EncodingContext ectx, Oid valtype);
 
 /*
  * Runtime invocation wrappers:
+ * - EncodingContextInvokeSingleEncode / Decode invoke a single stage.
  * - EncodingContextEncode traverses the parent chain from root to leaf.
  * - EncodingContextDecode traverses the parent chain from leaf to root.
  */
-extern Datum EncodingContextEncode(EncodingContext ectx, Datum val, Oid valtype);
-extern Datum EncodingContextDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype);
+extern PGDLLIMPORT Datum EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype);
+extern PGDLLIMPORT Datum EncodingContextInvokeSingleDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype);
+extern PGDLLIMPORT Datum EncodingContextEncode(EncodingContext ectx, Datum val, Oid valtype);
+extern PGDLLIMPORT Datum EncodingContextDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype);
 
 /* Context lifecycle */
-extern EncodingContext CreateEncodingContext(MemoryContext parent_mcxt,
-											Oid context_id,
-											Oid type_id,
-											Oid parent_id,
-											Oid target_typid,
-											char kind,
-											const char *algorithm,
-											Oid enc_fn,
-											Oid dec_fn);
-extern void SetEncodingContextTables(EncodingContext ectx,
-									 bytea *enctab,
-									 bytea *dectab);
-extern void FreeEncodingContext(EncodingContext ectx);
+extern PGDLLIMPORT EncodingContext CreateEncodingContext(MemoryContext parent_mcxt,
+														 Oid context_id,
+														 Oid type_id,
+														 Oid parent_id,
+														 Oid target_typid,
+														 char kind,
+														 const char *algorithm,
+														 Oid enc_fn,
+														 Oid dec_fn);
+extern PGDLLIMPORT void SetEncodingContextTables(EncodingContext ectx,
+												 bytea *enctab,
+												 bytea *dectab);
+extern PGDLLIMPORT void FreeEncodingContext(EncodingContext ectx);
 
 /*
  * Catalog Management C API (pg_encoding_type & pg_encoding_context)
  */
-extern Oid	EncodingTypeCreate(const char *name,
-							   Oid namespaceId,
-							   Oid ownerId,
-							   char kind,
-							   const char *algorithm,
-							   Oid encFuncId,
-							   Oid decFuncId);
-extern void RemoveEncodingTypeById(Oid type_id);
-extern void EncodingTypeRemove(Oid type_id, bool cascade, bool missing_ok);
+extern PGDLLIMPORT Oid EncodingTypeCreate(const char *name,
+										  Oid namespaceId,
+										  Oid ownerId,
+										  char kind,
+										  const char *algorithm,
+										  Oid encFuncId,
+										  Oid decFuncId);
+extern PGDLLIMPORT void RemoveEncodingTypeById(Oid type_id);
+extern PGDLLIMPORT void EncodingTypeRemove(Oid type_id, bool cascade, bool missing_ok);
 
-extern Oid	EncodingContextCreate(const char *name,
-								  Oid namespaceId,
-								  Oid ownerId,
-								  Oid type_id,
-								  Oid parent_id,
-								  Oid target_typid,
-								  bytea *enctab,
-								  bytea *dectab,
-								  text *label,
-								  Datum options);
-extern void EncodingContextUpdate(Oid context_id,
-								  bytea *enctab, bool update_enctab,
-								  bytea *dectab, bool update_dectab,
-								  text *label, bool update_label,
-								  Datum options, bool update_options);
-extern void RemoveEncodingContextById(Oid context_id);
-extern void EncodingContextRemove(Oid context_id, bool cascade, bool missing_ok);
+extern PGDLLIMPORT Oid EncodingContextCreate(const char *name,
+											 Oid namespaceId,
+											 Oid ownerId,
+											 Oid type_id,
+											 Oid parent_id,
+											 Oid target_typid,
+											 bytea *enctab,
+											 bytea *dectab,
+											 text *label,
+											 Datum options);
+extern PGDLLIMPORT void EncodingContextUpdate(Oid context_id,
+											  bytea *enctab, bool update_enctab,
+											  bytea *dectab, bool update_dectab,
+											  text *label, bool update_label,
+											  Datum options, bool update_options);
+extern PGDLLIMPORT void RemoveEncodingContextById(Oid context_id);
+extern PGDLLIMPORT void EncodingContextRemove(Oid context_id, bool cascade, bool missing_ok);
 
-extern void ColumnSetEncodingContext(Oid relid, const char *attname, Oid context_id);
-extern Oid	GetRootEncodingContextTargetType(Oid context_id);
+extern PGDLLIMPORT void ColumnSetEncodingContext(Oid relid, const char *attname, Oid context_id);
+extern PGDLLIMPORT Oid GetRootEncodingContextTargetType(Oid context_id);
 
 #endif							/* ENCODING_CONTEXT_H */

@@ -2915,6 +2915,21 @@ check_valid_polymorphic_signature(Oid ret_type,
 	}
 	else if (IsPolymorphicTypeFamily1(ret_type))
 	{
+		/*
+		 * Allow encoding context decode handler signature:
+		 * dec_fn(internal, bytea) RETURNS anyelement
+		 *
+		 * Because the first argument is INTERNAL, this function cannot be
+		 * invoked directly from SQL without an internal pointer, and
+		 * EncodingContextInvokeSingleDecode supplies the concrete target
+		 * return type in the synthesized FuncExpr at call time.
+		 */
+		if (ret_type == ANYELEMENTOID &&
+			nargs == 2 &&
+			declared_arg_types[0] == INTERNALOID &&
+			declared_arg_types[1] == BYTEAOID)
+			return NULL;
+
 		/* Otherwise, any family-1 type can be deduced from any other */
 		for (int i = 0; i < nargs; i++)
 		{

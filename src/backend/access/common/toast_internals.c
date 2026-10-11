@@ -33,6 +33,7 @@
 
 int			toast_flavour = TOAST_FLAVOUR_PLAIN;
 bool		direct_toast_self_prune = true;
+bool		direct_toast_chunk_compression = true;
 uint64		direct_toast_delete_count = 0;
 
 /*
@@ -81,7 +82,7 @@ toast_pointer_build(vartag_external tag, const void *ptr)
 
 	result = (varlena *) palloc(VARHDRSZ_EXTERNAL + VARTAG_SIZE(tag));
 	SET_VARTAG_EXTERNAL(result, tag);
-	Assert(VARATT_IS_EXTERNAL_ONDISK(result));
+	Assert(VARATT_IS_EXTERNAL_ONDISK(result) || VARATT_IS_EXTERNAL_DIRECT(result));
 	memcpy(VARDATA_EXTERNAL(result), ptr, VARTAG_SIZE(tag));
 
 	return result;
@@ -806,6 +807,7 @@ typedef struct DirectToastWriteState
 	int32		max_chunk_size;
 	EncodingContext ectx;
 	Oid			valtype;
+	bool		encode_per_chunk;
 } DirectToastWriteState;
 
 /*
@@ -846,7 +848,7 @@ toast_direct_insert_chunk(DirectToastWriteState *state,
 		if (chunk_size > 0)
 			memcpy(VARDATA(&chunk_buf), chunk_data_p, chunk_size);
 
-		if (state->ectx != NULL)
+		if (state->encode_per_chunk && state->ectx != NULL)
 		{
 			encoded_datum = EncodingContextEncode(state->ectx,
 												  PointerGetDatum(&chunk_buf),
@@ -902,7 +904,7 @@ toast_direct_insert_chunk(DirectToastWriteState *state,
 		t_isnull[4] = true;
 	}
 
-	if (chunk_data_p != NULL && state->ectx != NULL)
+	if (state->ectx != NULL && (chunk_data_p != NULL || !state->encode_per_chunk))
 	{
 		t_values[5] = ObjectIdGetDatum(state->ectx->context_id);
 		t_isnull[5] = false;
@@ -1061,6 +1063,8 @@ toast_save_datum_direct(Relation rel, Datum value,
 	DirectToastWriteState state;
 	struct varatt_direct toast_pointer;
 	struct varlena *result;
+	struct varlena *decompressed_val = NULL;
+	struct varlena *whole_encoded = NULL;
 	char	   *data_p;
 	int32		data_todo;
 	Pointer		dval = DatumGetPointer(value);
@@ -1077,16 +1081,39 @@ toast_save_datum_direct(Relation rel, Datum value,
 	state.max_chunk_size = TOAST_MAX_CHUNK_SIZE(TupleDescAttr(state.toasttupDesc, 0)->atttypid);
 	state.ectx = OidIsValid(ectx_id) ? GetEncodingContext(ectx_id) : NULL;
 	state.valtype = valtype;
+	state.encode_per_chunk = (state.ectx != NULL &&
+							  direct_toast_chunk_compression &&
+							  !EncodingContextIsWholeDatum(state.ectx, valtype));
 
 	if (state.toasttupDesc->natts < 5 ||
 		(state.ectx != NULL && state.toasttupDesc->natts < 6))
+	{
+		char	   *toastrelname = pstrdup(RelationGetRelationName(state.toastrel));
+
+		table_close(state.toastrel, NoLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot write direct TOAST datum to legacy TOAST table \"%s\"",
-						RelationGetRelationName(state.toastrel)),
+						toastrelname),
 				 errhint("Run \"SELECT pg_ensure_direct_toast('%s'::regclass);\" or \"ALTER TABLE %s SET (toast_flavour = 'direct');\" to upgrade the TOAST table.",
 						 RelationGetRelationName(rel),
 						 RelationGetRelationName(rel))));
+	}
+
+	if (state.ectx != NULL && VARATT_IS_COMPRESSED(dval))
+	{
+		decompressed_val = detoast_attr((struct varlena *) dval);
+		dval = (Pointer) decompressed_val;
+		value = PointerGetDatum(decompressed_val);
+	}
+
+	if (state.ectx != NULL && !state.encode_per_chunk)
+	{
+		Datum		enc_d = EncodingContextEncode(state.ectx, value, valtype);
+
+		whole_encoded = (struct varlena *) DatumGetPointer(enc_d);
+		dval = (Pointer) whole_encoded;
+	}
 
 	if (VARATT_IS_SHORT(dval))
 	{
@@ -1112,6 +1139,9 @@ toast_save_datum_direct(Relation rel, Datum value,
 		toast_pointer.va_extinfo = data_todo;
 	}
 
+	if (whole_encoded != NULL)
+		toast_pointer.va_extinfo |= (3U << VARLENA_EXTSIZE_BITS);
+
 	if (OidIsValid(rel->rd_toastoid))
 		toast_pointer.va_toastrelid = rel->rd_toastoid;
 	else
@@ -1126,11 +1156,14 @@ toast_save_datum_direct(Relation rel, Datum value,
 	else
 		toast_pointer.va_tid = toast_save_direct_tree(&state, data_p, data_todo, total_chunks);
 
+	if (whole_encoded != NULL && (Pointer) whole_encoded != DatumGetPointer(value))
+		pfree(whole_encoded);
+	if (decompressed_val != NULL)
+		pfree(decompressed_val);
+
 	table_close(state.toastrel, NoLock);
 
-	result = (struct varlena *) palloc(DIRECT_POINTER_SIZE);
-	SET_VARTAG_EXTERNAL(result, VARTAG_DIRECT);
-	memcpy(VARDATA_EXTERNAL(result), &toast_pointer, sizeof(toast_pointer));
+	result = toast_pointer_build(VARTAG_DIRECT, &toast_pointer);
 
 	Assert(VARATT_IS_EXTERNAL(result));
 	Assert(VARTAG_EXTERNAL(result) == VARTAG_DIRECT);
@@ -1159,63 +1192,9 @@ toast_delete_datum_direct(Relation rel, Datum value, bool is_speculative)
 	table_close(toastrel, NoLock);
 }
 
-/*
- * Recursively delete direct TOAST tuples.
- */
-static void
-toast_delete_datum_direct_recursive(Relation toastrel, ItemPointer tid, bool is_speculative)
+static inline void
+toast_direct_delete_tid(Relation toastrel, ItemPointer tid, bool is_speculative)
 {
-	TupleTableSlot *slot;
-	Snapshot	snapshot = get_toast_snapshot();
-	Datum		tids_datum;
-	bool		is_null_tids;
-
-	check_stack_depth();
-
-	slot = table_slot_create(toastrel, NULL);
-
-	if (!table_tuple_fetch_row_version(toastrel, tid, snapshot, slot))
-	{
-		ExecDropSingleTupleTableSlot(slot);
-		return;
-	}
-
-	tids_datum = slot_getattr(slot, 4, &is_null_tids);
-
-	if (!is_null_tids)
-	{
-		ArrayType  *arr = DatumGetArrayTypePCopy(tids_datum);
-		Datum	   *elems;
-		bool	   *nulls;
-		int			nelems;
-		int			i;
-
-		deconstruct_array_builtin(arr, TIDOID, &elems, &nulls, &nelems);
-
-		ExecClearTuple(slot);
-
-		for (i = 0; i < nelems; i++)
-		{
-			ItemPointer elem_tid = (ItemPointer) DatumGetPointer(elems[i]);
-
-			CHECK_FOR_INTERRUPTS();
-
-			if (!ItemPointerEquals(elem_tid, tid))
-			{
-				toast_delete_datum_direct_recursive(toastrel, elem_tid, is_speculative);
-			}
-		}
-		pfree(elems);
-		pfree(nulls);
-		pfree(arr);
-	}
-	else
-	{
-		ExecClearTuple(slot);
-	}
-
-	ExecDropSingleTupleTableSlot(slot);
-
 	if (is_speculative)
 		heap_abort_speculative(toastrel, tid);
 	else
@@ -1225,4 +1204,64 @@ toast_delete_datum_direct_recursive(Relation toastrel, ItemPointer tid, bool is_
 			RecordPageWithFreeSpace(toastrel, ItemPointerGetBlockNumber(tid),
 									BLCKSZ - SizeOfPageHeaderData);
 	}
+}
+
+/*
+ * Recursively delete direct TOAST tuples.
+ */
+static void
+toast_delete_datum_direct_recursive(Relation toastrel, ItemPointer tid, bool is_speculative)
+{
+	HeapTupleData tup;
+	Buffer		buffer = InvalidBuffer;
+	Snapshot	snapshot = get_toast_snapshot();
+	Datum		tids_datum;
+	bool		is_null_tids;
+	bool		is_null_offsets = true;
+
+	check_stack_depth();
+
+	tup.t_self = *tid;
+	if (!heap_fetch(toastrel, snapshot, &tup, &buffer, false))
+		return;
+
+	tids_datum = fastgetattr(&tup, 4, toastrel->rd_att, &is_null_tids);
+
+	if (!is_null_tids)
+	{
+		ArrayType  *arr = DatumGetArrayTypePCopy(tids_datum);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		int			i;
+
+		(void) fastgetattr(&tup, 5, toastrel->rd_att, &is_null_offsets);
+		ReleaseBuffer(buffer);
+
+		deconstruct_array_builtin(arr, TIDOID, &elems, &nulls, &nelems);
+
+		for (i = 0; i < nelems; i++)
+		{
+			ItemPointer elem_tid = (ItemPointer) DatumGetPointer(elems[i]);
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (!ItemPointerEquals(elem_tid, tid))
+			{
+				if (is_null_offsets)
+					toast_direct_delete_tid(toastrel, elem_tid, is_speculative);
+				else
+					toast_delete_datum_direct_recursive(toastrel, elem_tid, is_speculative);
+			}
+		}
+		pfree(elems);
+		pfree(nulls);
+		pfree(arr);
+	}
+	else
+	{
+		ReleaseBuffer(buffer);
+	}
+
+	toast_direct_delete_tid(toastrel, tid, is_speculative);
 }

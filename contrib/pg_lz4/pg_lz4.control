@@ -1,0 +1,5 @@
+# pg_lz4 extension
+comment = 'LZ4 context compression and sliding-window dictionary training for encoding contexts'
+default_version = '1.0'
+module_pathname = '$libdir/pg_lz4'
+relocatable = true

@@ -33,15 +33,18 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "catalog/toasting.h"
 #include "common/pg_lzcompress.h"
+#include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
@@ -105,6 +108,33 @@ InitEncodingContextCache(void)
 								  (Datum) 0);
 }
 
+static PGFunction
+resolve_extension_encoding_func(const char *algorithm, bool is_decode)
+{
+	const char *shlib = NULL;
+	char		funcname[NAMEDATALEN];
+
+	if (algorithm == NULL || algorithm[0] == '\0')
+		return NULL;
+
+	if (strcmp(algorithm, "zstd") == 0)
+		shlib = "$libdir/pg_zstd";
+	else if (strcmp(algorithm, "lz4") == 0)
+		shlib = "$libdir/pg_lz4";
+	else if (strcmp(algorithm, "avro") == 0)
+		shlib = "$libdir/pg_avro";
+	else if (strcmp(algorithm, "cascade") == 0 ||
+			 strcmp(algorithm, "avro_zstd") == 0)
+		shlib = "$libdir/pg_cascade";
+	else
+		return NULL;
+
+	snprintf(funcname, sizeof(funcname), "pg_%s_context_%s",
+			 algorithm, is_decode ? "decode" : "encode");
+
+	return (PGFunction) load_external_function(shlib, funcname, false, NULL);
+}
+
 /*
  * CreateEncodingContext
  *		Allocates and initializes an in-memory EncodingContextData in its own
@@ -142,8 +172,37 @@ CreateEncodingContext(MemoryContext parent_mcxt,
 
 	if (OidIsValid(enc_fn))
 		fmgr_info_cxt(enc_fn, &ectx->enc_flinfo, cxt);
+	else
+	{
+		PGFunction	ext_enc = resolve_extension_encoding_func(algorithm, false);
+
+		if (ext_enc != NULL)
+		{
+			ectx->enc_flinfo.fn_addr = ext_enc;
+			ectx->enc_flinfo.fn_oid = InvalidOid;
+			ectx->enc_flinfo.fn_nargs = 2;
+			ectx->enc_flinfo.fn_strict = true;
+			ectx->enc_flinfo.fn_retset = false;
+			ectx->enc_flinfo.fn_mcxt = cxt;
+		}
+	}
+
 	if (OidIsValid(dec_fn))
 		fmgr_info_cxt(dec_fn, &ectx->dec_flinfo, cxt);
+	else
+	{
+		PGFunction	ext_dec = resolve_extension_encoding_func(algorithm, true);
+
+		if (ext_dec != NULL)
+		{
+			ectx->dec_flinfo.fn_addr = ext_dec;
+			ectx->dec_flinfo.fn_oid = InvalidOid;
+			ectx->dec_flinfo.fn_nargs = 2;
+			ectx->dec_flinfo.fn_strict = true;
+			ectx->dec_flinfo.fn_retset = false;
+			ectx->dec_flinfo.fn_mcxt = cxt;
+		}
+	}
 
 	return ectx;
 }
@@ -325,6 +384,7 @@ GetEncodingContextInternal(Oid context_id, int depth)
 	Oid			dec_fn;
 	bytea	   *enctab = NULL;
 	bytea	   *dectab = NULL;
+	ArrayType  *options = NULL;
 	Datum		datum;
 	bool		isnull;
 	EncodingContext parent_ectx = NULL;
@@ -357,7 +417,7 @@ GetEncodingContextInternal(Oid context_id, int depth)
 	parent_id = ctxForm->ectxparentid;
 	target_typid = ctxForm->ectxtargettypid;
 
-	/* Extract varlena enctab and dectab while holding syscache pin */
+	/* Extract varlena enctab, dectab, and options while holding syscache pin */
 	datum = SysCacheGetAttr(ENCODINGCONTEXTOID, ctutup,
 							Anum_pg_encoding_context_ectxenctab, &isnull);
 	if (!isnull)
@@ -367,6 +427,11 @@ GetEncodingContextInternal(Oid context_id, int depth)
 							Anum_pg_encoding_context_ectxdectab, &isnull);
 	if (!isnull)
 		dectab = DatumGetByteaPCopy(datum);
+
+	datum = SysCacheGetAttr(ENCODINGCONTEXTOID, ctutup,
+							Anum_pg_encoding_context_ectxoptions, &isnull);
+	if (!isnull)
+		options = DatumGetArrayTypePCopy(datum);
 
 	ReleaseSysCache(ctutup);
 
@@ -378,6 +443,8 @@ GetEncodingContextInternal(Oid context_id, int depth)
 			pfree(enctab);
 		if (dectab)
 			pfree(dectab);
+		if (options)
+			pfree(options);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("encoding type with OID %u does not exist", type_id)));
@@ -399,6 +466,8 @@ GetEncodingContextInternal(Oid context_id, int depth)
 				pfree(enctab);
 			if (dectab)
 				pfree(dectab);
+			if (options)
+				pfree(options);
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("encoding context %u cannot be its own parent", context_id)));
@@ -419,6 +488,17 @@ GetEncodingContextInternal(Oid context_id, int depth)
 	ectx->parent = parent_ectx;
 	SetEncodingContextTables(ectx, enctab, dectab);
 
+	if (options != NULL)
+	{
+		Size		opt_len = VARSIZE_ANY(options);
+		MemoryContext oldcxt = MemoryContextSwitchTo(ectx->mcxt);
+
+		ectx->options = (ArrayType *) palloc(opt_len);
+		memcpy(ectx->options, options, opt_len);
+		MemoryContextSwitchTo(oldcxt);
+		pfree(options);
+	}
+
 	if (enctab)
 		pfree(enctab);
 	if (dectab)
@@ -435,6 +515,173 @@ GetEncodingContextInternal(Oid context_id, int depth)
 	return ectx;
 }
 
+/*
+ * EncodingContextGetOption
+ *		Searches ectx->options (a text[] array of "key=value" strings) for
+ *		a case-insensitive match on optname. Returns a palloc'd C string in
+ *		CurrentMemoryContext if found, or NULL if not present.
+ */
+const char *
+EncodingContextGetOption(EncodingContext ectx, const char *optname)
+{
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	Size		optlen;
+	char	   *found_val = NULL;
+
+	if (ectx == NULL || ectx->options == NULL || optname == NULL)
+		return NULL;
+
+	optlen = strlen(optname);
+	deconstruct_array_builtin(ectx->options, TEXTOID, &elems, &nulls, &nelems);
+
+	for (int i = 0; i < nelems; i++)
+	{
+		char	   *kv;
+
+		if (nulls[i])
+			continue;
+
+		kv = TextDatumGetCString(elems[i]);
+		if (pg_strncasecmp(kv, optname, optlen) == 0 && kv[optlen] == '=')
+		{
+			if (found_val)
+				pfree(found_val);
+			found_val = pstrdup(kv + optlen + 1);
+		}
+		pfree(kv);
+	}
+
+	pfree(elems);
+	pfree(nulls);
+	return found_val;
+}
+
+static bool
+EncodingContextIsWholeDatumInternal(EncodingContext ectx, Oid valtype, int depth)
+{
+	EncodingContext curr = ectx;
+
+	check_stack_depth();
+
+	if (depth >= MAX_ENCODING_CONTEXT_DEPTH)
+		return false;
+
+	if (valtype == JSONBOID || valtype == JSONOID)
+		return true;
+
+	while (curr != NULL)
+	{
+		const char *wd_opt = EncodingContextGetOption(curr, "whole_datum");
+
+		CHECK_FOR_INTERRUPTS();
+		if (depth >= MAX_ENCODING_CONTEXT_DEPTH)
+			return false;
+
+		if (wd_opt != NULL)
+		{
+			bool		is_wd = (pg_strcasecmp(wd_opt, "true") == 0 ||
+								 pg_strcasecmp(wd_opt, "on") == 0 ||
+								 pg_strcasecmp(wd_opt, "1") == 0 ||
+								 pg_strcasecmp(wd_opt, "yes") == 0);
+
+			pfree((void *) wd_opt);
+			if (is_wd)
+				return true;
+		}
+		if (curr->kind == ENCTYPKIND_SERIALIZATION ||
+			strcmp(NameStr(curr->algorithm), "avro") == 0 ||
+			strcmp(NameStr(curr->algorithm), "avro_zstd") == 0)
+			return true;
+		if (curr->target_typid == JSONBOID || curr->target_typid == JSONOID)
+			return true;
+
+		/*
+		 * Also check multi-stage cascade contexts configured via WITH (stages = ...)
+		 */
+		{
+			const char *stages_opt = EncodingContextGetOption(curr, "stages");
+
+			if (stages_opt != NULL)
+			{
+				char	   *raw = pstrdup(stages_opt);
+				char	   *p = raw;
+
+				pfree((void *) stages_opt);
+				while (*p != '\0')
+				{
+					char	   *comma = strchr(p, ',');
+					char	   *tok = p;
+					char	   *endp;
+					bool		all_digits = true;
+					Oid			st_oid = InvalidOid;
+
+					CHECK_FOR_INTERRUPTS();
+					if (comma != NULL)
+						*comma = '\0';
+					while (*tok == ' ' || *tok == '\t')
+						tok++;
+					endp = tok + strlen(tok);
+					while (endp > tok && (endp[-1] == ' ' || endp[-1] == '\t'))
+						*--endp = '\0';
+
+					if (*tok != '\0')
+					{
+						for (const char *c = tok; *c != '\0'; c++)
+						{
+							if (*c < '0' || *c > '9')
+							{
+								all_digits = false;
+								break;
+							}
+						}
+						if (all_digits)
+							st_oid = (Oid) strtoul(tok, NULL, 10);
+						else
+							st_oid = get_encoding_context_oid(stringToQualifiedNameList(tok, NULL), true);
+
+						if (OidIsValid(st_oid) && st_oid != curr->context_id &&
+							SearchSysCacheExists1(ENCODINGCONTEXTOID, ObjectIdGetDatum(st_oid)))
+						{
+							EncodingContext st_ectx = GetEncodingContext(st_oid);
+
+							if (st_ectx != NULL &&
+								EncodingContextIsWholeDatumInternal(st_ectx, InvalidOid, depth + 1))
+							{
+								pfree(raw);
+								return true;
+							}
+						}
+					}
+
+					if (comma == NULL)
+						break;
+					p = comma + 1;
+				}
+				pfree(raw);
+			}
+		}
+
+		curr = curr->parent;
+		depth++;
+	}
+	return false;
+}
+
+/*
+ * EncodingContextIsWholeDatum
+ *		Returns true if the encoding context pipeline requires encoding/decoding
+ *		the entire datum as a single logical unit rather than per 2 KB slice
+ *		(for example, when any stage is a structured serializer such as Apache
+ *		Avro with kind == 's', or when the root target SQL type is jsonb/json).
+ */
+bool
+EncodingContextIsWholeDatum(EncodingContext ectx, Oid valtype)
+{
+	return EncodingContextIsWholeDatumInternal(ectx, valtype, 0);
+}
+
 /* ----------------------------------------------------------------
  *					Composable Runtime Execution
  * ----------------------------------------------------------------
@@ -445,17 +692,17 @@ GetEncodingContextInternal(Oid context_id, int depth)
  *		Executes a single stage's encode function with a synthesized FuncExpr
  *		so polymorphic handlers (anyelement) can inspect argument/result types.
  */
-static Datum
+Datum
 EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype)
 {
 	LOCAL_FCINFO(fcinfo, 2);
 	Oid			actual_valtype;
 	List	   *fargs;
 	FuncExpr   *fexpr;
-	Node	   *old_expr;
+	FmgrInfo	local_flinfo;
 	Datum		result;
 
-	if (!OidIsValid(ectx->enc_fn))
+	if (!OidIsValid(ectx->enc_fn) && ectx->enc_flinfo.fn_addr == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("encoding context %u (type \"%s\") has no encode function",
@@ -482,17 +729,17 @@ EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype)
 						 InvalidOid,
 						 COERCE_EXPLICIT_CALL);
 
-	old_expr = ectx->enc_flinfo.fn_expr;
-	ectx->enc_flinfo.fn_expr = (Node *) fexpr;
+	local_flinfo = ectx->enc_flinfo;
+	local_flinfo.fn_expr = (Node *) fexpr;
 
-	InitFunctionCallInfoData(*fcinfo, &ectx->enc_flinfo, 2, InvalidOid, NULL, NULL);
+	InitFunctionCallInfoData(*fcinfo, &local_flinfo, 2, InvalidOid, NULL, NULL);
 	fcinfo->args[0].value = PointerGetDatum(ectx);
 	fcinfo->args[0].isnull = false;
 	fcinfo->args[1].value = val;
 	fcinfo->args[1].isnull = false;
 
 	result = FunctionCallInvoke(fcinfo);
-	ectx->enc_flinfo.fn_expr = old_expr;
+	ectx->enc_flinfo.fn_extra = local_flinfo.fn_extra;
 	pfree(fexpr);
 	list_free_deep(fargs);
 
@@ -509,17 +756,17 @@ EncodingContextInvokeSingleEncode(EncodingContext ectx, Datum val, Oid valtype)
  * EncodingContextInvokeSingleDecode
  *		Executes a single stage's decode function with a synthesized FuncExpr.
  */
-static Datum
+Datum
 EncodingContextInvokeSingleDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype)
 {
 	LOCAL_FCINFO(fcinfo, 2);
 	Oid			actual_resulttype;
 	List	   *fargs;
 	FuncExpr   *fexpr;
-	Node	   *old_expr;
+	FmgrInfo	local_flinfo;
 	Datum		result;
 
-	if (!OidIsValid(ectx->dec_fn))
+	if (!OidIsValid(ectx->dec_fn) && ectx->dec_flinfo.fn_addr == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("encoding context %u (type \"%s\") has no decode function",
@@ -546,17 +793,17 @@ EncodingContextInvokeSingleDecode(EncodingContext ectx, Datum encoded_bytea, Oid
 						 InvalidOid,
 						 COERCE_EXPLICIT_CALL);
 
-	old_expr = ectx->dec_flinfo.fn_expr;
-	ectx->dec_flinfo.fn_expr = (Node *) fexpr;
+	local_flinfo = ectx->dec_flinfo;
+	local_flinfo.fn_expr = (Node *) fexpr;
 
-	InitFunctionCallInfoData(*fcinfo, &ectx->dec_flinfo, 2, InvalidOid, NULL, NULL);
+	InitFunctionCallInfoData(*fcinfo, &local_flinfo, 2, InvalidOid, NULL, NULL);
 	fcinfo->args[0].value = PointerGetDatum(ectx);
 	fcinfo->args[0].isnull = false;
 	fcinfo->args[1].value = encoded_bytea;
 	fcinfo->args[1].isnull = false;
 
 	result = FunctionCallInvoke(fcinfo);
-	ectx->dec_flinfo.fn_expr = old_expr;
+	ectx->dec_flinfo.fn_extra = local_flinfo.fn_extra;
 	pfree(fexpr);
 	list_free_deep(fargs);
 
@@ -583,6 +830,8 @@ EncodingContextEncode(EncodingContext ectx, Datum val, Oid valtype)
 	EncodingContext curr = ectx;
 	Datum		cur_datum = val;
 	Oid			cur_type = valtype;
+
+	check_stack_depth();
 
 	if (ectx == NULL)
 		ereport(ERROR,
@@ -628,6 +877,8 @@ EncodingContextDecode(EncodingContext ectx, Datum encoded_bytea, Oid resulttype)
 	EncodingContext curr = ectx;
 	Datum		cur_datum = encoded_bytea;
 	int			depth = 0;
+
+	check_stack_depth();
 
 	if (ectx == NULL)
 		ereport(ERROR,
@@ -684,7 +935,8 @@ IsValidEncodingKind(char kind)
 
 /*
  * GetRootEncodingContextTargetType
- *		Walks the parent chain of context_id to return the root context's
+ *		Walks the parent chain (and first cascade stage if parent_id is 0 and
+ *		target_typid is 0) of context_id to return the root context's
  *		ectxtargettypid, enforcing MAX_ENCODING_CONTEXT_DEPTH against cycles.
  */
 Oid
@@ -731,10 +983,68 @@ GetRootEncodingContextTargetType(Oid context_id)
 		target_typid = ctxForm->ectxtargettypid;
 		ReleaseSysCache(tup);
 
-		if (!OidIsValid(parent_id))
+		if (OidIsValid(parent_id))
+		{
+			curr_id = parent_id;
+			continue;
+		}
+
+		if (OidIsValid(target_typid))
 			return target_typid;
 
-		curr_id = parent_id;
+		/*
+		 * If neither parent_id nor target_typid is set, check if this is a
+		 * multi-stage cascade context with a "stages" option and inspect its
+		 * first stage.
+		 */
+		{
+			EncodingContext ectx = GetEncodingContext(curr_id);
+			const char *stages_opt = EncodingContextGetOption(ectx, "stages");
+			Oid			first_stage_oid = InvalidOid;
+
+			if (stages_opt != NULL)
+			{
+				char	   *raw = pstrdup(stages_opt);
+				char	   *comma = strchr(raw, ',');
+				char	   *tok = raw;
+				char	   *endp;
+				bool		all_digits = true;
+
+				pfree((void *) stages_opt);
+				if (comma != NULL)
+					*comma = '\0';
+				while (*tok == ' ' || *tok == '\t')
+					tok++;
+				endp = tok + strlen(tok);
+				while (endp > tok && (endp[-1] == ' ' || endp[-1] == '\t'))
+					*--endp = '\0';
+
+				if (*tok != '\0')
+				{
+					for (const char *c = tok; *c != '\0'; c++)
+					{
+						if (*c < '0' || *c > '9')
+						{
+							all_digits = false;
+							break;
+						}
+					}
+					if (all_digits)
+						first_stage_oid = (Oid) strtoul(tok, NULL, 10);
+					else
+						first_stage_oid = get_encoding_context_oid(stringToQualifiedNameList(tok, NULL), true);
+				}
+				pfree(raw);
+			}
+
+			if (OidIsValid(first_stage_oid))
+			{
+				curr_id = first_stage_oid;
+				continue;
+			}
+		}
+
+		return InvalidOid;
 	}
 
 	return InvalidOid;
@@ -1356,6 +1666,12 @@ ColumnSetEncodingContext(Oid relid, const char *attname, Oid context_id)
 	table_close(rel, AccessExclusiveLock);
 
 	CommandCounterIncrement();
+
+	if (OidIsValid(context_id))
+	{
+		AlterTableCreateToastTable(relid, (Datum) 0, AccessExclusiveLock);
+		ensure_direct_toast_ectx(relid);
+	}
 }
 
 /* ----------------------------------------------------------------

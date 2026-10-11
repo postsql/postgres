@@ -811,6 +811,12 @@
   check_hook => 'check_default_with_oids',
 },
 
+{ name => 'direct_toast_chunk_compression', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Enables chunk-wise encoding and compression for Direct TOAST columns.',
+  variable => 'direct_toast_chunk_compression',
+  boot_val => 'true',
+},
+
 { name => 'direct_toast_self_prune', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Enables on-access page pruning and FSM updates for Direct TOAST tables.',
   variable => 'direct_toast_self_prune',
