@@ -299,7 +299,8 @@ GetTransactionSnapshot(void)
 		 */
 		InvalidateCatalogSnapshot();
 
-		Assert(pairingheap_is_empty(&RegisteredSnapshots));
+		Assert(pairingheap_is_empty(&RegisteredSnapshots) ||
+			   InAutonomousTransaction());
 		Assert(FirstXactSnapshot == NULL);
 
 		if (IsInParallelMode())
@@ -1004,6 +1005,105 @@ AtSubAbort_Snapshot(int level)
 
 		ActiveSnapshot = next;
 	}
+
+	SnapshotResetXmin();
+}
+
+/*
+ * AtAutonomousStart_Snapshot
+ *		Save outer transaction snapshot state and reset for a new autonomous
+ *		transaction.
+ */
+void
+AtAutonomousStart_Snapshot(bool *saveFirstSnapshotSet,
+						   Snapshot *saveFirstXactSnapshot,
+						   Snapshot *saveCurrentSnapshot)
+{
+	*saveFirstSnapshotSet = FirstSnapshotSet;
+	*saveFirstXactSnapshot = FirstXactSnapshot;
+	if (CurrentSnapshot == &CurrentSnapshotData)
+		*saveCurrentSnapshot = CopySnapshot(&CurrentSnapshotData);
+	else
+		*saveCurrentSnapshot = CurrentSnapshot;
+
+	FirstSnapshotSet = false;
+	FirstXactSnapshot = NULL;
+	CurrentSnapshot = NULL;
+}
+
+/*
+ * AtAutonomousEOXact_Snapshot
+ *		Clean up snapshots created by an autonomous transaction and restore
+ *		the outer transaction's snapshot state.
+ */
+void
+AtAutonomousEOXact_Snapshot(int level,
+							bool savedFirstSnapshotSet,
+							Snapshot savedFirstXactSnapshot,
+							Snapshot savedCurrentSnapshot)
+{
+	/* Forget any active snapshots pushed within the autonomous transaction */
+	while (ActiveSnapshot && ActiveSnapshot->as_level >= level)
+	{
+		ActiveSnapshotElt *next;
+
+		next = ActiveSnapshot->as_next;
+
+		Assert(ActiveSnapshot->as_snap->active_count >= 1);
+		ActiveSnapshot->as_snap->active_count -= 1;
+
+		if (ActiveSnapshot->as_snap->active_count == 0 &&
+			ActiveSnapshot->as_snap->regd_count == 0)
+			FreeSnapshot(ActiveSnapshot->as_snap);
+
+		pfree(ActiveSnapshot);
+
+		ActiveSnapshot = next;
+	}
+
+	if (FirstXactSnapshot != NULL)
+	{
+		Assert(FirstXactSnapshot->regd_count > 0);
+		Assert(!pairingheap_is_empty(&RegisteredSnapshots));
+		pairingheap_remove(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+		FirstXactSnapshot->regd_count--;
+		if (FirstXactSnapshot->active_count == 0 &&
+			FirstXactSnapshot->regd_count == 0)
+			FreeSnapshot(FirstXactSnapshot);
+	}
+
+	InvalidateCatalogSnapshot();
+
+	FirstSnapshotSet = savedFirstSnapshotSet;
+	FirstXactSnapshot = savedFirstXactSnapshot;
+	if (savedCurrentSnapshot != NULL &&
+		savedCurrentSnapshot != savedFirstXactSnapshot)
+	{
+		CurrentSnapshotData.xmin = savedCurrentSnapshot->xmin;
+		CurrentSnapshotData.xmax = savedCurrentSnapshot->xmax;
+		CurrentSnapshotData.xcnt = savedCurrentSnapshot->xcnt;
+		if (savedCurrentSnapshot->xcnt > 0)
+			memcpy(CurrentSnapshotData.xip, savedCurrentSnapshot->xip,
+				   savedCurrentSnapshot->xcnt * sizeof(TransactionId));
+		CurrentSnapshotData.subxcnt = savedCurrentSnapshot->subxcnt;
+		if (savedCurrentSnapshot->subxcnt > 0 &&
+			(!savedCurrentSnapshot->suboverflowed || savedCurrentSnapshot->takenDuringRecovery))
+			memcpy(CurrentSnapshotData.subxip, savedCurrentSnapshot->subxip,
+				   savedCurrentSnapshot->subxcnt * sizeof(TransactionId));
+		CurrentSnapshotData.suboverflowed = savedCurrentSnapshot->suboverflowed;
+		CurrentSnapshotData.takenDuringRecovery = savedCurrentSnapshot->takenDuringRecovery;
+		CurrentSnapshotData.curcid = savedCurrentSnapshot->curcid;
+		CurrentSnapshotData.snapXactCompletionCount = savedCurrentSnapshot->snapXactCompletionCount;
+		pfree(savedCurrentSnapshot);
+		CurrentSnapshot = &CurrentSnapshotData;
+	}
+	else
+	{
+		CurrentSnapshot = savedCurrentSnapshot;
+	}
+
+	/* Restore CurrentSnapshotData.curcid to the outer transaction's curcid */
+	SnapshotSetCommandId(GetCurrentCommandId(false));
 
 	SnapshotResetXmin();
 }
@@ -1902,6 +2002,24 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 bool
 XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 {
+	/*
+	 * If we are inside an autonomous transaction, an uncommitted parent XID of
+	 * our own backend is not in snapshot->xip/subxip (because GetSnapshotData
+	 * skips MyProc), even when its XID < snapshot->xmax.  Treat it as still in
+	 * progress so uncommitted parent changes remain invisible to the
+	 * autonomous transaction.
+	 */
+	if (TransactionIdIsActiveParentTransactionId(xid))
+		return true;
+
+	/*
+	 * If a subtransaction of the current transaction was committed early via
+	 * COMMIT SAVEPOINT, its XID is no longer in CurrentTransactionState, and
+	 * its XID may be >= snapshot->xmax for an enclosing REPEATABLE READ or
+	 * SERIALIZABLE transaction snapshot taken before the savepoint assigned
+	 * its XID.  Treat it as not in progress so the enclosing transaction
+	 * continues to see its own committed savepoint's changes.
+	 */
 	/*
 	 * Make a quick range check to eliminate most XIDs without looking at the
 	 * xip arrays.  Note that this is OK even if we convert a subxact XID to

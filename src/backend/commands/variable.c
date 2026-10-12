@@ -547,14 +547,14 @@ check_transaction_read_only(bool *newval, void **extra, GucSource source)
 {
 	if (*newval == false && XactReadOnly && IsTransactionState() && !InitializingParallelWorker)
 	{
-		/* Can't go to r/w mode inside a r/o transaction */
-		if (IsSubTransaction())
+		/* Can't go to r/w mode inside a r/o subtransaction */
+		if (IsSubTransactionOfCurrentAutonomous())
 		{
 			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
 			GUC_check_errmsg("cannot set transaction read-write mode inside a read-only transaction");
 			return false;
 		}
-		/* Top level transaction can't change to r/w after first snapshot. */
+		/* Top level or autonomous transaction can't change to r/w after first snapshot. */
 		if (FirstSnapshotSet)
 		{
 			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
@@ -597,10 +597,17 @@ check_transaction_isolation(int *newval, void **extra, GucSource source)
 			return false;
 		}
 		/* We ignore a subtransaction setting it to the existing value. */
-		if (IsSubTransaction())
+		if (IsSubTransactionOfCurrentAutonomous())
 		{
 			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
 			GUC_check_errmsg("SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction");
+			return false;
+		}
+		if (newXactIsoLevel == XACT_SERIALIZABLE && InAutonomousTransaction())
+		{
+			GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+			GUC_check_errmsg("cannot use serializable mode in an autonomous transaction");
+			GUC_check_errhint("You can use REPEATABLE READ instead.");
 			return false;
 		}
 		/* Can't go to serializable mode while recovery is still active */
@@ -627,7 +634,7 @@ check_transaction_deferrable(bool *newval, void **extra, GucSource source)
 	if (InitializingParallelWorker)
 		return true;
 
-	if (IsSubTransaction())
+	if (IsSubTransactionOfCurrentAutonomous())
 	{
 		GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
 		GUC_check_errmsg("SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction");

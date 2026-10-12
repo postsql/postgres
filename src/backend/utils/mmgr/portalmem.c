@@ -969,6 +969,64 @@ AtSubCommit_Portals(SubTransactionId mySubid,
 }
 
 /*
+ * Pre-commit portal processing for an autonomous transaction.
+ *
+ * Non-holdable READY portals created in this autonomous transaction are
+ * dropped, holdable READY portals are materialized into HoldPortal, and any
+ * ACTIVE portal (such as the one executing COMMIT AUTONOMOUS) is reassigned to
+ * the parent subtransaction.
+ */
+bool
+AtAutonomousCommit_Portals(SubTransactionId mySubid,
+						   SubTransactionId parentSubid,
+						   int parentLevel,
+						   ResourceOwner parentXactOwner)
+{
+	bool		result = false;
+	HASH_SEQ_STATUS status;
+	PortalHashEnt *hentry;
+
+	hash_seq_init(&status, PortalHashTable);
+
+	while ((hentry = (PortalHashEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Portal		portal = hentry->portal;
+
+		if (portal->activeSubid == mySubid)
+			portal->activeSubid = parentSubid;
+
+		if (portal->createSubid != mySubid)
+			continue;
+
+		if (portal->status == PORTAL_ACTIVE)
+		{
+			portal->createSubid = parentSubid;
+			portal->createLevel = parentLevel;
+			if (portal->resowner)
+				ResourceOwnerNewParent(portal->resowner, parentXactOwner);
+			continue;
+		}
+
+		if ((portal->cursorOptions & CURSOR_OPT_HOLD) &&
+			portal->status == PORTAL_READY)
+		{
+			HoldPortal(portal);
+			result = true;
+		}
+		else
+		{
+			PortalDrop(portal, true);
+			result = true;
+		}
+
+		hash_seq_term(&status);
+		hash_seq_init(&status, PortalHashTable);
+	}
+
+	return result;
+}
+
+/*
  * Subtransaction abort handling for portals.
  *
  * Deactivate portals created or used during the failed subtransaction.

@@ -123,6 +123,39 @@ SubTransSetParent(TransactionId xid, TransactionId parent)
 }
 
 /*
+ * Clear the parent of an independently committed subtransaction in the
+ * subtrans log so that SubTransGetTopmostTransaction treats it as its own
+ * top-level transaction.
+ */
+void
+SubTransClearParent(TransactionId xid)
+{
+	int64		pageno = TransactionIdToPage(xid);
+	int			entryno = TransactionIdToEntry(xid);
+	int			slotno;
+	LWLock	   *lock;
+	TransactionId *ptr;
+
+	if (!TransactionIdIsNormal(xid))
+		return;
+
+	lock = SimpleLruGetBankLock(SubTransCtl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	slotno = SimpleLruReadPage(SubTransCtl, pageno, true, &xid);
+	ptr = (TransactionId *) SubTransCtl->shared->page_buffer[slotno];
+	ptr += entryno;
+
+	if (*ptr != InvalidTransactionId)
+	{
+		*ptr = InvalidTransactionId;
+		SubTransCtl->shared->page_dirty[slotno] = true;
+	}
+
+	LWLockRelease(lock);
+}
+
+/*
  * Interrogate the parent of a transaction in the subtrans log.
  */
 TransactionId

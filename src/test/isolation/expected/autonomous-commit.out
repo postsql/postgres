@@ -1,0 +1,52 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_upd1 s1_auto_begin s1_auto_ins s1_auto_upd2 s2_sel s1_auto_commit s2_sel s2_upd2 s1_rollback s2_sel
+step s1_begin: BEGIN;
+step s1_upd1: UPDATE auto_iso SET val = 's1-outer' WHERE id = 1;
+step s1_auto_begin: BEGIN AUTONOMOUS;
+step s1_auto_ins: INSERT INTO auto_iso VALUES (3, 's1-autonomous');
+step s1_auto_upd2: UPDATE auto_iso SET val = 's1-auto-upd2' WHERE id = 2;
+step s2_sel: SELECT id, val FROM auto_iso ORDER BY id;
+id|val   
+--+------
+ 1|init-1
+ 2|init-2
+(2 rows)
+
+step s1_auto_commit: COMMIT AUTONOMOUS;
+step s2_sel: SELECT id, val FROM auto_iso ORDER BY id;
+id|val          
+--+-------------
+ 1|init-1       
+ 2|s1-auto-upd2 
+ 3|s1-autonomous
+(3 rows)
+
+step s2_upd2: UPDATE auto_iso SET val = 's2-upd2' WHERE id = 2;
+step s1_rollback: ROLLBACK;
+step s2_sel: SELECT id, val FROM auto_iso ORDER BY id;
+id|val          
+--+-------------
+ 1|init-1       
+ 2|s2-upd2      
+ 3|s1-autonomous
+(3 rows)
+
+
+starting permutation: s1_begin s1_upd1 s1_auto_begin s1_auto_ins s1_auto_commit s2_upd1 s1_commit s2_sel
+step s1_begin: BEGIN;
+step s1_upd1: UPDATE auto_iso SET val = 's1-outer' WHERE id = 1;
+step s1_auto_begin: BEGIN AUTONOMOUS;
+step s1_auto_ins: INSERT INTO auto_iso VALUES (3, 's1-autonomous');
+step s1_auto_commit: COMMIT AUTONOMOUS;
+step s2_upd1: UPDATE auto_iso SET val = 's2-upd1' WHERE id = 1; <waiting ...>
+step s1_commit: COMMIT;
+step s2_upd1: <... completed>
+step s2_sel: SELECT id, val FROM auto_iso ORDER BY id;
+id|val          
+--+-------------
+ 1|s2-upd1      
+ 2|init-2       
+ 3|s1-autonomous
+(3 rows)
+

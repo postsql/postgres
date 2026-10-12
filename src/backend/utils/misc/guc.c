@@ -2211,7 +2211,10 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 				restorePrior = true;
 			else if (stack->state == GUC_SAVE)
 				restorePrior = true;
-			else if (stack->nest_level == 1)
+			else if (stack->nest_level == 1 ||
+					 (!IsSubTransactionOfCurrentAutonomous() &&
+					  stack->nest_level == nestLevel &&
+					  (prev == NULL || stack->state != GUC_SET)))
 			{
 				/* transaction commit */
 				if (stack->state == GUC_SET_LOCAL)
@@ -2443,7 +2446,6 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 	/* Update nesting level */
 	GUCNestLevel = nestLevel - 1;
 }
-
 
 /*
  * Start up automatic reporting of changes to variables marked GUC_REPORT.

@@ -54,6 +54,7 @@ extern void AtInplace_Inval(void);
 extern void ForgetInplace_Inval(void);
 
 extern void AtEOSubXact_Inval(bool isCommit);
+extern void AtAutonomousCommit_Inval(void);
 
 extern void PostPrepare_Inval(void);
 

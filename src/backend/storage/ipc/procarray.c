@@ -1437,6 +1437,18 @@ TransactionIdIsInProgress(TransactionId xid)
 	}
 
 	/*
+	 * If we are inside an autonomous transaction, an uncommitted parent XID of
+	 * our own backend is not considered "current" for tuple visibility, but it
+	 * is still in-progress in our backend (which the ProcArray loop below skips
+	 * because pgxactoff == mypgxactoff).
+	 */
+	if (TransactionIdIsActiveParentTransactionId(xid))
+	{
+		xc_by_my_xact_inc();
+		return true;
+	}
+
+	/*
 	 * If first time through, get workspace to remember main XIDs in. We
 	 * malloc it permanently to avoid repeated palloc/pfree overhead.
 	 */

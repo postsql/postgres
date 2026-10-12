@@ -671,6 +671,48 @@ AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 }
 
 /*
+ * Perform relation stats work when an autonomous transaction or savepoint
+ * commits independently of its parent transaction.
+ */
+void
+AtAutonomousCommit_PgStat_Relations(PgStat_SubXactStatus *xact_state, int nestDepth)
+{
+	PgStat_TableXactStatus *trans;
+	PgStat_TableXactStatus *next_trans;
+
+	for (trans = xact_state->first; trans != NULL; trans = next_trans)
+	{
+		PgStat_RelationStatus *relstat;
+
+		next_trans = trans->next;
+		Assert(trans->nest_level == nestDepth);
+		relstat = trans->parent;
+		Assert(relstat->tab.trans == trans);
+
+		relstat->tab.counts_xact.tuples_inserted += trans->tuples_inserted;
+		relstat->tab.counts_xact.tuples_updated += trans->tuples_updated;
+		relstat->tab.counts_xact.tuples_deleted += trans->tuples_deleted;
+
+		if (trans->truncdropped)
+		{
+			relstat->tab.truncdropped = true;
+			relstat->tab.counts_xact.delta_live_tuples = 0;
+			relstat->tab.counts_xact.delta_dead_tuples = 0;
+		}
+		relstat->tab.counts_xact.delta_live_tuples +=
+			trans->tuples_inserted - trans->tuples_deleted;
+		relstat->tab.counts_xact.delta_dead_tuples +=
+			trans->tuples_updated + trans->tuples_deleted;
+		relstat->tab.counts_xact.changed_tuples +=
+			trans->tuples_inserted + trans->tuples_updated +
+			trans->tuples_deleted;
+
+		relstat->tab.trans = trans->upper;
+		pfree(trans);
+	}
+}
+
+/*
  * Perform relation stats specific end-of-sub-transaction work. Helper for
  * AtEOSubXact_PgStat.
  *

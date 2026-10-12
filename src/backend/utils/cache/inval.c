@@ -1283,6 +1283,46 @@ ForgetInplace_Inval(void)
 }
 
 /*
+ * AtAutonomousCommit_Inval
+ *		Process queued-up invalidation messages when an autonomous transaction
+ *		or savepoint commits independently of its parent transaction.
+ */
+void
+AtAutonomousCommit_Inval(void)
+{
+	int			my_level;
+	TransInvalidationInfo *myInfo;
+
+	Assert(inplaceInvalInfo == NULL);
+
+	myInfo = transInvalInfo;
+	if (myInfo == NULL)
+		return;
+
+	my_level = GetCurrentTransactionNestLevel();
+	if (myInfo->my_level != my_level)
+	{
+		Assert(myInfo->my_level < my_level);
+		return;
+	}
+
+	if (myInfo->ii.RelcacheInitFileInval)
+		RelationCacheInitFilePreInvalidate();
+
+	AppendInvalidationMessages(&myInfo->PriorCmdInvalidMsgs,
+							   &myInfo->ii.CurrentCmdInvalidMsgs);
+
+	ProcessInvalidationMessagesMulti(&myInfo->PriorCmdInvalidMsgs,
+									 SendSharedInvalidMessages);
+
+	if (myInfo->ii.RelcacheInitFileInval)
+		RelationCacheInitFilePostInvalidate();
+
+	/* Pop the transaction state stack */
+	transInvalInfo = myInfo->parent;
+}
+
+/*
  * AtEOSubXact_Inval
  *		Process queued-up invalidation messages at end of subtransaction.
  *

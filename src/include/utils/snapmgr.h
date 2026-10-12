@@ -98,6 +98,13 @@ extern void UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner);
 
 extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
+extern void AtAutonomousStart_Snapshot(bool *saveFirstSnapshotSet,
+									   Snapshot *saveFirstXactSnapshot,
+									   Snapshot *saveCurrentSnapshot);
+extern void AtAutonomousEOXact_Snapshot(int level,
+										bool savedFirstSnapshotSet,
+										Snapshot savedFirstXactSnapshot,
+										Snapshot savedCurrentSnapshot);
 extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin);
 
 extern void ImportSnapshot(const char *idstr);

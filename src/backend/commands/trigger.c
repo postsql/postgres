@@ -5568,6 +5568,64 @@ AfterTriggerEndSubXact(bool isCommit)
 }
 
 /*
+ * AfterTriggerBeginAutonomousSubXact()
+ *
+ *	Start an autonomous transaction, isolating its deferred trigger queue and
+ *	SET CONSTRAINTS state from the enclosing parent transaction.
+ */
+void
+AfterTriggerBeginAutonomousSubXact(void)
+{
+	int			my_level = GetCurrentTransactionNestLevel();
+
+	AfterTriggerBeginSubXact();
+
+	afterTriggers.trans_stack[my_level].state = afterTriggers.state;
+	afterTriggers.state = NULL;
+	afterTriggers.events.head = NULL;
+	afterTriggers.events.tail = NULL;
+	afterTriggers.events.tailfree = NULL;
+}
+
+/*
+ * AfterTriggerEndAutonomousSubXact()
+ *
+ *	End an autonomous transaction, freeing its event queue and restoring the
+ *	parent transaction's deferred trigger queue and SET CONSTRAINTS state.
+ */
+void
+AfterTriggerEndAutonomousSubXact(bool isCommit)
+{
+	int			my_level = GetCurrentTransactionNestLevel();
+
+	if (my_level >= afterTriggers.maxtransdepth)
+		return;
+
+	if (!isCommit)
+	{
+		while (afterTriggers.query_depth > afterTriggers.trans_stack[my_level].query_depth)
+		{
+			if (afterTriggers.query_depth < afterTriggers.maxquerydepth)
+				AfterTriggerFreeQuery(&afterTriggers.query_stack[afterTriggers.query_depth]);
+			afterTriggers.query_depth--;
+		}
+	}
+	Assert(afterTriggers.query_depth ==
+		   afterTriggers.trans_stack[my_level].query_depth);
+
+	/* Free all events queued within the autonomous transaction */
+	afterTriggerFreeEventList(&afterTriggers.events);
+
+	/* Restore outer transaction's event list and constraint state */
+	afterTriggers.events = afterTriggers.trans_stack[my_level].events;
+
+	if (afterTriggers.state != NULL)
+		pfree(afterTriggers.state);
+	afterTriggers.state = afterTriggers.trans_stack[my_level].state;
+	afterTriggers.trans_stack[my_level].state = NULL;
+}
+
+/*
  * Get the transition table for the given event and depending on whether we are
  * processing the old or the new tuple.
  */
@@ -5811,10 +5869,11 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		afterTriggers.state = SetConstraintStateCreate(8);
 
 	/*
-	 * If in a subtransaction, and we didn't save the current state already,
-	 * save it so it can be restored if the subtransaction aborts.
+	 * If in a subtransaction of the current (autonomous) transaction, and we
+	 * didn't save the current state already, save it so it can be restored if
+	 * the subtransaction aborts.
 	 */
-	if (my_level > 1 &&
+	if (IsSubTransactionOfCurrentAutonomous() &&
 		afterTriggers.trans_stack[my_level].state == NULL)
 	{
 		afterTriggers.trans_stack[my_level].state =
@@ -6092,7 +6151,7 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 			 * subtransaction could later get rolled back.
 			 */
 			if (afterTriggerInvokeEvents(events, firing_id, NULL,
-										 !IsSubTransaction()))
+										 !IsSubTransactionOfCurrentAutonomous()))
 				break;			/* all fired */
 		}
 

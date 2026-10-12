@@ -371,9 +371,12 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 				switch (stmt->kind)
 				{
 					case TRANS_STMT_BEGIN:
+					case TRANS_STMT_BEGIN_AUTONOMOUS:
 					case TRANS_STMT_START:
 					case TRANS_STMT_COMMIT:
+					case TRANS_STMT_COMMIT_AUTONOMOUS:
 					case TRANS_STMT_ROLLBACK:
+					case TRANS_STMT_ROLLBACK_AUTONOMOUS:
 					case TRANS_STMT_SAVEPOINT:
 					case TRANS_STMT_RELEASE:
 					case TRANS_STMT_ROLLBACK_TO:
@@ -632,8 +635,42 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 						}
 						break;
 
+					case TRANS_STMT_BEGIN_AUTONOMOUS:
+						{
+							ListCell   *lc;
+
+							BeginAutonomousTransactionBlock();
+							foreach(lc, stmt->options)
+							{
+								DefElem    *item = (DefElem *) lfirst(lc);
+
+								if (strcmp(item->defname, "transaction_isolation") == 0)
+									SetPGVariable("transaction_isolation",
+												  list_make1(item->arg),
+												  true);
+								else if (strcmp(item->defname, "transaction_read_only") == 0)
+									SetPGVariable("transaction_read_only",
+												  list_make1(item->arg),
+												  true);
+								else if (strcmp(item->defname, "transaction_deferrable") == 0)
+									SetPGVariable("transaction_deferrable",
+												  list_make1(item->arg),
+												  true);
+							}
+						}
+						break;
+
 					case TRANS_STMT_COMMIT:
 						if (!EndTransactionBlock(stmt->chain))
+						{
+							/* report unsuccessful commit in qc */
+							if (qc)
+								SetQueryCompletion(qc, CMDTAG_ROLLBACK, 0);
+						}
+						break;
+
+					case TRANS_STMT_COMMIT_AUTONOMOUS:
+						if (!EndAutonomousTransactionBlock(stmt->chain))
 						{
 							/* report unsuccessful commit in qc */
 							if (qc)
@@ -662,6 +699,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 					case TRANS_STMT_ROLLBACK:
 						UserAbortTransactionBlock(stmt->chain);
+						break;
+
+					case TRANS_STMT_ROLLBACK_AUTONOMOUS:
+						UserAbortAutonomousTransactionBlock(stmt->chain);
 						break;
 
 					case TRANS_STMT_SAVEPOINT:
@@ -2427,6 +2468,7 @@ CreateCommandTag(Node *parsetree)
 				switch (stmt->kind)
 				{
 					case TRANS_STMT_BEGIN:
+					case TRANS_STMT_BEGIN_AUTONOMOUS:
 						tag = CMDTAG_BEGIN;
 						break;
 
@@ -2435,10 +2477,12 @@ CreateCommandTag(Node *parsetree)
 						break;
 
 					case TRANS_STMT_COMMIT:
+					case TRANS_STMT_COMMIT_AUTONOMOUS:
 						tag = CMDTAG_COMMIT;
 						break;
 
 					case TRANS_STMT_ROLLBACK:
+					case TRANS_STMT_ROLLBACK_AUTONOMOUS:
 					case TRANS_STMT_ROLLBACK_TO:
 						tag = CMDTAG_ROLLBACK;
 						break;

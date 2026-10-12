@@ -184,6 +184,10 @@ typedef enum TBlockState
 	TBLOCK_SUBABORT_PENDING,	/* live subxact, ROLLBACK received */
 	TBLOCK_SUBRESTART,			/* live subxact, ROLLBACK TO received */
 	TBLOCK_SUBABORT_RESTART,	/* failed subxact, ROLLBACK TO received */
+
+	/* autonomous transaction states */
+	TBLOCK_AUTONOMOUS_BEGIN,	/* starting an autonomous subtransaction */
+	TBLOCK_AUTONOMOUS_COMMIT,	/* COMMIT AUTONOMOUS received */
 } TBlockState;
 
 /*
@@ -212,6 +216,15 @@ typedef struct TransactionStateData
 	Oid			prevUser;		/* previous CurrentUserId setting */
 	int			prevSecContext; /* previous SecurityRestrictionContext */
 	bool		prevXactReadOnly;	/* entry-time xact r/o state */
+	int			prevXactIsoLevel;	/* entry-time xact isolation level */
+	bool		prevXactDeferrable; /* entry-time xact deferrable state */
+	XLogRecPtr	savedXactLastRecEnd;	/* parent's XactLastRecEnd */
+	CommandId	savedCommandId; /* parent's currentCommandId */
+	bool		savedCommandIdUsed; /* parent's currentCommandIdUsed */
+	bool		savedFirstSnapshotSet;	/* parent's FirstSnapshotSet */
+	Snapshot	savedFirstXactSnapshot; /* parent's FirstXactSnapshot */
+	Snapshot	savedCurrentSnapshot;	/* parent's CurrentSnapshot */
+	bool		isAutonomous;	/* is this an autonomous transaction root? */
 	bool		startedInRecovery;	/* did we start in recovery? */
 	bool		didLogXid;		/* has xid been included in WAL record? */
 	int			parallelModeLevel;	/* Enter/ExitParallelMode counter */
@@ -356,7 +369,10 @@ static bool CommitTransactionCommandInternal(void);
 static bool AbortCurrentTransactionInternal(void);
 
 static void StartSubTransaction(void);
+static void StartAutonomousSubTransaction(void);
 static void CommitSubTransaction(void);
+static void CommitAutonomousSubTransaction(void);
+static TransactionId RecordSubTransactionCommit(void);
 static void AbortSubTransaction(void);
 static void CleanupSubTransaction(void);
 static void PushTransaction(void);
@@ -479,12 +495,24 @@ GetCurrentTransactionIdIfAny(void)
 /*
  *	GetTopFullTransactionId
  *
- * This will return the FullTransactionId of the main transaction, assigning
- * one if it's not yet set.  Be careful to call this only inside a valid xact.
+ * This will return the FullTransactionId of the main transaction (or current
+ * autonomous transaction root), assigning one if it's not yet set.  Be careful
+ * to call this only inside a valid xact.
  */
 FullTransactionId
 GetTopFullTransactionId(void)
 {
+	if (InAutonomousTransaction())
+	{
+		TransactionState s = CurrentTransactionState;
+
+		while (s != NULL && !s->isAutonomous)
+			s = s->parent;
+		Assert(s != NULL);
+		if (!FullTransactionIdIsValid(s->fullTransactionId))
+			AssignTransactionId(s);
+		return s->fullTransactionId;
+	}
 	if (!FullTransactionIdIsValid(XactTopFullTransactionId))
 		AssignTransactionId(&TopTransactionStateData);
 	return XactTopFullTransactionId;
@@ -493,14 +521,23 @@ GetTopFullTransactionId(void)
 /*
  *	GetTopFullTransactionIdIfAny
  *
- * This will return the FullTransactionId of the main transaction, if one is
- * assigned.  It will return InvalidFullTransactionId if we are not currently
- * inside a transaction, or inside a transaction that hasn't yet been assigned
- * one.
+ * This will return the FullTransactionId of the main transaction (or current
+ * autonomous transaction root), if one is assigned.  It will return
+ * InvalidFullTransactionId if we are not currently inside a transaction, or
+ * inside a transaction that hasn't yet been assigned one.
  */
 FullTransactionId
 GetTopFullTransactionIdIfAny(void)
 {
+	if (InAutonomousTransaction())
+	{
+		TransactionState s = CurrentTransactionState;
+
+		while (s != NULL && !s->isAutonomous)
+			s = s->parent;
+		Assert(s != NULL);
+		return s->fullTransactionId;
+	}
 	return XactTopFullTransactionId;
 }
 
@@ -573,8 +610,8 @@ IsSubxactTopXidLogPending(void)
 	if (!IsTransactionState())
 		return false;
 
-	/* it has to be a subtransaction */
-	if (!IsSubTransaction())
+	/* it has to be a subtransaction of the current top/autonomous xact */
+	if (!IsSubTransactionOfCurrentAutonomous())
 		return false;
 
 	/* the subtransaction has to have a XID assigned */
@@ -936,7 +973,6 @@ GetCurrentTransactionNestLevel(void)
 	return s->nestingLevel;
 }
 
-
 /*
  *	TransactionIdIsCurrentTransactionId
  */
@@ -961,7 +997,8 @@ TransactionIdIsCurrentTransactionId(TransactionId xid)
 	if (!TransactionIdIsNormal(xid))
 		return false;
 
-	if (TransactionIdEquals(xid, GetTopTransactionIdIfAny()))
+	if (!InAutonomousTransaction() &&
+		TransactionIdEquals(xid, GetTopTransactionIdIfAny()))
 		return true;
 
 	/*
@@ -997,41 +1034,134 @@ TransactionIdIsCurrentTransactionId(TransactionId xid)
 	/*
 	 * We will return true for the Xid of the current subtransaction, any of
 	 * its subcommitted children, any of its parents, or any of their
-	 * previously subcommitted children.  However, a transaction being aborted
-	 * is no longer "current", even though it may still have an entry on the
-	 * state stack.
+	 * previously subcommitted children, up to the current autonomous
+	 * transaction boundary.  However, a transaction being aborted is no
+	 * longer "current", even though it may still have an entry on the state
+	 * stack.
 	 */
 	for (s = CurrentTransactionState; s != NULL; s = s->parent)
 	{
-		int			low,
-					high;
-
-		if (s->state == TRANS_ABORT)
-			continue;
-		if (!FullTransactionIdIsValid(s->fullTransactionId))
-			continue;			/* it can't have any child XIDs either */
-		if (TransactionIdEquals(xid, XidFromFullTransactionId(s->fullTransactionId)))
-			return true;
-		/* As the childXids array is ordered, we can use binary search */
-		low = 0;
-		high = s->nChildXids - 1;
-		while (low <= high)
+		if (s->state != TRANS_ABORT &&
+			FullTransactionIdIsValid(s->fullTransactionId))
 		{
-			int			middle;
-			TransactionId probe;
+			int			low,
+						high;
 
-			middle = low + (high - low) / 2;
-			probe = s->childXids[middle];
-			if (TransactionIdEquals(probe, xid))
+			if (TransactionIdEquals(xid, XidFromFullTransactionId(s->fullTransactionId)))
 				return true;
-			else if (TransactionIdPrecedes(probe, xid))
-				low = middle + 1;
-			else
-				high = middle - 1;
+			/* As the childXids array is ordered, we can use binary search */
+			low = 0;
+			high = s->nChildXids - 1;
+			while (low <= high)
+			{
+				int			middle;
+				TransactionId probe;
+
+				middle = low + (high - low) / 2;
+				probe = s->childXids[middle];
+				if (TransactionIdEquals(probe, xid))
+					return true;
+				else if (TransactionIdPrecedes(probe, xid))
+					low = middle + 1;
+				else
+					high = middle - 1;
+			}
 		}
+
+		/* Do not walk past an autonomous transaction boundary */
+		if (s->isAutonomous)
+			break;
 	}
 
 	return false;
+}
+
+/*
+ *	TransactionIdIsActiveParentTransactionId
+ *
+ * Returns true if xid belongs to an active parent transaction outside the
+ * current autonomous transaction boundary.
+ */
+bool
+TransactionIdIsActiveParentTransactionId(TransactionId xid)
+{
+	TransactionState s;
+	bool		crossedAutonomous = false;
+
+	if (!TransactionIdIsNormal(xid))
+		return false;
+
+	for (s = CurrentTransactionState; s != NULL; s = s->parent)
+	{
+		if (crossedAutonomous && s->state != TRANS_ABORT &&
+			FullTransactionIdIsValid(s->fullTransactionId))
+		{
+			int			low,
+						high;
+
+			if (TransactionIdEquals(xid, XidFromFullTransactionId(s->fullTransactionId)))
+				return true;
+			low = 0;
+			high = s->nChildXids - 1;
+			while (low <= high)
+			{
+				int			middle;
+				TransactionId probe;
+
+				middle = low + (high - low) / 2;
+				probe = s->childXids[middle];
+				if (TransactionIdEquals(probe, xid))
+					return true;
+				else if (TransactionIdPrecedes(probe, xid))
+					low = middle + 1;
+				else
+					high = middle - 1;
+			}
+		}
+
+		if (s->isAutonomous)
+			crossedAutonomous = true;
+	}
+
+	return false;
+}
+
+/*
+ *	InAutonomousTransaction
+ *
+ * Returns true if we are currently inside an autonomous transaction (or a
+ * subtransaction thereof).
+ */
+bool
+InAutonomousTransaction(void)
+{
+	TransactionState s;
+
+	for (s = CurrentTransactionState; s != NULL; s = s->parent)
+	{
+		if (s->isAutonomous)
+			return true;
+	}
+	return false;
+}
+
+/*
+ *	IsSubTransactionOfCurrentAutonomous
+ *
+ * Returns true if we are inside a savepoint/subtransaction nested beneath the
+ * current top-level or autonomous transaction root, and false if we are at
+ * the top-level transaction or at the root of an autonomous transaction.
+ */
+bool
+IsSubTransactionOfCurrentAutonomous(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (s->nestingLevel < 2)
+		return false;
+	if (s->isAutonomous)
+		return false;
+	return true;
 }
 
 /*
@@ -1066,7 +1196,7 @@ GetTopReadOnlyTransactionNestLevel(void)
 
 	if (!XactReadOnly)
 		return 0;
-	while (s->nestingLevel > 1)
+	while (s->nestingLevel > 1 && !s->isAutonomous)
 	{
 		if (!s->prevXactReadOnly)
 			return s->nestingLevel;
@@ -1615,6 +1745,181 @@ RecordTransactionCommit(void)
 	XactLastRecEnd = 0;
 cleanup:
 	/* Clean up local data */
+	if (rels)
+		pfree(rels);
+	if (ndroppedstats)
+		pfree(droppedstats);
+
+	return latestXid;
+}
+
+/*
+ *	RecordSubTransactionCommit
+ *
+ * Durably commits the current subtransaction (and any subcommitted children
+ * in s->childXids) as an independent transaction in WAL, pg_commit_ts,
+ * pg_xact, pg_subtrans, and ProcArray.
+ */
+static TransactionId
+RecordSubTransactionCommit(void)
+{
+	TransactionState s = CurrentTransactionState;
+	TransactionId xid = GetCurrentTransactionIdIfAny();
+	bool		markXidCommitted = TransactionIdIsValid(xid);
+	TransactionId latestXid = InvalidTransactionId;
+	int			nrels;
+	RelFileLocator *rels;
+	int			nchildren;
+	TransactionId *children;
+	int			ndroppedstats = 0;
+	xl_xact_stats_item *droppedstats = NULL;
+	int			nmsgs = 0;
+	SharedInvalidationMessage *invalMessages = NULL;
+	bool		RelcacheInitFileInval = false;
+	bool		wrote_xlog;
+
+	/* Get data needed for commit record (scoped to current nestLevel) */
+	nrels = smgrGetPendingDeletes(true, &rels);
+	nchildren = xactGetCommittedChildren(&children);
+	ndroppedstats = pgstat_get_transactional_drops(true, &droppedstats);
+	if (XLogStandbyInfoActive())
+		nmsgs = xactGetCommittedInvalidationMessages(&invalMessages,
+													 &RelcacheInitFileInval);
+	wrote_xlog = (XactLastRecEnd != 0);
+
+	if (!markXidCommitted)
+	{
+		if (nrels != 0 || ndroppedstats != 0)
+			elog(ERROR, "cannot commit a subtransaction that deleted files but has no xid");
+
+		Assert(nchildren == 0);
+
+		if (nmsgs != 0)
+		{
+			LogStandbyInvalidations(nmsgs, invalMessages,
+									RelcacheInitFileInval);
+			wrote_xlog = true;
+		}
+
+		if (!wrote_xlog)
+			goto cleanup;
+	}
+	else
+	{
+		bool		replorigin;
+		TimestampTz commit_time;
+
+		replorigin = (replorigin_xact_state.origin != InvalidReplOriginId &&
+					  replorigin_xact_state.origin != DoNotReplicateId);
+
+		/*
+		 * Remove committed XIDs from unreportedXids so a subsequent top-level
+		 * XLOG_XACT_ASSIGNMENT record does not re-associate them with topXid.
+		 */
+		if (nUnreportedXids > 0)
+		{
+			int			w = 0;
+
+			for (int r = 0; r < nUnreportedXids; r++)
+			{
+				TransactionId uxid = unreportedXids[r];
+				bool		remove = TransactionIdEquals(uxid, xid);
+
+				for (int c = 0; !remove && c < nchildren; c++)
+				{
+					if (TransactionIdEquals(uxid, children[c]))
+						remove = true;
+				}
+				if (!remove)
+					unreportedXids[w++] = uxid;
+			}
+			nUnreportedXids = w;
+		}
+
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0);
+		START_CRIT_SECTION();
+		MyProc->delayChkptFlags |= DELAY_CHKPT_IN_COMMIT;
+
+		pg_write_barrier();
+
+		/*
+		 * Use GetCurrentTimestamp() rather than
+		 * GetCurrentTransactionStopTimestamp() so we do not set global
+		 * xactStopTimestamp, which must remain 0 for the outer transaction.
+		 */
+		commit_time = GetCurrentTimestamp();
+
+		XactLogCommitRecord(commit_time,
+							nchildren, children, nrels, rels,
+							ndroppedstats, droppedstats,
+							nmsgs, invalMessages,
+							RelcacheInitFileInval,
+							MyXactFlags & ~XACT_FLAGS_NEEDIMMEDIATECOMMIT,
+							InvalidTransactionId, NULL /* plain commit */ );
+
+		if (replorigin)
+			replorigin_session_advance(replorigin_xact_state.origin_lsn,
+									   XactLastRecEnd);
+
+		TransactionTreeSetCommitTsData(xid, nchildren, children,
+									   commit_time,
+									   replorigin_xact_state.origin);
+	}
+
+	if ((wrote_xlog && markXidCommitted &&
+		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
+		forceSyncCommit || nrels > 0)
+	{
+		XLogFlush(XactLastRecEnd);
+
+		if (markXidCommitted)
+			TransactionIdCommitTree(xid, nchildren, children);
+	}
+	else
+	{
+		XLogSetAsyncXactLSN(XactLastRecEnd);
+
+		if (markXidCommitted)
+			TransactionIdAsyncCommitTree(xid, nchildren, children, XactLastRecEnd);
+	}
+
+	if (markXidCommitted)
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_IN_COMMIT;
+		END_CRIT_SECTION();
+	}
+
+	latestXid = TransactionIdLatest(xid, nchildren, children);
+
+	if (markXidCommitted)
+	{
+		/*
+		 * Detach xid and its subcommitted children from the parent
+		 * transaction in pg_subtrans and remove them from MyProc->subxids.
+		 * Note: we must do this AFTER marking clog above so that concurrent
+		 * backends never see the XIDs as neither in-progress nor committed.
+		 */
+		SubTransClearParent(xid);
+		for (int i = 0; i < nchildren; i++)
+			SubTransClearParent(children[i]);
+
+		XidCacheRemoveRunningXids(xid, nchildren, children, latestXid);
+	}
+
+	if (wrote_xlog && markXidCommitted)
+		SyncRepWaitForLSN(XactLastRecEnd, true);
+
+	XactLastCommitEnd = XactLastRecEnd;
+	XactLastRecEnd = 0;
+
+cleanup:
+	/* Free childXids array; do NOT pass committed XIDs up to parent */
+	if (s->childXids != NULL)
+		pfree(s->childXids);
+	s->childXids = NULL;
+	s->nChildXids = 0;
+	s->maxChildXids = 0;
+
 	if (rels)
 		pfree(rels);
 	if (ndroppedstats)
@@ -3172,9 +3477,11 @@ StartTransactionCommand(void)
 		case TBLOCK_BEGIN:
 		case TBLOCK_PARALLEL_INPROGRESS:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
 		case TBLOCK_ABORT_PENDING:
@@ -3376,6 +3683,15 @@ CommitTransactionCommandInternal(void)
 			break;
 
 			/*
+			 * The user issued BEGIN AUTONOMOUS. Start an autonomous
+			 * subtransaction.
+			 */
+		case TBLOCK_AUTONOMOUS_BEGIN:
+			StartAutonomousSubTransaction();
+			s->blockState = TBLOCK_SUBINPROGRESS;
+			break;
+
+			/*
 			 * The user issued a RELEASE command, so we end the current
 			 * subtransaction and return to the parent transaction. The parent
 			 * might be ended too, so repeat till we find an INPROGRESS
@@ -3390,6 +3706,29 @@ CommitTransactionCommandInternal(void)
 
 			Assert(s->blockState == TBLOCK_INPROGRESS ||
 				   s->blockState == TBLOCK_SUBINPROGRESS);
+			break;
+
+			/*
+			 * The user issued COMMIT AUTONOMOUS.
+			 */
+		case TBLOCK_AUTONOMOUS_COMMIT:
+			{
+				bool		chain = s->chain;
+
+				CommitAutonomousSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				if (chain)
+				{
+					BeginAutonomousTransactionBlock();
+					s = CurrentTransactionState;	/* changed by push */
+					Assert(s->blockState == TBLOCK_AUTONOMOUS_BEGIN);
+					StartAutonomousSubTransaction();
+					s->blockState = TBLOCK_SUBINPROGRESS;
+					RestoreTransactionCharacteristics(&savetc);
+				}
+				else if (s->blockState == TBLOCK_STARTED)
+					return false;
+			}
 			break;
 
 			/*
@@ -3427,6 +3766,24 @@ CommitTransactionCommandInternal(void)
 				PrepareTransaction();
 				s->blockState = TBLOCK_DEFAULT;
 			}
+			else if (s->blockState == TBLOCK_AUTONOMOUS_COMMIT)
+			{
+				bool		chain = s->chain;
+
+				CommitAutonomousSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				if (chain)
+				{
+					BeginAutonomousTransactionBlock();
+					s = CurrentTransactionState;	/* changed by push */
+					Assert(s->blockState == TBLOCK_AUTONOMOUS_BEGIN);
+					StartAutonomousSubTransaction();
+					s->blockState = TBLOCK_SUBINPROGRESS;
+					RestoreTransactionCharacteristics(&savetc);
+				}
+				else if (s->blockState == TBLOCK_STARTED)
+					return false;
+			}
 			else
 				elog(ERROR, "CommitTransactionCommand: unexpected state %s",
 					 BlockStateAsString(s->blockState));
@@ -3440,6 +3797,25 @@ CommitTransactionCommandInternal(void)
 			 * caller to do the next iteration.
 			 */
 		case TBLOCK_SUBABORT_END:
+			if (s->isAutonomous)
+			{
+				bool		chain = s->chain;
+
+				CleanupSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				if (chain)
+				{
+					BeginAutonomousTransactionBlock();
+					s = CurrentTransactionState;	/* changed by push */
+					Assert(s->blockState == TBLOCK_AUTONOMOUS_BEGIN);
+					StartAutonomousSubTransaction();
+					s->blockState = TBLOCK_SUBINPROGRESS;
+					RestoreTransactionCharacteristics(&savetc);
+				}
+				else if (s->blockState == TBLOCK_STARTED)
+					return false;
+				return true;
+			}
 			CleanupSubTransaction();
 			return false;
 
@@ -3447,6 +3823,26 @@ CommitTransactionCommandInternal(void)
 			 * As above, but it's not dead yet, so abort first.
 			 */
 		case TBLOCK_SUBABORT_PENDING:
+			if (s->isAutonomous)
+			{
+				bool		chain = s->chain;
+
+				AbortSubTransaction();
+				CleanupSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				if (chain)
+				{
+					BeginAutonomousTransactionBlock();
+					s = CurrentTransactionState;	/* changed by push */
+					Assert(s->blockState == TBLOCK_AUTONOMOUS_BEGIN);
+					StartAutonomousSubTransaction();
+					s->blockState = TBLOCK_SUBINPROGRESS;
+					RestoreTransactionCharacteristics(&savetc);
+				}
+				else if (s->blockState == TBLOCK_STARTED)
+					return false;
+				return true;
+			}
 			AbortSubTransaction();
 			CleanupSubTransaction();
 			return false;
@@ -3664,6 +4060,22 @@ AbortCurrentTransactionInternal(void)
 			break;
 
 			/*
+			 * If we failed while trying to create or commit an autonomous
+			 * transaction, clean up the broken autonomous subtransaction and
+			 * resume the parent (unless the parent was not an explicit
+			 * transaction block, in which case we also clean up the parent).
+			 */
+		case TBLOCK_AUTONOMOUS_BEGIN:
+		case TBLOCK_AUTONOMOUS_COMMIT:
+			AbortSubTransaction();
+			CleanupSubTransaction();
+			s = CurrentTransactionState;	/* changed by pop */
+			if (s->blockState == TBLOCK_STARTED ||
+				s->blockState == TBLOCK_IMPLICIT_INPROGRESS)
+				return false;
+			break;
+
+			/*
 			 * If we failed while trying to create a subtransaction, clean up
 			 * the broken subtransaction and abort the parent.  The same
 			 * applies if we get a failure while ending a subtransaction.  As
@@ -3675,17 +4087,35 @@ AbortCurrentTransactionInternal(void)
 		case TBLOCK_SUBCOMMIT:
 		case TBLOCK_SUBABORT_PENDING:
 		case TBLOCK_SUBRESTART:
-			AbortSubTransaction();
-			CleanupSubTransaction();
-			return false;
+			{
+				bool		isAutonomous = s->isAutonomous;
+
+				AbortSubTransaction();
+				CleanupSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				if (isAutonomous &&
+					s->blockState != TBLOCK_STARTED &&
+					s->blockState != TBLOCK_IMPLICIT_INPROGRESS)
+					return true;
+				return false;
+			}
 
 			/*
 			 * Same as above, except the Abort() was already done.
 			 */
 		case TBLOCK_SUBABORT_END:
 		case TBLOCK_SUBABORT_RESTART:
-			CleanupSubTransaction();
-			return false;
+			{
+				bool		isAutonomous = s->isAutonomous;
+
+				CleanupSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				if (isAutonomous &&
+					s->blockState != TBLOCK_STARTED &&
+					s->blockState != TBLOCK_IMPLICIT_INPROGRESS)
+					return true;
+				return false;
+			}
 	}
 
 	/* Done, no more iterations required */
@@ -4033,9 +4463,11 @@ BeginTransactionBlock(void)
 		case TBLOCK_DEFAULT:
 		case TBLOCK_BEGIN:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
 		case TBLOCK_ABORT_PENDING:
@@ -4047,6 +4479,239 @@ BeginTransactionBlock(void)
 				 BlockStateAsString(s->blockState));
 			break;
 	}
+}
+
+/*
+ *	BeginAutonomousTransactionBlock
+ *		This executes a BEGIN AUTONOMOUS command.
+ */
+void
+BeginAutonomousTransactionBlock(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (IsInParallelMode() || IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot start autonomous transactions during a parallel operation")));
+
+	switch (s->blockState)
+	{
+		case TBLOCK_STARTED:
+		case TBLOCK_INPROGRESS:
+		case TBLOCK_IMPLICIT_INPROGRESS:
+		case TBLOCK_SUBINPROGRESS:
+			PushTransaction();
+			s = CurrentTransactionState;	/* changed by push */
+			s->isAutonomous = true;
+			s->savepointLevel += 1;
+			s->blockState = TBLOCK_AUTONOMOUS_BEGIN;
+			break;
+
+		case TBLOCK_ABORT:
+		case TBLOCK_SUBABORT:
+			ereport(ERROR,
+					(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION),
+					 errmsg("current transaction is aborted, commands ignored until end of transaction block")));
+			break;
+
+			/* These cases are invalid. */
+		case TBLOCK_DEFAULT:
+		case TBLOCK_BEGIN:
+		case TBLOCK_PARALLEL_INPROGRESS:
+		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
+		case TBLOCK_END:
+		case TBLOCK_SUBRELEASE:
+		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
+		case TBLOCK_ABORT_END:
+		case TBLOCK_SUBABORT_END:
+		case TBLOCK_ABORT_PENDING:
+		case TBLOCK_SUBABORT_PENDING:
+		case TBLOCK_SUBRESTART:
+		case TBLOCK_SUBABORT_RESTART:
+		case TBLOCK_PREPARE:
+			elog(FATAL, "BeginAutonomousTransactionBlock: unexpected state %s",
+				 BlockStateAsString(s->blockState));
+			break;
+	}
+}
+
+/*
+ *	EndAutonomousTransactionBlock
+ *		This executes a COMMIT AUTONOMOUS command.
+ *
+ * Since COMMIT AUTONOMOUS may actually do a ROLLBACK AUTONOMOUS, the result
+ * indicates what happened: true for COMMIT, false for ROLLBACK.
+ */
+bool
+EndAutonomousTransactionBlock(bool chain)
+{
+	TransactionState s = CurrentTransactionState;
+	bool		result = false;
+
+	if (!InAutonomousTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+				 errmsg("there is no autonomous transaction in progress")));
+
+	switch (s->blockState)
+	{
+		case TBLOCK_SUBINPROGRESS:
+			while (!s->isAutonomous)
+			{
+				if (s->blockState == TBLOCK_SUBINPROGRESS)
+					s->blockState = TBLOCK_SUBCOMMIT;
+				else
+					elog(FATAL, "EndAutonomousTransactionBlock: unexpected state %s",
+						 BlockStateAsString(s->blockState));
+				s = s->parent;
+			}
+			if (s->blockState == TBLOCK_SUBINPROGRESS)
+				s->blockState = TBLOCK_AUTONOMOUS_COMMIT;
+			else
+				elog(FATAL, "EndAutonomousTransactionBlock: unexpected state %s",
+					 BlockStateAsString(s->blockState));
+			result = true;
+			break;
+
+		case TBLOCK_SUBABORT:
+			while (!s->isAutonomous)
+			{
+				if (s->blockState == TBLOCK_SUBINPROGRESS)
+					s->blockState = TBLOCK_SUBABORT_PENDING;
+				else if (s->blockState == TBLOCK_SUBABORT)
+					s->blockState = TBLOCK_SUBABORT_END;
+				else
+					elog(FATAL, "EndAutonomousTransactionBlock: unexpected state %s",
+						 BlockStateAsString(s->blockState));
+				s = s->parent;
+			}
+			if (s->blockState == TBLOCK_SUBINPROGRESS)
+				s->blockState = TBLOCK_SUBABORT_PENDING;
+			else if (s->blockState == TBLOCK_SUBABORT)
+				s->blockState = TBLOCK_SUBABORT_END;
+			else
+				elog(FATAL, "EndAutonomousTransactionBlock: unexpected state %s",
+					 BlockStateAsString(s->blockState));
+			break;
+
+		case TBLOCK_PARALLEL_INPROGRESS:
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("cannot commit during a parallel operation")));
+			break;
+
+			/* These cases are invalid. */
+		case TBLOCK_DEFAULT:
+		case TBLOCK_STARTED:
+		case TBLOCK_BEGIN:
+		case TBLOCK_INPROGRESS:
+		case TBLOCK_IMPLICIT_INPROGRESS:
+		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
+		case TBLOCK_END:
+		case TBLOCK_SUBRELEASE:
+		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
+		case TBLOCK_ABORT:
+		case TBLOCK_ABORT_END:
+		case TBLOCK_SUBABORT_END:
+		case TBLOCK_ABORT_PENDING:
+		case TBLOCK_SUBABORT_PENDING:
+		case TBLOCK_SUBRESTART:
+		case TBLOCK_SUBABORT_RESTART:
+		case TBLOCK_PREPARE:
+			elog(FATAL, "EndAutonomousTransactionBlock: unexpected state %s",
+				 BlockStateAsString(s->blockState));
+			break;
+	}
+
+	Assert(s->isAutonomous);
+	Assert(s->blockState == TBLOCK_AUTONOMOUS_COMMIT ||
+		   s->blockState == TBLOCK_SUBABORT_END ||
+		   s->blockState == TBLOCK_SUBABORT_PENDING);
+
+	s->chain = chain;
+
+	return result;
+}
+
+/*
+ *	UserAbortAutonomousTransactionBlock
+ *		This executes a ROLLBACK AUTONOMOUS command.
+ */
+void
+UserAbortAutonomousTransactionBlock(bool chain)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (!InAutonomousTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+				 errmsg("there is no autonomous transaction in progress")));
+
+	switch (s->blockState)
+	{
+		case TBLOCK_SUBINPROGRESS:
+		case TBLOCK_SUBABORT:
+			while (!s->isAutonomous)
+			{
+				if (s->blockState == TBLOCK_SUBINPROGRESS)
+					s->blockState = TBLOCK_SUBABORT_PENDING;
+				else if (s->blockState == TBLOCK_SUBABORT)
+					s->blockState = TBLOCK_SUBABORT_END;
+				else
+					elog(FATAL, "UserAbortAutonomousTransactionBlock: unexpected state %s",
+						 BlockStateAsString(s->blockState));
+				s = s->parent;
+			}
+			if (s->blockState == TBLOCK_SUBINPROGRESS)
+				s->blockState = TBLOCK_SUBABORT_PENDING;
+			else if (s->blockState == TBLOCK_SUBABORT)
+				s->blockState = TBLOCK_SUBABORT_END;
+			else
+				elog(FATAL, "UserAbortAutonomousTransactionBlock: unexpected state %s",
+					 BlockStateAsString(s->blockState));
+			break;
+
+		case TBLOCK_PARALLEL_INPROGRESS:
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("cannot abort during a parallel operation")));
+			break;
+
+			/* These cases are invalid. */
+		case TBLOCK_DEFAULT:
+		case TBLOCK_STARTED:
+		case TBLOCK_BEGIN:
+		case TBLOCK_INPROGRESS:
+		case TBLOCK_IMPLICIT_INPROGRESS:
+		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
+		case TBLOCK_END:
+		case TBLOCK_SUBRELEASE:
+		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
+		case TBLOCK_ABORT:
+		case TBLOCK_ABORT_END:
+		case TBLOCK_SUBABORT_END:
+		case TBLOCK_ABORT_PENDING:
+		case TBLOCK_SUBABORT_PENDING:
+		case TBLOCK_SUBRESTART:
+		case TBLOCK_SUBABORT_RESTART:
+		case TBLOCK_PREPARE:
+			elog(FATAL, "UserAbortAutonomousTransactionBlock: unexpected state %s",
+				 BlockStateAsString(s->blockState));
+			break;
+	}
+
+	Assert(s->isAutonomous);
+	Assert(s->blockState == TBLOCK_SUBABORT_END ||
+		   s->blockState == TBLOCK_SUBABORT_PENDING);
+
+	s->chain = chain;
 }
 
 /*
@@ -4118,6 +4783,12 @@ EndTransactionBlock(bool chain)
 {
 	TransactionState s = CurrentTransactionState;
 	bool		result = false;
+
+	if (InAutonomousTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot commit main transaction while an autonomous transaction is active"),
+				 errhint("Use COMMIT AUTONOMOUS or ROLLBACK AUTONOMOUS.")));
 
 	switch (s->blockState)
 	{
@@ -4242,9 +4913,11 @@ EndTransactionBlock(bool chain)
 		case TBLOCK_DEFAULT:
 		case TBLOCK_BEGIN:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
 		case TBLOCK_ABORT_PENDING:
@@ -4277,6 +4950,12 @@ void
 UserAbortTransactionBlock(bool chain)
 {
 	TransactionState s = CurrentTransactionState;
+
+	if (InAutonomousTransaction())
+	{
+		UserAbortAutonomousTransactionBlock(chain);
+		return;
+	}
 
 	switch (s->blockState)
 	{
@@ -4365,9 +5044,11 @@ UserAbortTransactionBlock(bool chain)
 		case TBLOCK_DEFAULT:
 		case TBLOCK_BEGIN:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
 		case TBLOCK_ABORT_PENDING:
@@ -4436,6 +5117,8 @@ EndImplicitTransactionBlock(void)
 	 */
 	if (s->blockState == TBLOCK_IMPLICIT_INPROGRESS)
 		s->blockState = TBLOCK_STARTED;
+	else if (TopTransactionStateData.blockState == TBLOCK_IMPLICIT_INPROGRESS)
+		TopTransactionStateData.blockState = TBLOCK_STARTED;
 }
 
 /*
@@ -4503,9 +5186,11 @@ DefineSavepoint(const char *name)
 		case TBLOCK_BEGIN:
 		case TBLOCK_PARALLEL_INPROGRESS:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
 		case TBLOCK_ABORT_END:
@@ -4579,9 +5264,11 @@ ReleaseSavepoint(const char *name)
 		case TBLOCK_BEGIN:
 		case TBLOCK_PARALLEL_INPROGRESS:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
 		case TBLOCK_ABORT_END:
@@ -4690,9 +5377,11 @@ RollbackToSavepoint(const char *name)
 		case TBLOCK_BEGIN:
 		case TBLOCK_PARALLEL_INPROGRESS:
 		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
 		case TBLOCK_ABORT_PENDING:
@@ -4808,9 +5497,11 @@ BeginInternalSubTransaction(const char *name)
 			/* These cases are invalid. */
 		case TBLOCK_DEFAULT:
 		case TBLOCK_BEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_SUBBEGIN:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
 		case TBLOCK_ABORT_END:
@@ -4887,6 +5578,7 @@ RollbackAndReleaseCurrentSubTransaction(void)
 		case TBLOCK_DEFAULT:
 		case TBLOCK_STARTED:
 		case TBLOCK_BEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_IMPLICIT_INPROGRESS:
 		case TBLOCK_PARALLEL_INPROGRESS:
 		case TBLOCK_SUBBEGIN:
@@ -4894,6 +5586,7 @@ RollbackAndReleaseCurrentSubTransaction(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -4970,6 +5663,7 @@ AbortOutOfAnyTransaction(void)
 				break;
 			case TBLOCK_STARTED:
 			case TBLOCK_BEGIN:
+			case TBLOCK_AUTONOMOUS_BEGIN:
 			case TBLOCK_INPROGRESS:
 			case TBLOCK_IMPLICIT_INPROGRESS:
 			case TBLOCK_PARALLEL_INPROGRESS:
@@ -5002,6 +5696,7 @@ AbortOutOfAnyTransaction(void)
 			case TBLOCK_SUBINPROGRESS:
 			case TBLOCK_SUBRELEASE:
 			case TBLOCK_SUBCOMMIT:
+				case TBLOCK_AUTONOMOUS_COMMIT:
 			case TBLOCK_SUBABORT_PENDING:
 			case TBLOCK_SUBRESTART:
 				AbortSubTransaction();
@@ -5085,6 +5780,7 @@ TransactionBlockStatusCode(void)
 		case TBLOCK_STARTED:
 			return 'I';			/* idle --- not in transaction */
 		case TBLOCK_BEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
 		case TBLOCK_SUBBEGIN:
 		case TBLOCK_INPROGRESS:
 		case TBLOCK_IMPLICIT_INPROGRESS:
@@ -5093,6 +5789,7 @@ TransactionBlockStatusCode(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_PREPARE:
 			return 'T';			/* in transaction */
 		case TBLOCK_ABORT:
@@ -5167,6 +5864,174 @@ StartSubTransaction(void)
 						 s->parent->subTransactionId);
 
 	ShowTransactionState("StartSubTransaction");
+}
+
+/*
+ * StartAutonomousSubTransaction
+ *
+ * Start a nested autonomous transaction inside an existing transaction block.
+ */
+static void
+StartAutonomousSubTransaction(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (s->state != TRANS_DEFAULT)
+		elog(WARNING, "StartAutonomousSubTransaction while in %s state",
+			 TransStateAsString(s->state));
+
+	s->state = TRANS_START;
+
+	/*
+	 * Save parent transaction settings and reset to session defaults for the
+	 * autonomous transaction.
+	 */
+	s->prevXactIsoLevel = XactIsoLevel;
+	s->prevXactDeferrable = XactDeferrable;
+	s->savedXactLastRecEnd = XactLastRecEnd;
+	s->savedCommandId = currentCommandId;
+	s->savedCommandIdUsed = currentCommandIdUsed;
+	XactIsoLevel = DefaultXactIsoLevel;
+	XactDeferrable = DefaultXactDeferrable;
+	XactReadOnly = DefaultXactReadOnly;
+	XactLastRecEnd = InvalidXLogRecPtr;
+	currentCommandId = FirstCommandId;
+	currentCommandIdUsed = false;
+
+	AtSubStart_Memory();
+	AtSubStart_ResourceOwner();
+	AfterTriggerBeginAutonomousSubXact();
+	AtAutonomousStart_Snapshot(&s->savedFirstSnapshotSet,
+							   &s->savedFirstXactSnapshot,
+							   &s->savedCurrentSnapshot);
+
+	s->state = TRANS_INPROGRESS;
+
+	CallSubXactCallbacks(SUBXACT_EVENT_START_SUB, s->subTransactionId,
+						 s->parent->subTransactionId);
+
+	ShowTransactionState("StartAutonomousSubTransaction");
+}
+
+/*
+ * CommitAutonomousSubTransaction
+ *
+ * Independently and durably commit a nested autonomous transaction while
+ * leaving the suspended parent transaction active.
+ */
+static void
+CommitAutonomousSubTransaction(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	ShowTransactionState("CommitAutonomousSubTransaction");
+
+	if (s->state != TRANS_INPROGRESS)
+		elog(WARNING, "CommitAutonomousSubTransaction while in %s state",
+			 TransStateAsString(s->state));
+
+	/* Fire deferred triggers and materialize/close portals created in this autonomous xact */
+	for (;;)
+	{
+		AfterTriggerFireDeferred();
+
+		if (!AtAutonomousCommit_Portals(s->subTransactionId,
+										s->parent->subTransactionId,
+										s->parent->nestingLevel,
+										s->parent->curTransactionOwner))
+			break;
+	}
+
+	/* Pre-commit processing */
+	CallSubXactCallbacks(SUBXACT_EVENT_PRE_COMMIT_SUB, s->subTransactionId,
+						 s->parent->subTransactionId);
+
+	AtEOSubXact_Parallel(true, s->subTransactionId);
+	if (s->parallelModeLevel != 0)
+	{
+		elog(WARNING, "parallelModeLevel is %d not 0 at end of autonomous transaction",
+			 s->parallelModeLevel);
+		s->parallelModeLevel = 0;
+	}
+
+	/* Must CCI to ensure commands of autonomous transaction are seen as done */
+	CommandCounterIncrement();
+
+	PreCommit_Autonomous_Notify();
+
+	/* Prevent cancel/die interrupt while cleaning up */
+	HOLD_INTERRUPTS();
+
+	/* Do the actual durable WAL, CLOG, SubTrans, and ProcArray commit */
+	s->state = TRANS_COMMIT;
+	(void) RecordSubTransactionCommit();
+
+	CallSubXactCallbacks(SUBXACT_EVENT_COMMIT_SUB, s->subTransactionId,
+						 s->parent->subTransactionId);
+
+	ResourceOwnerRelease(s->curTransactionOwner,
+						 RESOURCE_RELEASE_BEFORE_LOCKS,
+						 true, false);
+
+	AtEOSubXact_LargeObject(false, s->subTransactionId,
+							s->parent->subTransactionId);
+	AtEOSubXact_RelationCache(true, s->subTransactionId,
+							  InvalidSubTransactionId);
+	AtEOSubXact_TypeCache();
+	AtAutonomousCommit_Inval();
+
+	/* Release the autonomous subtransaction XID lock and all locks it took */
+	CurrentResourceOwner = s->curTransactionOwner;
+	if (FullTransactionIdIsValid(s->fullTransactionId))
+		XactLockTableDelete(XidFromFullTransactionId(s->fullTransactionId));
+
+	ResourceOwnerRelease(s->curTransactionOwner,
+						 RESOURCE_RELEASE_LOCKS,
+						 false, false);
+	ResourceOwnerRelease(s->curTransactionOwner,
+						 RESOURCE_RELEASE_AFTER_LOCKS,
+						 true, false);
+
+	smgrDoPendingDeletes(true);
+
+	AtAutonomousCommit_Notify();
+	AtEOXact_GUC(true, s->gucNestLevel);
+	AtEOSubXact_SPI(true, s->subTransactionId);
+	AtEOSubXact_on_commit_actions(true, s->subTransactionId,
+								  s->parent->subTransactionId);
+	AtEOSubXact_Namespace(true, s->subTransactionId,
+						  s->parent->subTransactionId);
+	AtEOSubXact_Files(false, s->subTransactionId,
+					  s->parent->subTransactionId);
+	AtEOSubXact_HashTables(true, s->nestingLevel);
+	AtAutonomousCommit_PgStat(s->nestingLevel);
+	currentCommandId = s->savedCommandId;
+	currentCommandIdUsed = s->savedCommandIdUsed;
+	AtAutonomousEOXact_Snapshot(s->nestingLevel,
+								s->savedFirstSnapshotSet,
+								s->savedFirstXactSnapshot,
+								s->savedCurrentSnapshot);
+	AfterTriggerEndAutonomousSubXact(true);
+
+	/* Restore parent transaction state */
+	SetUserIdAndSecContext(s->prevUser, s->prevSecContext);
+	XactReadOnly = s->prevXactReadOnly;
+	XactIsoLevel = s->prevXactIsoLevel;
+	XactDeferrable = s->prevXactDeferrable;
+	XactLastRecEnd = s->savedXactLastRecEnd;
+
+	CurrentResourceOwner = s->parent->curTransactionOwner;
+	CurTransactionResourceOwner = s->parent->curTransactionOwner;
+	ResourceOwnerDelete(s->curTransactionOwner);
+	s->curTransactionOwner = NULL;
+
+	AtSubCleanup_Memory();
+
+	s->state = TRANS_DEFAULT;
+
+	PopTransaction();
+
+	RESUME_INTERRUPTS();
 }
 
 /*
@@ -5394,7 +6259,10 @@ AbortSubTransaction(void)
 	 */
 	if (s->curTransactionOwner)
 	{
-		AfterTriggerEndSubXact(false);
+		if (s->isAutonomous)
+			AfterTriggerEndAutonomousSubXact(false);
+		else
+			AfterTriggerEndSubXact(false);
 		AtSubAbort_Portals(s->subTransactionId,
 						   s->parent->subTransactionId,
 						   s->curTransactionOwner,
@@ -5440,7 +6308,19 @@ AbortSubTransaction(void)
 						  s->parent->subTransactionId);
 		AtEOSubXact_HashTables(false, s->nestingLevel);
 		AtEOSubXact_PgStat(false, s->nestingLevel);
-		AtSubAbort_Snapshot(s->nestingLevel);
+		if (s->isAutonomous)
+		{
+			currentCommandId = s->savedCommandId;
+			currentCommandIdUsed = s->savedCommandIdUsed;
+			AtAutonomousEOXact_Snapshot(s->nestingLevel,
+										s->savedFirstSnapshotSet,
+										s->savedFirstXactSnapshot,
+										s->savedCurrentSnapshot);
+		}
+		else
+		{
+			AtSubAbort_Snapshot(s->nestingLevel);
+		}
 	}
 
 	/*
@@ -5449,6 +6329,14 @@ AbortSubTransaction(void)
 	 * with the commit case.
 	 */
 	XactReadOnly = s->prevXactReadOnly;
+	if (s->isAutonomous)
+	{
+		XactIsoLevel = s->prevXactIsoLevel;
+		XactDeferrable = s->prevXactDeferrable;
+		XactLastRecEnd = s->savedXactLastRecEnd;
+		currentCommandId = s->savedCommandId;
+		currentCommandIdUsed = s->savedCommandIdUsed;
+	}
 
 	RESUME_INTERRUPTS();
 }
@@ -5532,10 +6420,14 @@ PushTransaction(void)
 	s->blockState = TBLOCK_SUBBEGIN;
 	GetUserIdAndSecContext(&s->prevUser, &s->prevSecContext);
 	s->prevXactReadOnly = XactReadOnly;
+	s->prevXactIsoLevel = XactIsoLevel;
+	s->prevXactDeferrable = XactDeferrable;
+	s->savedXactLastRecEnd = XactLastRecEnd;
 	s->startedInRecovery = p->startedInRecovery;
 	s->parallelModeLevel = 0;
 	s->parallelChildXact = (p->parallelModeLevel != 0 || p->parallelChildXact);
 	s->topXidLogged = false;
+	s->isAutonomous = false;
 
 	CurrentTransactionState = s;
 
@@ -5629,7 +6521,7 @@ SerializeTransactionState(Size maxsize, char *start_address)
 
 	result->xactIsoLevel = XactIsoLevel;
 	result->xactDeferrable = XactDeferrable;
-	result->topFullTransactionId = XactTopFullTransactionId;
+	result->topFullTransactionId = GetTopFullTransactionIdIfAny();
 	result->currentFullTransactionId =
 		CurrentTransactionState->fullTransactionId;
 	result->currentCommandId = currentCommandId;
@@ -5794,6 +6686,8 @@ BlockStateAsString(TBlockState blockState)
 			return "STARTED";
 		case TBLOCK_BEGIN:
 			return "BEGIN";
+		case TBLOCK_AUTONOMOUS_BEGIN:
+			return "AUTONOMOUS_BEGIN";
 		case TBLOCK_INPROGRESS:
 			return "INPROGRESS";
 		case TBLOCK_IMPLICIT_INPROGRESS:
@@ -5818,6 +6712,8 @@ BlockStateAsString(TBlockState blockState)
 			return "SUBRELEASE";
 		case TBLOCK_SUBCOMMIT:
 			return "SUBCOMMIT";
+		case TBLOCK_AUTONOMOUS_COMMIT:
+			return "AUTONOMOUS_COMMIT";
 		case TBLOCK_SUBABORT:
 			return "SUBABORT";
 		case TBLOCK_SUBABORT_END:

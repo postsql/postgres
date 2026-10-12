@@ -12,6 +12,7 @@
 #define SUBTRANS_H
 
 extern void SubTransSetParent(TransactionId xid, TransactionId parent);
+extern void SubTransClearParent(TransactionId xid);
 extern TransactionId SubTransGetParent(TransactionId xid);
 extern TransactionId SubTransGetTopmostTransaction(TransactionId xid);
 

@@ -933,6 +933,7 @@ extern PgStat_StatSubEntry *pgstat_fetch_stat_subscription(Oid subid);
 
 extern void AtEOXact_PgStat(bool isCommit, bool parallel);
 extern void AtEOSubXact_PgStat(bool isCommit, int nestDepth);
+extern void AtAutonomousCommit_PgStat(int nestDepth);
 extern void AtPrepare_PgStat(void);
 extern void PostPrepare_PgStat(void);
 struct xl_xact_stats_item;

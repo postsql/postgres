@@ -2521,6 +2521,18 @@ AtSubAbort_Notify(void)
 	 * current subtransaction level, either because none were ever created, or
 	 * because we reentered this routine due to trouble during subxact abort.
 	 */
+	/*
+	 * If PreCommit_Autonomous_Notify staged any listen/unlisten actions before
+	 * an error occurred, revert them now.
+	 */
+	if (pendingListenActions != NULL)
+	{
+		ApplyPendingListenActions(false);
+		if (amRegisteredListener && LocalChannelTableIsEmpty())
+			asyncQueueUnregister();
+		pendingListenActions = NULL;
+	}
+
 	while (pendingActions != NULL &&
 		   pendingActions->nestingLevel >= my_level)
 	{
@@ -2536,6 +2548,88 @@ AtSubAbort_Notify(void)
 		NotificationList *childPendingNotifies = pendingNotifies;
 
 		pendingNotifies = pendingNotifies->upper;
+		pfree(childPendingNotifies);
+	}
+}
+
+/*
+ * PreCommit_Autonomous_Notify() --- Pre-commit notify processing for an
+ * independently committing subtransaction (autonomous transaction or
+ * COMMIT SAVEPOINT).
+ */
+void
+PreCommit_Autonomous_Notify(void)
+{
+	int			my_level = GetCurrentTransactionNestLevel();
+	ActionList *savedActions = pendingActions;
+	NotificationList *savedNotifies = pendingNotifies;
+	bool		hasActions = (pendingActions != NULL &&
+							  pendingActions->nestingLevel == my_level);
+	bool		hasNotifies = (pendingNotifies != NULL &&
+							   pendingNotifies->nestingLevel == my_level);
+
+	if (!hasActions && !hasNotifies)
+		return;
+
+	if (!hasActions)
+		pendingActions = NULL;
+	if (!hasNotifies)
+		pendingNotifies = NULL;
+
+	PG_TRY();
+	{
+		PreCommit_Notify();
+	}
+	PG_FINALLY();
+	{
+		pendingActions = savedActions;
+		pendingNotifies = savedNotifies;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * AtAutonomousCommit_Notify() --- Post-commit notify processing for an
+ * independently committing subtransaction (autonomous transaction or
+ * COMMIT SAVEPOINT).
+ */
+void
+AtAutonomousCommit_Notify(void)
+{
+	int			my_level = GetCurrentTransactionNestLevel();
+	bool		hasActions = (pendingActions != NULL &&
+							  pendingActions->nestingLevel == my_level);
+	bool		hasNotifies = (pendingNotifies != NULL &&
+							   pendingNotifies->nestingLevel == my_level);
+
+	if (!hasActions && !hasNotifies)
+		return;
+
+	if (hasActions)
+	{
+		ActionList *childPendingActions = pendingActions;
+
+		ApplyPendingListenActions(true);
+		if (amRegisteredListener && LocalChannelTableIsEmpty())
+			asyncQueueUnregister();
+		pendingListenActions = NULL;
+
+		pendingActions = childPendingActions->upper;
+		pfree(childPendingActions);
+	}
+
+	if (hasNotifies)
+	{
+		NotificationList *childPendingNotifies = pendingNotifies;
+
+		SignalBackends();
+		if (tryAdvanceTail)
+		{
+			tryAdvanceTail = false;
+			asyncQueueAdvanceTail();
+		}
+
+		pendingNotifies = childPendingNotifies->upper;
 		pfree(childPendingNotifies);
 	}
 }

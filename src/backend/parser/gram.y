@@ -720,6 +720,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %token <keyword> ABORT_P ABSENT ABSOLUTE_P ACCESS ACTION ADD_P ADMIN AFTER
 	AGGREGATE ALL ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY ARRAY AS ASC
 	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
+	AUTONOMOUS
 
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
 	BOOLEAN_P BOTH BREADTH BY
@@ -11355,12 +11356,31 @@ TransactionStmt:
 					n->location = -1;
 					$$ = (Node *) n;
 				}
+			| ABORT_P AUTONOMOUS opt_transaction opt_transaction_chain
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_ROLLBACK_AUTONOMOUS;
+					n->options = NIL;
+					n->chain = $4;
+					n->location = -1;
+					$$ = (Node *) n;
+				}
 			| START TRANSACTION transaction_mode_list_or_empty
 				{
 					TransactionStmt *n = makeNode(TransactionStmt);
 
 					n->kind = TRANS_STMT_START;
 					n->options = $3;
+					n->location = -1;
+					$$ = (Node *) n;
+				}
+			| START AUTONOMOUS opt_transaction transaction_mode_list_or_empty
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_BEGIN_AUTONOMOUS;
+					n->options = $4;
 					n->location = -1;
 					$$ = (Node *) n;
 				}
@@ -11374,6 +11394,16 @@ TransactionStmt:
 					n->location = -1;
 					$$ = (Node *) n;
 				}
+			| COMMIT AUTONOMOUS opt_transaction opt_transaction_chain
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_COMMIT_AUTONOMOUS;
+					n->options = NIL;
+					n->chain = $4;
+					n->location = -1;
+					$$ = (Node *) n;
+				}
 			| ROLLBACK opt_transaction opt_transaction_chain
 				{
 					TransactionStmt *n = makeNode(TransactionStmt);
@@ -11381,6 +11411,16 @@ TransactionStmt:
 					n->kind = TRANS_STMT_ROLLBACK;
 					n->options = NIL;
 					n->chain = $3;
+					n->location = -1;
+					$$ = (Node *) n;
+				}
+			| ROLLBACK AUTONOMOUS opt_transaction opt_transaction_chain
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_ROLLBACK_AUTONOMOUS;
+					n->options = NIL;
+					n->chain = $4;
 					n->location = -1;
 					$$ = (Node *) n;
 				}
@@ -11468,6 +11508,15 @@ TransactionStmtLegacy:
 					n->location = -1;
 					$$ = (Node *) n;
 				}
+			| BEGIN_P AUTONOMOUS opt_transaction transaction_mode_list_or_empty
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_BEGIN_AUTONOMOUS;
+					n->options = $4;
+					n->location = -1;
+					$$ = (Node *) n;
+				}
 			| END_P opt_transaction opt_transaction_chain
 				{
 					TransactionStmt *n = makeNode(TransactionStmt);
@@ -11475,6 +11524,16 @@ TransactionStmtLegacy:
 					n->kind = TRANS_STMT_COMMIT;
 					n->options = NIL;
 					n->chain = $3;
+					n->location = -1;
+					$$ = (Node *) n;
+				}
+			| END_P AUTONOMOUS opt_transaction opt_transaction_chain
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_COMMIT_AUTONOMOUS;
+					n->options = NIL;
+					n->chain = $4;
 					n->location = -1;
 					$$ = (Node *) n;
 				}
@@ -18089,6 +18148,7 @@ unreserved_keyword:
 			| ATOMIC
 			| ATTACH
 			| ATTRIBUTE
+			| AUTONOMOUS
 			| BACKWARD
 			| BEFORE
 			| BEGIN_P
@@ -18643,6 +18703,7 @@ bare_label_keyword:
 			| ATTACH
 			| ATTRIBUTE
 			| AUTHORIZATION
+			| AUTONOMOUS
 			| BACKWARD
 			| BEFORE
 			| BEGIN_P

@@ -787,6 +787,7 @@ extern void pgstat_lock_snapshot_cb(void);
 
 extern void AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit);
 extern void AtEOSubXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit, int nestDepth);
+extern void AtAutonomousCommit_PgStat_Relations(PgStat_SubXactStatus *xact_state, int nestDepth);
 extern void AtPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state);
 extern void PostPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state);
 

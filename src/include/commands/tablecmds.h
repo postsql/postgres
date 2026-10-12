@@ -98,6 +98,8 @@ extern void AtEOXact_on_commit_actions(bool isCommit);
 extern void AtEOSubXact_on_commit_actions(bool isCommit,
 										  SubTransactionId mySubid,
 										  SubTransactionId parentSubid);
+extern void PreCommit_Autonomous_on_commit_actions(SubTransactionId mySubid);
+extern void AtAutonomousCommit_on_commit_actions(SubTransactionId mySubid);
 
 extern void RangeVarCallbackMaintainsTable(const RangeVar *relation,
 										   Oid relId, Oid oldRelId,

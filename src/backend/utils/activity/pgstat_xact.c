@@ -130,6 +130,31 @@ AtEOSubXact_PgStat(bool isCommit, int nestDepth)
 }
 
 /*
+ * Called from access/transam/xact.c when an autonomous transaction or
+ * savepoint commits independently of its parent transaction.
+ */
+void
+AtAutonomousCommit_PgStat(int nestDepth)
+{
+	PgStat_SubXactStatus *xact_state;
+
+	AtEOXact_PgStat_Database(true, false);
+
+	xact_state = pgStatXactStack;
+	if (xact_state != NULL &&
+		xact_state->nest_level >= nestDepth)
+	{
+		Assert(xact_state->nest_level == nestDepth);
+		pgStatXactStack = xact_state->prev;
+
+		AtAutonomousCommit_PgStat_Relations(xact_state, nestDepth);
+		AtEOXact_PgStat_DroppedStats(xact_state, true);
+
+		pfree(xact_state);
+	}
+}
+
+/*
  * Like AtEOXact_PgStat_DroppedStats(), but for subtransactions.
  */
 static void
@@ -275,15 +300,11 @@ pgstat_get_transactional_drops(bool isCommit, xl_xact_stats_item **items)
 	int			nitems = 0;
 	dlist_iter	iter;
 
-	if (xact_state == NULL)
+	if (xact_state == NULL ||
+		xact_state->nest_level < GetCurrentTransactionNestLevel())
 		return 0;
 
-	/*
-	 * We expect to be called for subtransaction abort (which logs a WAL
-	 * record), but not for subtransaction commit (which doesn't).
-	 */
-	Assert(!isCommit || xact_state->nest_level == 1);
-	Assert(!isCommit || xact_state->prev == NULL);
+	Assert(xact_state->nest_level == GetCurrentTransactionNestLevel());
 
 	*items = palloc_array(xl_xact_stats_item, dclist_count(&xact_state->pending_drops));
 

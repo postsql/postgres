@@ -20187,6 +20187,90 @@ AtEOSubXact_on_commit_actions(bool isCommit, SubTransactionId mySubid,
 }
 
 /*
+ * Perform ON COMMIT actions for temporary tables created within an autonomous
+ * transaction.
+ */
+void
+PreCommit_Autonomous_on_commit_actions(SubTransactionId mySubid)
+{
+	ListCell   *l;
+	List	   *oids_to_truncate = NIL;
+	List	   *oids_to_drop = NIL;
+
+	foreach(l, on_commits)
+	{
+		OnCommitItem *oc = (OnCommitItem *) lfirst(l);
+
+		if (oc->creating_subid != mySubid ||
+			oc->deleting_subid != InvalidSubTransactionId)
+			continue;
+
+		switch (oc->oncommit)
+		{
+			case ONCOMMIT_NOOP:
+			case ONCOMMIT_PRESERVE_ROWS:
+				break;
+			case ONCOMMIT_DELETE_ROWS:
+				if ((MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE))
+					oids_to_truncate = lappend_oid(oids_to_truncate, oc->relid);
+				break;
+			case ONCOMMIT_DROP:
+				oids_to_drop = lappend_oid(oids_to_drop, oc->relid);
+				break;
+		}
+	}
+
+	if (oids_to_truncate != NIL)
+		heap_truncate(oids_to_truncate);
+
+	if (oids_to_drop != NIL)
+	{
+		ObjectAddresses *targetObjects = new_object_addresses();
+
+		foreach(l, oids_to_drop)
+		{
+			ObjectAddress object;
+
+			object.classId = RelationRelationId;
+			object.objectId = lfirst_oid(l);
+			object.objectSubId = 0;
+
+			add_exact_object_address(&object, targetObjects);
+		}
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+		performMultipleDeletions(targetObjects, DROP_CASCADE,
+								 PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
+		PopActiveSnapshot();
+	}
+}
+
+/*
+ * Post-commit cleanup of ON COMMIT entries for an autonomous transaction or
+ * committed savepoint.
+ */
+void
+AtAutonomousCommit_on_commit_actions(SubTransactionId mySubid)
+{
+	ListCell   *cur_item;
+
+	foreach(cur_item, on_commits)
+	{
+		OnCommitItem *oc = (OnCommitItem *) lfirst(cur_item);
+
+		if (oc->deleting_subid == mySubid)
+		{
+			on_commits = foreach_delete_current(on_commits, cur_item);
+			pfree(oc);
+		}
+		else if (oc->creating_subid == mySubid)
+		{
+			oc->creating_subid = InvalidSubTransactionId;
+		}
+	}
+}
+
+/*
  * This is intended as a callback for RangeVarGetRelidExtended().  It allows
  * the relation to be locked only if (1) it's a plain or partitioned table,
  * materialized view, or TOAST table and (2) the current user is the owner (or

@@ -690,6 +690,13 @@ XactLockTableWait(TransactionId xid, Relation rel, const ItemPointerData *ctid,
 	for (;;)
 	{
 		Assert(TransactionIdIsValid(xid));
+
+		if (TransactionIdIsActiveParentTransactionId(xid))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
+					 errmsg("deadlock detected"),
+					 errdetail("Autonomous transaction attempted to wait for an uncommitted parent transaction.")));
+
 		Assert(!TransactionIdEquals(xid, GetTopTransactionIdIfAny()));
 
 		SET_LOCKTAG_TRANSACTION(tag, xid);
@@ -744,6 +751,10 @@ ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 	for (;;)
 	{
 		Assert(TransactionIdIsValid(xid));
+
+		if (TransactionIdIsActiveParentTransactionId(xid))
+			return false;
+
 		Assert(!TransactionIdEquals(xid, GetTopTransactionIdIfAny()));
 
 		SET_LOCKTAG_TRANSACTION(tag, xid);

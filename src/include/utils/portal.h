@@ -221,6 +221,10 @@ extern void AtSubCommit_Portals(SubTransactionId mySubid,
 								SubTransactionId parentSubid,
 								int parentLevel,
 								ResourceOwner parentXactOwner);
+extern bool AtAutonomousCommit_Portals(SubTransactionId mySubid,
+									   SubTransactionId parentSubid,
+									   int parentLevel,
+									   ResourceOwner parentXactOwner);
 extern void AtSubAbort_Portals(SubTransactionId mySubid,
 							   SubTransactionId parentSubid,
 							   ResourceOwner myXactOwner,
