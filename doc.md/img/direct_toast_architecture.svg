@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 460" width="100%" height="100%">
+  <defs>
+    <style>
+      .hdr { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: bold; font-size: 15px; fill: #0f172a; }
+      .lbl { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #334155; }
+      .code { font-family: monospace; font-size: 11px; fill: #1e293b; }
+      .card { rx: 6px; ry: 6px; stroke-width: 1.5; }
+      .arrow { stroke: #475569; stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+    </style>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#475569" />
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+
+  <!-- Left Side: Plain TOAST -->
+  <g transform="translate(30, 25)">
+    <rect x="0" y="0" width="410" height="405" fill="#ffffff" stroke="#cbd5e1" class="card"/>
+    <text x="20" y="30" class="hdr" fill="#b91c1c">Legacy Plain TOAST (OID Indirection)</text>
+
+    <!-- Main table heap -->
+    <rect x="20" y="50" width="370" height="60" fill="#fee2e2" stroke="#ef4444" class="card"/>
+    <text x="35" y="73" class="hdr">Main Heap Tuple</text>
+    <text x="35" y="93" class="code">varatt_external: [va_rawsize, va_extinfo, va_valueid (OID)]</text>
+
+    <!-- Arrow to Btree -->
+    <path d="M 205 110 L 205 145" class="arrow"/>
+
+    <!-- TOAST B-Tree Index -->
+    <rect x="40" y="150" width="330" height="65" fill="#fef3c7" stroke="#f59e0b" class="card"/>
+    <text x="55" y="173" class="hdr">TOAST B-Tree Index (O(log N))</text>
+    <text x="55" y="193" class="code">Key: (chunk_id OID, chunk_seq INT32) -&gt; Heap TID</text>
+
+    <!-- Arrow to chunks -->
+    <path d="M 205 215 L 205 250" class="arrow"/>
+
+    <!-- TOAST Heap chunks -->
+    <rect x="20" y="255" width="370" height="95" fill="#f1f5f9" stroke="#94a3b8" class="card"/>
+    <text x="35" y="278" class="hdr">TOAST Heap Storage</text>
+    <text x="35" y="298" class="code">Chunk 0: [chunk_id, chunk_seq, chunk_data (2KB)]</text>
+    <text x="35" y="318" class="code">Chunk 1: [chunk_id, chunk_seq, chunk_data (2KB)]</text>
+    <text x="35" y="338" class="lbl" fill="#b91c1c">⚠️ Updates/Deletes cause dead tuples &amp; index bloat</text>
+
+    <text x="20" y="380" class="lbl" fill="#dc2626">• Requires B-Tree lookup for every chunk</text>
+    <text x="20" y="398" class="lbl" fill="#dc2626">• TOAST table vacuum requires full index cleanup</text>
+  </g>
+
+  <!-- Right Side: Direct TOAST -->
+  <g transform="translate(480, 25)">
+    <rect x="0" y="0" width="410" height="405" fill="#ffffff" stroke="#cbd5e1" class="card"/>
+    <text x="20" y="30" class="hdr" fill="#15803d">Direct TOAST (Direct TID Addressing)</text>
+
+    <!-- Main table heap -->
+    <rect x="20" y="50" width="370" height="60" fill="#dcfce7" stroke="#22c55e" class="card"/>
+    <text x="35" y="73" class="hdr">Main Heap Tuple</text>
+    <text x="35" y="93" class="code">varatt_direct: [rawsize, extinfo, ItemPointerData (TID)]</text>
+
+    <!-- Direct arrows to chunks bypassing index -->
+    <path d="M 120 110 L 80 185" class="arrow"/>
+    <path d="M 205 110 L 205 185" class="arrow"/>
+    <path d="M 290 110 L 330 185" class="arrow"/>
+
+    <!-- Direct TOAST Heap Chunks -->
+    <rect x="20" y="190" width="370" height="160" fill="#f0fdf4" stroke="#86efac" class="card"/>
+    <text x="35" y="213" class="hdr">Direct TOAST Heap (Index-Free Addressing)</text>
+
+    <rect x="35" y="225" width="95" height="50" fill="#ffffff" stroke="#22c55e" class="card"/>
+    <text x="82" y="245" text-anchor="middle" class="code">Single Chunk</text>
+    <text x="82" y="262" text-anchor="middle" class="lbl">Direct TID</text>
+
+    <rect x="140" y="225" width="105" height="50" fill="#ffffff" stroke="#22c55e" class="card"/>
+    <text x="192" y="245" text-anchor="middle" class="code">Flat Array</text>
+    <text x="192" y="262" text-anchor="middle" class="lbl">TID[ ] in chunk 0</text>
+
+    <rect x="255" y="225" width="120" height="50" fill="#ffffff" stroke="#22c55e" class="card"/>
+    <text x="315" y="245" text-anchor="middle" class="code">Hierarchical DAG</text>
+    <text x="315" y="262" text-anchor="middle" class="lbl">Multi-level offsets</text>
+
+    <text x="35" y="300" class="code" fill="#15803d">Self-Pruning: LP_UNUSED immediately on overwrite</text>
+    <text x="35" y="320" class="lbl" fill="#166534">✓ Direct O(1) page access via ItemPointer (Block, Offset)</text>
+    <text x="35" y="338" class="lbl" fill="#166534">✓ Fast arbitrary chunk slicing without scanning whole datum</text>
+
+    <text x="20" y="380" class="lbl" fill="#15803d">• 2x-5x faster detoasting and bulk insert performance</text>
+    <text x="20" y="398" class="lbl" fill="#15803d">• Zero B-Tree overhead and zero unpruned TOAST bloat</text>
+  </g>
+</svg>

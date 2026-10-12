@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 380" width="100%" height="100%">
+  <defs>
+    <style>
+      .hdr { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: bold; font-size: 15px; fill: #0f172a; }
+      .lbl { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #334155; }
+      .code { font-family: monospace; font-size: 11px; fill: #0f172a; }
+      .box { rx: 6px; ry: 6px; stroke-width: 1.5; }
+      .arr { stroke: #64748b; stroke-width: 2; fill: none; marker-end: url(#ah); }
+    </style>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+
+  <text x="40" y="32" class="hdr" font-size="17">Pluggable Encoding Contexts &amp; pg_cascade Multi-Stage Pipeline</text>
+
+  <!-- Step 1: Raw Datum -->
+  <g transform="translate(40, 70)">
+    <rect x="0" y="0" width="140" height="150" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="15" y="28" class="hdr" fill="#334155">Raw Datum</text>
+    <rect x="15" y="45" width="110" height="70" fill="#f1f5f9" stroke="#94a3b8" class="box"/>
+    <text x="70" y="75" text-anchor="middle" class="code">JSON / Array /</text>
+    <text x="70" y="93" text-anchor="middle" class="code">Timeseries</text>
+    <text x="15" y="135" class="lbl">Size: 100 KB</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M 180 145 L 220 145" class="arr"/>
+
+  <!-- Step 2: Stage 1 Domain Encoding (Avro / Bitpack) -->
+  <g transform="translate(230, 70)">
+    <rect x="0" y="0" width="180" height="150" fill="#f0fdf4" stroke="#22c55e" class="box"/>
+    <text x="15" y="28" class="hdr" fill="#15803d">Stage 1: pg_avro</text>
+    <rect x="15" y="45" width="150" height="70" fill="#ffffff" stroke="#86efac" class="box"/>
+    <text x="90" y="72" text-anchor="middle" class="code">Domain Encoding</text>
+    <text x="90" y="90" text-anchor="middle" class="lbl">Varint / ZigZag /</text>
+    <text x="90" y="105" text-anchor="middle" class="lbl">Schema Structural</text>
+    <text x="15" y="135" class="lbl" fill="#166534">Size: 45 KB (-55%)</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M 410 145 L 450 145" class="arr"/>
+
+  <!-- Step 3: Stage 2 General Compression (Zstandard / LZ4) -->
+  <g transform="translate(460, 70)">
+    <rect x="0" y="0" width="180" height="150" fill="#eff6ff" stroke="#3b82f6" class="box"/>
+    <text x="15" y="28" class="hdr" fill="#1d4ed8">Stage 2: pg_zstd</text>
+    <rect x="15" y="45" width="150" height="70" fill="#ffffff" stroke="#93c5fd" class="box"/>
+    <text x="90" y="72" text-anchor="middle" class="code">Block Compression</text>
+    <text x="90" y="90" text-anchor="middle" class="lbl">Trained Dictionary +</text>
+    <text x="90" y="105" text-anchor="middle" class="lbl">Entropy Coding</text>
+    <text x="15" y="135" class="lbl" fill="#1e40af">Size: 12 KB (-88%)</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M 640 145 L 680 145" class="arr"/>
+
+  <!-- Step 4: Direct TOAST Storage -->
+  <g transform="translate(690, 70)">
+    <rect x="0" y="0" width="170" height="150" fill="#fdf4ff" stroke="#d946ef" class="box"/>
+    <text x="15" y="28" class="hdr" fill="#a21caf">Storage Engine</text>
+    <rect x="15" y="45" width="140" height="70" fill="#ffffff" stroke="#f0abfc" class="box"/>
+    <text x="85" y="72" text-anchor="middle" class="code">Direct TOAST</text>
+    <text x="85" y="90" text-anchor="middle" class="lbl">VARTAG_DIRECT</text>
+    <text x="85" y="105" text-anchor="middle" class="lbl">TID Pointer</text>
+    <text x="15" y="135" class="lbl" fill="#86198f">In-place &amp; sliceable</text>
+  </g>
+
+  <!-- Bottom Explanatory Banner -->
+  <g transform="translate(40, 245)">
+    <rect x="0" y="0" width="820" height="95" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="20" y="26" class="hdr" fill="#0f172a">Managed via DDL &amp; Catalogs (pg_encoding_type &amp; pg_encoding_context):</text>
+    <text x="20" y="48" class="code">CREATE ENCODING CONTEXT cascade_ctx (ENCODING TYPE cascade, OPTIONS (stage1 'avro', stage2 'zstd'));</text>
+    <text x="20" y="68" class="code">ALTER TABLE events ALTER COLUMN payload SET ENCODING CONTEXT cascade_ctx;</text>
+    <text x="20" y="86" class="lbl" fill="#64748b">Transparent decoding and slicing on demand during query execution.</text>
+  </g>
+</svg>

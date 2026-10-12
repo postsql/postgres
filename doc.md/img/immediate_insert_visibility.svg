@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" width="100%" height="100%">
+  <defs>
+    <style>
+      .hdr { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: bold; font-size: 15px; fill: #0f172a; }
+      .lbl { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #334155; }
+      .code { font-family: monospace; font-size: 11px; fill: #0f172a; }
+      .box { rx: 6px; ry: 6px; stroke-width: 1.5; }
+      .arr { stroke: #64748b; stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+    </style>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+
+  <text x="40" y="30" class="hdr" font-size="17">Immediate Insert Visibility: Zero-Latency Ingestion &amp; Streaming</text>
+
+  <!-- Top: Standard MVCC Flow -->
+  <g transform="translate(40, 55)">
+    <rect x="0" y="0" width="820" height="150" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="20" y="25" class="hdr" fill="#b91c1c">Standard PostgreSQL MVCC Model</text>
+
+    <!-- Timeline blocks -->
+    <rect x="20" y="45" width="220" height="50" fill="#fee2e2" stroke="#ef4444" class="box"/>
+    <text x="35" y="65" class="code">Session A: INSERT INTO tbl ...</text>
+    <text x="35" y="83" class="lbl" fill="#b91c1c">xmin = active XID (uncommitted)</text>
+
+    <path d="M 240 70 L 310 70" class="arr"/>
+
+    <rect x="310" y="45" width="250" height="50" fill="#f1f5f9" stroke="#94a3b8" class="box"/>
+    <text x="325" y="65" class="code">Session B: SELECT * FROM tbl</text>
+    <text x="325" y="83" class="lbl" fill="#64748b">BLOCKED / HIDDEN: Row is invisible!</text>
+
+    <path d="M 560 70 L 630 70" class="arr"/>
+
+    <rect x="630" y="45" width="170" height="50" fill="#fef3c7" stroke="#f59e0b" class="box"/>
+    <text x="645" y="65" class="code">Session A: COMMIT</text>
+    <text x="645" y="83" class="lbl" fill="#b45309">Visible only now</text>
+
+    <text x="20" y="125" class="lbl" fill="#991b1b">⚠️ High latency for streaming pipelines; requires frequent COMMIT overhead or uncommitted transaction stalls.</text>
+  </g>
+
+  <!-- Bottom: Immediate Insert Visibility -->
+  <g transform="translate(40, 225)">
+    <rect x="0" y="0" width="820" height="170" fill="#ffffff" stroke="#22c55e" class="box"/>
+    <text x="20" y="25" class="hdr" fill="#15803d">Immediate Insert Visibility (SET immediate_insert_visibility = on)</text>
+
+    <rect x="20" y="45" width="280" height="55" fill="#dcfce7" stroke="#22c55e" class="box"/>
+    <text x="35" y="65" class="code">Session A: INSERT INTO tbl ...</text>
+    <text x="35" y="83" class="code" fill="#15803d">xmin = FrozenXID | COMMITTED</text>
+    <text x="35" y="94" class="lbl" fill="#166534">Directly stamped as committed</text>
+
+    <path d="M 300 72 L 370 72" class="arr"/>
+
+    <rect x="370" y="45" width="280" height="55" fill="#f0fdf4" stroke="#16a34a" class="box"/>
+    <text x="385" y="65" class="code">Session B: SELECT * FROM tbl</text>
+    <text x="385" y="83" class="code" fill="#16a34a">INSTANTLY VISIBLE (0 ms lag!)</text>
+    <text x="385" y="94" class="lbl" fill="#166534">Reader snapshot sees tuple right away</text>
+
+    <rect x="670" y="45" width="130" height="55" fill="#bae6fd" stroke="#0284c7" class="box"/>
+    <text x="680" y="65" class="code">Sync Flush</text>
+    <text x="680" y="83" class="lbl">Optional</text>
+    <text x="680" y="94" class="lbl">wal_flush=on</text>
+
+    <text x="20" y="130" class="lbl" fill="#166534">✓ Perfect for telemetry, sensor streams, logging tables, real-time metrics, and lock-free append-only message queues.</text>
+    <text x="20" y="148" class="lbl" fill="#166534">✓ Decouples read visibility latency from writer transaction commit boundaries.</text>
+  </g>
+</svg>

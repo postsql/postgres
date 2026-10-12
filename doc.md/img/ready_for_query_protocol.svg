@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 850 360" width="100%" height="100%">
+  <defs>
+    <style>
+      .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-weight: bold; font-size: 16px; fill: #1e293b; }
+      .label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12px; fill: #334155; }
+      .code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 11px; fill: #0f172a; }
+      .box { rx: 6px; ry: 6px; stroke-width: 1.5; }
+      .arrow { stroke: #64748b; stroke-width: 1.5; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+
+  <!-- Standard RFQ -->
+  <g transform="translate(40, 30)">
+    <text x="0" y="0" class="title">Standard ReadyForQuery ('Z') - 5 Bytes</text>
+    <g transform="translate(0, 20)">
+      <rect x="0" y="0" width="60" height="45" fill="#e2e8f0" stroke="#94a3b8" class="box"/>
+      <text x="30" y="22" text-anchor="middle" class="code">'Z' (1B)</text>
+      <text x="30" y="36" text-anchor="middle" class="label">Type</text>
+
+      <rect x="70" y="0" width="100" height="45" fill="#e2e8f0" stroke="#94a3b8" class="box"/>
+      <text x="120" y="22" text-anchor="middle" class="code">Int32(5) (4B)</text>
+      <text x="120" y="36" text-anchor="middle" class="label">Length</text>
+
+      <rect x="180" y="0" width="90" height="45" fill="#fed7aa" stroke="#f97316" class="box"/>
+      <text x="225" y="22" text-anchor="middle" class="code">'I'/'T'/'E' (1B)</text>
+      <text x="225" y="36" text-anchor="middle" class="label">Tx Status</text>
+    </g>
+  </g>
+
+  <!-- Rich RFQ -->
+  <g transform="translate(40, 140)">
+    <text x="0" y="0" class="title">Extended Rich ReadyForQuery - Variable Length Body with Session Metadata</text>
+    <g transform="translate(0, 20)">
+      <!-- Standard header -->
+      <rect x="0" y="0" width="50" height="50" fill="#e2e8f0" stroke="#94a3b8" class="box"/>
+      <text x="25" y="24" text-anchor="middle" class="code">'Z'</text>
+      <text x="25" y="39" text-anchor="middle" class="label">Type</text>
+
+      <rect x="58" y="0" width="90" height="50" fill="#e2e8f0" stroke="#94a3b8" class="box"/>
+      <text x="103" y="24" text-anchor="middle" class="code">Int32(5+N)</text>
+      <text x="103" y="39" text-anchor="middle" class="label">Length</text>
+
+      <rect x="156" y="0" width="70" height="50" fill="#fed7aa" stroke="#f97316" class="box"/>
+      <text x="191" y="24" text-anchor="middle" class="code">'I'/'T'/'E'</text>
+      <text x="191" y="39" text-anchor="middle" class="label">Tx Status</text>
+
+      <!-- Key-Value metadata pairs -->
+      <rect x="236" y="0" width="95" height="50" fill="#bbf7d0" stroke="#22c55e" class="box"/>
+      <text x="283" y="20" text-anchor="middle" class="code">k:'T' v:'1'/'0'</text>
+      <text x="283" y="37" text-anchor="middle" class="label">Temp Tables</text>
+
+      <rect x="341" y="0" width="95" height="50" fill="#bbf7d0" stroke="#22c55e" class="box"/>
+      <text x="388" y="20" text-anchor="middle" class="code">k:'H' v:'1'/'0'</text>
+      <text x="388" y="37" text-anchor="middle" class="label">Hold Cursors</text>
+
+      <rect x="446" y="0" width="95" height="50" fill="#bbf7d0" stroke="#22c55e" class="box"/>
+      <text x="493" y="20" text-anchor="middle" class="code">k:'P' v:'1'/'0'</text>
+      <text x="493" y="37" text-anchor="middle" class="label">Prep Stmts</text>
+
+      <rect x="551" y="0" width="105" height="50" fill="#bae6fd" stroke="#0284c7" class="box"/>
+      <text x="603" y="20" text-anchor="middle" class="code">k:'l' v:[8B LSN]</text>
+      <text x="603" y="37" text-anchor="middle" class="label">Commit LSN</text>
+
+      <rect x="666" y="0" width="105" height="50" fill="#e9d5ff" stroke="#a855f7" stroke-dasharray="4,3" class="box"/>
+      <text x="718" y="20" text-anchor="middle" class="code">Extension KV</text>
+      <text x="718" y="37" text-anchor="middle" class="label">Hook Payloads</text>
+    </g>
+  </g>
+
+  <!-- Benefits Banner -->
+  <g transform="translate(40, 245)">
+    <rect x="0" y="0" width="770" height="85" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="20" y="26" class="title" fill="#0369a1">Connection Pooler &amp; Proxy Optimizations (PgBouncer, Envoy, Odyssey):</text>
+    <text x="20" y="48" class="label">• Zero-overhead transaction-level pooling: immediately knows if temp tables, hold cursors, or prepared stmts exist.</text>
+    <text x="20" y="66" class="label">• C hook (`ReadyForQueryHook`) allows zero-round-trip causality tracking and replica routing based on commit LSN.</text>
+  </g>
+</svg>

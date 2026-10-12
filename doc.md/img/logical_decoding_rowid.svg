@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 390" width="100%" height="100%">
+  <defs>
+    <style>
+      .hdr { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: bold; font-size: 15px; fill: #0f172a; }
+      .lbl { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #334155; }
+      .code { font-family: monospace; font-size: 11px; fill: #0f172a; }
+      .box { rx: 6px; ry: 6px; stroke-width: 1.5; }
+      .arr { stroke: #64748b; stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+    </style>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+
+  <text x="40" y="30" class="hdr" font-size="17">Logical Replication with REPLICA IDENTITY ROWID &amp; Index-Only Primary Key</text>
+
+  <!-- Publisher Side -->
+  <g transform="translate(40, 60)">
+    <rect x="0" y="0" width="240" height="230" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="15" y="25" class="hdr" fill="#0284c7">Publisher (Source DB)</text>
+    <text x="15" y="45" class="lbl">Table has NO Primary Key!</text>
+
+    <rect x="15" y="60" width="210" height="75" fill="#f0f9ff" stroke="#7dd3fc" class="box"/>
+    <text x="25" y="80" class="code">ALTER TABLE events</text>
+    <text x="25" y="96" class="code">REPLICA IDENTITY ROWID;</text>
+    <text x="25" y="120" class="lbl" fill="#0369a1">Exposes physical ctid as virtual</text>
+    <text x="25" y="132" class="code" fill="#0369a1">.rowid TID</text>
+
+    <text x="15" y="170" class="lbl">• INSERT: sends new .rowid</text>
+    <text x="15" y="188" class="lbl">• UPDATE: sends old .rowid key</text>
+    <text x="15" y="206" class="lbl">• DELETE: sends old .rowid key</text>
+  </g>
+
+  <!-- Wire Protocol CDC Stream -->
+  <path d="M 280 175 L 340 175" class="arr"/>
+
+  <g transform="translate(340, 105)">
+    <rect x="0" y="0" width="200" height="140" fill="#fdf4ff" stroke="#d946ef" class="box"/>
+    <text x="15" y="25" class="hdr" fill="#a21caf">Logical Replication Wire</text>
+    <text x="15" y="45" class="lbl">pgoutput Protocol:</text>
+    <rect x="15" y="55" width="170" height="40" fill="#ffffff" stroke="#f0abfc" class="box"/>
+    <text x="25" y="75" class="code">Relation: col '.rowid'</text>
+    <text x="25" y="88" class="lbl">FLAG: REPLICA_IDENTITY</text>
+
+    <text x="15" y="115" class="code">Key: (0, 12) -&gt; Target</text>
+  </g>
+
+  <!-- Subscriber Side -->
+  <path d="M 540 175 L 600 175" class="arr"/>
+
+  <g transform="translate(600, 60)">
+    <rect x="0" y="0" width="260" height="230" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="15" y="25" class="hdr" fill="#15803d">Subscriber (Target DB)</text>
+    <text x="15" y="45" class="lbl">Zero-Bloat Index-Only Rowid:</text>
+
+    <rect x="15" y="60" width="230" height="85" fill="#f0fdf4" stroke="#86efac" class="box"/>
+    <text x="25" y="80" class="code">Index: idx_rowid ON tbl(.rowid)</text>
+    <text x="25" y="98" class="code" fill="#15803d">Heap Tuple: desc-&gt;natts - 1</text>
+    <text x="25" y="115" class="lbl" fill="#166534">0 bytes stored in heap for .rowid!</text>
+    <text x="25" y="130" class="lbl" fill="#166534">Fast O(log N) CDC index lookup</text>
+
+    <text x="15" y="170" class="lbl">• Zero table rewrite upon migration</text>
+    <text x="15" y="188" class="lbl">• Instant drop: DROP INDEX / COLUMN</text>
+    <text x="15" y="206" class="lbl">• Zero VACUUM FULL required</text>
+  </g>
+
+  <!-- Bottom Banner -->
+  <g transform="translate(40, 310)">
+    <rect x="0" y="0" width="820" height="60" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="20" y="24" class="hdr" fill="#0f172a">Solves the Missing Primary Key Dilemma in PostgreSQL Replication:</text>
+    <text x="20" y="44" class="lbl">Replicate tables without primary keys efficiently, avoiding FULL table scans on every UPDATE/DELETE.</text>
+  </g>
+</svg>

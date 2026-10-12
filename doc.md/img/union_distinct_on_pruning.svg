@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 400" width="100%" height="100%">
+  <defs>
+    <style>
+      .hdr { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: bold; font-size: 15px; fill: #0f172a; }
+      .lbl { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #334155; }
+      .code { font-family: monospace; font-size: 11px; fill: #0f172a; }
+      .box { rx: 6px; ry: 6px; stroke-width: 1.5; }
+      .arr { stroke: #64748b; stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+    </style>
+    <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+
+  <text x="40" y="30" class="hdr" font-size="17">Dynamic State-Space Pruning: WITH RECURSIVE ... UNION DISTINCT ON (node ORDER BY cost)</text>
+
+  <!-- Step 1: WorkTable Queue -->
+  <g transform="translate(40, 60)">
+    <rect x="0" y="0" width="220" height="230" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="15" y="25" class="hdr" fill="#0284c7">1. Recursive WorkTable</text>
+    <text x="15" y="45" class="lbl">Tuples queued for expansion:</text>
+
+    <rect x="15" y="60" width="190" height="35" fill="#e0f2fe" stroke="#38bdf8" class="box"/>
+    <text x="25" y="82" class="code">Node: B, Cost: 10 (Path: A-B)</text>
+
+    <rect x="15" y="105" width="190" height="35" fill="#fef08a" stroke="#eab308" class="box"/>
+    <text x="25" y="127" class="code">Node: C, Cost: 14 (Path: A-C)</text>
+
+    <rect x="15" y="150" width="190" height="35" fill="#bbf7d0" stroke="#22c55e" class="box"/>
+    <text x="25" y="172" class="code">Node: B, Cost: 7  (Better!)</text>
+
+    <text x="15" y="210" class="lbl" fill="#0369a1">Fetches &amp; evaluates next step</text>
+  </g>
+
+  <!-- Arrow to evaluation -->
+  <path d="M 260 175 L 310 175" class="arr"/>
+
+  <!-- Step 2: DistinctOn Hash Table -->
+  <g transform="translate(320, 60)">
+    <rect x="0" y="0" width="260" height="230" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="15" y="25" class="hdr" fill="#9333ea">2. DISTINCT ON Hash Table</text>
+    <text x="15" y="45" class="lbl">Tracks best known tuple per key:</text>
+
+    <rect x="15" y="60" width="230" height="65" fill="#fdf4ff" stroke="#d946ef" class="box"/>
+    <text x="25" y="80" class="code">Key: Node B</text>
+    <text x="25" y="97" class="code" fill="#dc2626">Old Cost: 10 (Evicted &amp; replaced)</text>
+    <text x="25" y="114" class="code" fill="#16a34a">New Cost: 7  (Best so far!)</text>
+
+    <rect x="15" y="135" width="230" height="40" fill="#f8fafc" stroke="#94a3b8" class="box"/>
+    <text x="25" y="155" class="code">Key: Node C -&gt; Best Cost: 14</text>
+
+    <text x="15" y="200" class="lbl" fill="#7e22ce">• Better sort key: Replaces hash entry</text>
+    <text x="15" y="217" class="lbl" fill="#dc2626">• Worse sort key: Pruned immediately!</text>
+  </g>
+
+  <!-- Arrow to decision -->
+  <path d="M 580 175 L 630 175" class="arr"/>
+
+  <!-- Step 3: Re-expansion & Results -->
+  <g transform="translate(640, 60)">
+    <rect x="0" y="0" width="200" height="230" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="15" y="25" class="hdr" fill="#16a34a">3. Output &amp; Loop</text>
+
+    <rect x="15" y="60" width="170" height="45" fill="#dcfce7" stroke="#22c55e" class="box"/>
+    <text x="25" y="80" class="code">Re-queue into WT:</text>
+    <text x="25" y="96" class="lbl">Node B (Cost 7) re-expands</text>
+
+    <rect x="15" y="115" width="170" height="45" fill="#f1f5f9" stroke="#94a3b8" class="box"/>
+    <text x="25" y="135" class="code">Tuplestore Buffer:</text>
+    <text x="25" y="151" class="lbl">Emits final minimal path</text>
+
+    <text x="15" y="190" class="lbl" fill="#15803d">Guarantees termination &amp;</text>
+    <text x="15" y="207" class="lbl" fill="#15803d">optimal state discovery</text>
+  </g>
+
+  <!-- Bottom Banner -->
+  <g transform="translate(40, 310)">
+    <rect x="0" y="0" width="800" height="65" fill="#ffffff" stroke="#cbd5e1" class="box"/>
+    <text x="20" y="25" class="hdr" fill="#0f172a">Powering Graph Search (Dijkstra, A*, Shortest Paths) in Standard SQL:</text>
+    <text x="20" y="47" class="lbl">Eliminates combinatorial explosion and infinite cycle loops by pruning dominated paths during recursion.</text>
+  </g>
+</svg>
