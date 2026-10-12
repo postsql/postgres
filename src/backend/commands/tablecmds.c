@@ -20270,6 +20270,22 @@ AtAutonomousCommit_on_commit_actions(SubTransactionId mySubid)
 	}
 }
 
+bool
+OnCommitHasSubXactActions(SubTransactionId targetSubid)
+{
+	ListCell   *cur_item;
+
+	foreach(cur_item, on_commits)
+	{
+		OnCommitItem *oc = (OnCommitItem *) lfirst(cur_item);
+
+		if (oc->creating_subid >= targetSubid ||
+			oc->deleting_subid >= targetSubid)
+			return true;
+	}
+	return false;
+}
+
 /*
  * This is intended as a callback for RangeVarGetRelidExtended().  It allows
  * the relation to be locked only if (1) it's a plain or partitioned table,

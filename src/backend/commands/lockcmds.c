@@ -42,6 +42,9 @@ LockTableCommand(LockStmt *lockstmt)
 {
 	ListCell   *p;
 
+	if (IsSubTransaction())
+		RecordSubTransactionExplicitLock();
+
 	/*
 	 * Iterate over the list and process the named relations one at a time
 	 */

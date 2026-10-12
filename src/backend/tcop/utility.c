@@ -375,6 +375,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 					case TRANS_STMT_START:
 					case TRANS_STMT_COMMIT:
 					case TRANS_STMT_COMMIT_AUTONOMOUS:
+					case TRANS_STMT_COMMIT_SAVEPOINT:
 					case TRANS_STMT_ROLLBACK:
 					case TRANS_STMT_ROLLBACK_AUTONOMOUS:
 					case TRANS_STMT_SAVEPOINT:
@@ -713,6 +714,11 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 					case TRANS_STMT_RELEASE:
 						RequireTransactionBlock(isTopLevel, "RELEASE SAVEPOINT");
 						ReleaseSavepoint(stmt->savepoint_name);
+						break;
+
+					case TRANS_STMT_COMMIT_SAVEPOINT:
+						RequireTransactionBlock(isTopLevel, "COMMIT SAVEPOINT");
+						CommitSavepoint(stmt->savepoint_name);
 						break;
 
 					case TRANS_STMT_ROLLBACK_TO:
@@ -2478,6 +2484,7 @@ CreateCommandTag(Node *parsetree)
 
 					case TRANS_STMT_COMMIT:
 					case TRANS_STMT_COMMIT_AUTONOMOUS:
+					case TRANS_STMT_COMMIT_SAVEPOINT:
 						tag = CMDTAG_COMMIT;
 						break;
 

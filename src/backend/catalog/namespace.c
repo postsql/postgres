@@ -4658,6 +4658,13 @@ AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 	}
 }
 
+bool
+NamespaceHasSubXactChanges(SubTransactionId targetSubid)
+{
+	return (myTempNamespaceSubID != InvalidSubTransactionId &&
+			myTempNamespaceSubID >= targetSubid);
+}
+
 /*
  * Remove all relations in the specified temp namespace.
  *

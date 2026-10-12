@@ -202,6 +202,7 @@ extern Oid	GetNextTempTableSpace(void);
 extern void AtEOXact_Files(bool isCommit);
 extern void AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
 							  SubTransactionId parentSubid);
+extern bool FilesHasSubXactAllocatedDescs(SubTransactionId targetSubid);
 extern void RemovePgTempFiles(void);
 extern void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok,
 								   bool unlink_all);

@@ -2020,6 +2020,9 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	 * its XID.  Treat it as not in progress so the enclosing transaction
 	 * continues to see its own committed savepoint's changes.
 	 */
+	if (TransactionIdIsCommittedSavepointTransactionId(xid))
+		return false;
+
 	/*
 	 * Make a quick range check to eliminate most XIDs without looking at the
 	 * xip arrays.  Note that this is OK even if we convert a subxact XID to

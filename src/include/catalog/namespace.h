@@ -199,6 +199,7 @@ extern void InitializeSearchPath(void);
 extern void AtEOXact_Namespace(bool isCommit, bool parallel);
 extern void AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 								  SubTransactionId parentSubid);
+extern bool NamespaceHasSubXactChanges(SubTransactionId targetSubid);
 
 /* stuff for search_path GUC variable */
 extern PGDLLIMPORT char *namespace_search_path;

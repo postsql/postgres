@@ -11451,6 +11451,33 @@ TransactionStmt:
 					n->location = @2;
 					$$ = (Node *) n;
 				}
+			| COMMIT SAVEPOINT ColId
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_COMMIT_SAVEPOINT;
+					n->savepoint_name = $3;
+					n->location = @3;
+					$$ = (Node *) n;
+				}
+			| COMMIT opt_transaction TO SAVEPOINT ColId
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_COMMIT_SAVEPOINT;
+					n->savepoint_name = $5;
+					n->location = @5;
+					$$ = (Node *) n;
+				}
+			| COMMIT opt_transaction TO ColId
+				{
+					TransactionStmt *n = makeNode(TransactionStmt);
+
+					n->kind = TRANS_STMT_COMMIT_SAVEPOINT;
+					n->savepoint_name = $4;
+					n->location = @4;
+					$$ = (Node *) n;
+				}
 			| ROLLBACK opt_transaction TO SAVEPOINT ColId
 				{
 					TransactionStmt *n = makeNode(TransactionStmt);

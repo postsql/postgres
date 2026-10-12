@@ -3196,6 +3196,17 @@ AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
 	}
 }
 
+bool
+FilesHasSubXactAllocatedDescs(SubTransactionId targetSubid)
+{
+	for (int i = 0; i < numAllocatedDescs; i++)
+	{
+		if (allocatedDescs[i].create_subid >= targetSubid)
+			return true;
+	}
+	return false;
+}
+
 /*
  * AtEOXact_Files
  *

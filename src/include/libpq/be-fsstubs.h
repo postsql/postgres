@@ -28,5 +28,6 @@ extern int	lo_write(int fd, const char *buf, int len);
 extern void AtEOXact_LargeObject(bool isCommit);
 extern void AtEOSubXact_LargeObject(bool isCommit, SubTransactionId mySubid,
 									SubTransactionId parentSubid);
+extern bool LargeObjectHasSubXactBlockers(SubTransactionId targetSubid);
 
 #endif							/* BE_FSSTUBS_H */

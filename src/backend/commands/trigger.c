@@ -5626,6 +5626,50 @@ AfterTriggerEndAutonomousSubXact(bool isCommit)
 }
 
 /*
+ * AfterTriggerHasSubXactBlockers()
+ *
+ *	Return true if any subtransaction at or below targetLevel has queued
+ *	deferred after-trigger events, executed SET CONSTRAINTS, or fired
+ *	previously queued deferred triggers.
+ */
+bool
+AfterTriggerHasSubXactBlockers(int targetLevel)
+{
+	int			my_level = GetCurrentTransactionNestLevel();
+	CommandId	subxact_firing_id;
+	AfterTriggerEvent event;
+	AfterTriggerEventChunk *chunk;
+
+	if (targetLevel >= afterTriggers.maxtransdepth)
+		return false;
+
+	/* Any new deferred trigger events queued since targetLevel began? */
+	if (afterTriggers.events.tail != afterTriggers.trans_stack[targetLevel].events.tail ||
+		afterTriggers.events.tailfree != afterTriggers.trans_stack[targetLevel].events.tailfree)
+		return true;
+
+	/* Any SET CONSTRAINTS executed at or below targetLevel? */
+	for (int level = targetLevel; level <= my_level && level < afterTriggers.maxtransdepth; level++)
+	{
+		if (afterTriggers.trans_stack[level].state != NULL)
+			return true;
+	}
+
+	/* Any parent deferred events fired inside targetLevel? */
+	subxact_firing_id = afterTriggers.trans_stack[targetLevel].firing_counter;
+	for_each_event_chunk(event, chunk, afterTriggers.events)
+	{
+		AfterTriggerShared evtshared = GetTriggerSharedData(event);
+
+		if ((event->ate_flags & (AFTER_TRIGGER_DONE | AFTER_TRIGGER_IN_PROGRESS)) &&
+			evtshared->ats_firing_id >= subxact_firing_id)
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * Get the transition table for the given event and depending on whether we are
  * processing the old or the new tuple.
  */

@@ -3843,6 +3843,7 @@ typedef enum TransactionStmtKind
 	TRANS_STMT_BEGIN_AUTONOMOUS,
 	TRANS_STMT_COMMIT_AUTONOMOUS,
 	TRANS_STMT_ROLLBACK_AUTONOMOUS,
+	TRANS_STMT_COMMIT_SAVEPOINT,
 } TransactionStmtKind;
 
 typedef struct TransactionStmt

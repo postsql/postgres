@@ -55,6 +55,8 @@ extern void ForgetInplace_Inval(void);
 
 extern void AtEOSubXact_Inval(bool isCommit);
 extern void AtAutonomousCommit_Inval(void);
+extern bool InvalHasSubXactChanges(int targetLevel);
+extern bool InvalHasAncestorChanges(int minLevel, int targetLevel);
 
 extern void PostPrepare_Inval(void);
 

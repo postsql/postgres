@@ -179,6 +179,7 @@ typedef enum TBlockState
 	TBLOCK_SUBINPROGRESS,		/* live subtransaction */
 	TBLOCK_SUBRELEASE,			/* RELEASE received */
 	TBLOCK_SUBCOMMIT,			/* COMMIT received while TBLOCK_SUBINPROGRESS */
+	TBLOCK_SUBCOMMIT_SAVEPOINT, /* COMMIT SAVEPOINT received */
 	TBLOCK_SUBABORT,			/* failed subxact, awaiting ROLLBACK */
 	TBLOCK_SUBABORT_END,		/* failed subxact, ROLLBACK received */
 	TBLOCK_SUBABORT_PENDING,	/* live subxact, ROLLBACK received */
@@ -213,6 +214,11 @@ typedef struct TransactionStateData
 	TransactionId *childXids;	/* subcommitted child XIDs, in XID order */
 	int			nChildXids;		/* # of subcommitted child XIDs */
 	int			maxChildXids;	/* allocated size of childXids[] */
+	TransactionId *committedSavepointXids;	/* XIDs committed via COMMIT SAVEPOINT */
+	int			nCommittedSavepointXids;
+	int			maxCommittedSavepointXids;
+	int			minModifiedAncestorLevel;	/* min ancestor level whose tuples we modified/locked */
+	bool		hasExplicitLock;	/* did this subxact execute LOCK TABLE? */
 	Oid			prevUser;		/* previous CurrentUserId setting */
 	int			prevSecContext; /* previous SecurityRestrictionContext */
 	bool		prevXactReadOnly;	/* entry-time xact r/o state */
@@ -248,6 +254,7 @@ typedef struct SerializedTransactionState
 	FullTransactionId currentFullTransactionId;
 	CommandId	currentCommandId;
 	int			nParallelCurrentXids;
+	int			nParallelCommittedSavepointXids;
 	TransactionId parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];
 } SerializedTransactionState;
 
@@ -372,6 +379,9 @@ static void StartSubTransaction(void);
 static void StartAutonomousSubTransaction(void);
 static void CommitSubTransaction(void);
 static void CommitAutonomousSubTransaction(void);
+static void CommitSavepointSubTransaction(void);
+static void CheckCommitSavepointBlockers(TransactionState target);
+static void RecordCommittedSavepointXids(TransactionState s);
 static TransactionId RecordSubTransactionCommit(void);
 static void AbortSubTransaction(void);
 static void CleanupSubTransaction(void);
@@ -972,6 +982,119 @@ GetCurrentTransactionNestLevel(void)
 
 	return s->nestingLevel;
 }
+
+/*
+ *	GetCurrentTransactionIdNestLevel
+ *
+ * If xid belongs to the current transaction or one of its ancestors (or their
+ * subcommitted children) within the current autonomous transaction boundary,
+ * return the nestingLevel of the TransactionState that owns xid.  Otherwise
+ * return 0.
+ */
+int
+GetCurrentTransactionIdNestLevel(TransactionId xid)
+{
+	TransactionState s;
+
+	if (!TransactionIdIsNormal(xid))
+		return 0;
+
+	for (s = CurrentTransactionState; s != NULL; s = s->parent)
+	{
+		if (s->state != TRANS_ABORT &&
+			FullTransactionIdIsValid(s->fullTransactionId))
+		{
+			int			low,
+						high;
+
+			if (TransactionIdEquals(xid, XidFromFullTransactionId(s->fullTransactionId)))
+				return s->nestingLevel;
+			low = 0;
+			high = s->nChildXids - 1;
+			while (low <= high)
+			{
+				int			middle;
+				TransactionId probe;
+
+				middle = low + (high - low) / 2;
+				probe = s->childXids[middle];
+				if (TransactionIdEquals(probe, xid))
+					return s->nestingLevel;
+				else if (TransactionIdPrecedes(probe, xid))
+					low = middle + 1;
+				else
+					high = middle - 1;
+			}
+		}
+
+		if (s->isAutonomous)
+			break;
+	}
+
+	return 0;
+}
+
+/*
+ *	RecordSubTransactionModifiedAncestorLevel
+ *
+ * Record that the current subtransaction has modified or locked a tuple
+ * created or modified by an ancestor at ancestorLevel.
+ */
+void
+RecordSubTransactionModifiedAncestorLevel(int ancestorLevel)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (ancestorLevel > 0 && ancestorLevel < s->nestingLevel)
+	{
+		if (s->minModifiedAncestorLevel == 0 ||
+			ancestorLevel < s->minModifiedAncestorLevel)
+			s->minModifiedAncestorLevel = ancestorLevel;
+	}
+}
+
+/*
+ *	RecordSubTransactionExplicitLock
+ *
+ * Record that the current subtransaction executed an explicit LOCK TABLE.
+ */
+void
+RecordSubTransactionExplicitLock(void)
+{
+	CurrentTransactionState->hasExplicitLock = true;
+}
+
+/*
+ *	TransactionIdIsCommittedSavepointTransactionId
+ *
+ * Returns true if xid was durably committed via COMMIT SAVEPOINT by the
+ * current transaction (or an enclosing autonomous transaction).
+ */
+bool
+TransactionIdIsCommittedSavepointTransactionId(TransactionId xid)
+{
+	TransactionState s;
+
+	if (!TransactionIdIsNormal(xid))
+		return false;
+
+	for (s = CurrentTransactionState; s != NULL; s = s->parent)
+	{
+		int			i;
+
+		for (i = 0; i < s->nCommittedSavepointXids; i++)
+		{
+			if (TransactionIdEquals(s->committedSavepointXids[i], xid))
+				return true;
+		}
+
+		if (s->isAutonomous)
+			break;
+	}
+
+	return false;
+}
+
 
 /*
  *	TransactionIdIsCurrentTransactionId
@@ -2095,6 +2218,57 @@ AtSubCommit_childXids(void)
 	s->maxChildXids = 0;
 }
 
+/*
+ * RecordCommittedSavepointXids
+ *
+ * Record the XIDs of a savepoint subtransaction (and its subcommitted
+ * children) on the enclosing transaction root (TopTransactionStateData or the
+ * enclosing autonomous transaction root) so that MVCC snapshots taken by the
+ * parent transaction before COMMIT SAVEPOINT still see the savepoint's tuples
+ * as visible.
+ */
+static void
+RecordCommittedSavepointXids(TransactionState s)
+{
+	TransactionState root = s->parent;
+	int			add_nxids;
+	int			new_nxids;
+
+	if (!FullTransactionIdIsValid(s->fullTransactionId))
+		return;
+
+	while (root->parent != NULL && !root->isAutonomous)
+		root = root->parent;
+
+	add_nxids = 1 + s->nChildXids;
+	new_nxids = root->nCommittedSavepointXids + add_nxids;
+
+	if (root->maxCommittedSavepointXids < new_nxids)
+	{
+		int			new_max;
+		TransactionId *new_xids;
+
+		new_max = Max(new_nxids * 2, 8);
+		if (root->committedSavepointXids == NULL)
+			new_xids = MemoryContextAlloc(TopTransactionContext,
+										  new_max * sizeof(TransactionId));
+		else
+			new_xids = repalloc_array(root->committedSavepointXids,
+									  TransactionId, new_max);
+
+		root->committedSavepointXids = new_xids;
+		root->maxCommittedSavepointXids = new_max;
+	}
+
+	root->committedSavepointXids[root->nCommittedSavepointXids] =
+		XidFromFullTransactionId(s->fullTransactionId);
+	if (s->nChildXids > 0)
+		memcpy(&root->committedSavepointXids[root->nCommittedSavepointXids + 1],
+			   s->childXids,
+			   s->nChildXids * sizeof(TransactionId));
+	root->nCommittedSavepointXids = new_nxids;
+}
+
 /* ----------------------------------------------------------------
  *						AbortTransaction stuff
  * ----------------------------------------------------------------
@@ -2457,6 +2631,11 @@ StartTransaction(void)
 	s->childXids = NULL;
 	s->nChildXids = 0;
 	s->maxChildXids = 0;
+	s->committedSavepointXids = NULL;
+	s->nCommittedSavepointXids = 0;
+	s->maxCommittedSavepointXids = 0;
+	s->minModifiedAncestorLevel = 0;
+	s->hasExplicitLock = false;
 
 	/*
 	 * Once the current user ID and the security context flags are fetched,
@@ -2850,6 +3029,11 @@ CommitTransaction(void)
 	s->childXids = NULL;
 	s->nChildXids = 0;
 	s->maxChildXids = 0;
+	s->committedSavepointXids = NULL;
+	s->nCommittedSavepointXids = 0;
+	s->maxCommittedSavepointXids = 0;
+	s->minModifiedAncestorLevel = 0;
+	s->hasExplicitLock = false;
 
 	XactTopFullTransactionId = InvalidFullTransactionId;
 	nParallelCurrentXids = 0;
@@ -3148,6 +3332,11 @@ PrepareTransaction(void)
 	s->childXids = NULL;
 	s->nChildXids = 0;
 	s->maxChildXids = 0;
+	s->committedSavepointXids = NULL;
+	s->nCommittedSavepointXids = 0;
+	s->maxCommittedSavepointXids = 0;
+	s->minModifiedAncestorLevel = 0;
+	s->hasExplicitLock = false;
 
 	XactTopFullTransactionId = InvalidFullTransactionId;
 	nParallelCurrentXids = 0;
@@ -3405,6 +3594,11 @@ CleanupTransaction(void)
 	s->childXids = NULL;
 	s->nChildXids = 0;
 	s->maxChildXids = 0;
+	s->committedSavepointXids = NULL;
+	s->nCommittedSavepointXids = 0;
+	s->maxCommittedSavepointXids = 0;
+	s->minModifiedAncestorLevel = 0;
+	s->hasExplicitLock = false;
 	s->parallelModeLevel = 0;
 	s->parallelChildXact = false;
 
@@ -3481,6 +3675,7 @@ StartTransactionCommand(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -3709,6 +3904,16 @@ CommitTransactionCommandInternal(void)
 			break;
 
 			/*
+			 * The user issued COMMIT SAVEPOINT.
+			 */
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
+			CommitSavepointSubTransaction();
+			s = CurrentTransactionState;	/* changed by pop */
+			Assert(s->blockState == TBLOCK_INPROGRESS ||
+				   s->blockState == TBLOCK_SUBINPROGRESS);
+			break;
+
+			/*
 			 * The user issued COMMIT AUTONOMOUS.
 			 */
 		case TBLOCK_AUTONOMOUS_COMMIT:
@@ -3783,6 +3988,13 @@ CommitTransactionCommandInternal(void)
 				}
 				else if (s->blockState == TBLOCK_STARTED)
 					return false;
+			}
+			else if (s->blockState == TBLOCK_SUBCOMMIT_SAVEPOINT)
+			{
+				CommitSavepointSubTransaction();
+				s = CurrentTransactionState;	/* changed by pop */
+				Assert(s->blockState == TBLOCK_INPROGRESS ||
+					   s->blockState == TBLOCK_SUBINPROGRESS);
 			}
 			else
 				elog(ERROR, "CommitTransactionCommand: unexpected state %s",
@@ -4085,6 +4297,7 @@ AbortCurrentTransactionInternal(void)
 		case TBLOCK_SUBBEGIN:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_SUBABORT_PENDING:
 		case TBLOCK_SUBRESTART:
 			{
@@ -4467,6 +4680,7 @@ BeginTransactionBlock(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -4524,6 +4738,7 @@ BeginAutonomousTransactionBlock(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -4614,6 +4829,7 @@ EndAutonomousTransactionBlock(bool chain)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_ABORT_END:
@@ -4693,6 +4909,7 @@ UserAbortAutonomousTransactionBlock(bool chain)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_ABORT_END:
@@ -4917,6 +5134,7 @@ EndTransactionBlock(bool chain)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -5048,6 +5266,7 @@ UserAbortTransactionBlock(bool chain)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -5190,6 +5409,7 @@ DefineSavepoint(const char *name)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
@@ -5268,6 +5488,7 @@ ReleaseSavepoint(const char *name)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
@@ -5381,6 +5602,7 @@ RollbackToSavepoint(const char *name)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT_END:
 		case TBLOCK_SUBABORT_END:
@@ -5443,6 +5665,276 @@ RollbackToSavepoint(const char *name)
 }
 
 /*
+ * CheckCommitSavepointBlockers
+ *		Verify all 15 architectural and transactional preconditions before
+ *		allowing target savepoint (and its inner savepoints) to be durably
+ *		committed independently of its parent transaction.
+ */
+static void
+CheckCommitSavepointBlockers(TransactionState target)
+{
+	TransactionState s;
+	TransactionState root;
+	bool		hasAdvisoryLock = false;
+	bool		hasParentLockConflict = false;
+	bool		hasExplicitLock = false;
+	bool		hasXids = false;
+	int			minAncestorMod = 0;
+
+	/* Blocker 2: Serializable isolation level */
+	if (IsolationIsSerializable())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot commit savepoint \"%s\" in SERIALIZABLE isolation level",
+						target->name)));
+
+	/* Blocker 3: Exported snapshots */
+	if (XactHasExportedSnapshots())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" when transaction has exported snapshots",
+						target->name)));
+
+	/* Inspect all TransactionState frames in the savepoint subtree */
+	for (s = CurrentTransactionState; s != NULL; s = s->parent)
+	{
+		if (s->hasExplicitLock)
+			hasExplicitLock = true;
+		if (FullTransactionIdIsValid(s->fullTransactionId) || s->nChildXids > 0)
+			hasXids = true;
+		if (s->minModifiedAncestorLevel > 0 &&
+			(minAncestorMod == 0 || s->minModifiedAncestorLevel < minAncestorMod))
+			minAncestorMod = s->minModifiedAncestorLevel;
+
+		/* Blocker 14: Security context or UserId changes */
+		if (s->prevUser != GetUserId() || InSecurityRestrictedOperation())
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot commit savepoint \"%s\" with active security or user ID changes",
+							target->name)));
+
+		if (s == target)
+			break;
+	}
+
+	/* Blocker 4: Uncommitted parent tuple dependency */
+	if (minAncestorMod > 0 && minAncestorMod < target->nestingLevel)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" because it modified or locked tuples from an uncommitted parent transaction",
+						target->name)));
+
+	/* Find root of current transaction (or enclosing autonomous transaction) */
+	root = target->parent;
+	while (root->parent != NULL && !root->isAutonomous)
+		root = root->parent;
+
+	/* Blocker 5 & 15: Lock ownership conflict with parent & advisory locks */
+	LockHasSavepointBlockers(target->curTransactionOwner,
+							 root->curTransactionOwner,
+							 &hasAdvisoryLock,
+							 &hasParentLockConflict);
+	if (hasAdvisoryLock)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" that acquired transaction-level advisory locks",
+						target->name)));
+	if (hasParentLockConflict)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" because it shares locks on objects locked by the parent transaction",
+						target->name)));
+
+	if (hasExplicitLock)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" that acquired explicit table locks",
+						target->name)));
+
+	/* Blocker 6: DDL / Catalog invalidations */
+	if (InvalHasSubXactChanges(target->nestingLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" that performed catalog or DDL changes",
+						target->name)));
+
+	/* Blocker 7: Pending relation file deletes / creates */
+	if (smgrHasSubXactPendingDeletes(target->nestingLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with pending relation storage changes",
+						target->name)));
+
+	/*
+	 * Blocker 6b: Uncommitted ancestor DDL / catalog or relation storage
+	 * changes when the savepoint subtree performed any writes.  Without this
+	 * check, a savepoint could commit writes referencing uncommitted parent
+	 * catalog objects (such as a newly created sequence or composite/enum
+	 * type) that later roll back.
+	 */
+	if (hasXids &&
+		(InvalHasAncestorChanges(root->nestingLevel, target->nestingLevel) ||
+		 smgrHasAncestorPendingDeletes(root->nestingLevel, target->nestingLevel)))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" because an uncommitted parent transaction performed catalog or DDL changes",
+						target->name)));
+
+	/* Blocker 8: After triggers or trigger mode changes */
+	if (AfterTriggerHasSubXactBlockers(target->nestingLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with pending triggers or constraint mode changes",
+						target->name)));
+
+	/* Blocker 9: Open portals / cursors created in the savepoint */
+	if (PortalHasSubXactBlockers(target->subTransactionId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with open cursors or portals created in the savepoint",
+						target->name)));
+
+	/* Blocker 10: Pending LISTEN / UNLISTEN / NOTIFY actions */
+	if (AsyncHasSubXactBlockers(target->nestingLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with pending LISTEN, UNLISTEN, or NOTIFY actions",
+						target->name)));
+
+	/* Blocker 11: GUC SET LOCAL / SET changes in the savepoint */
+	if (GUCSubXactHasBlockers(target->gucNestLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with configuration parameter changes",
+						target->name)));
+
+	/* Blocker 12: ON COMMIT actions or temporary namespace changes */
+	if (OnCommitHasSubXactActions(target->subTransactionId) ||
+		NamespaceHasSubXactChanges(target->subTransactionId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with temporary table or namespace changes",
+						target->name)));
+
+	/* Blocker 13: Open virtual files or large object descriptors */
+	if (FilesHasSubXactAllocatedDescs(target->subTransactionId) ||
+		LargeObjectHasSubXactBlockers(target->subTransactionId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot commit savepoint \"%s\" with open file or large object descriptors",
+						target->name)));
+}
+
+/*
+ * CommitSavepoint
+ *		This executes a COMMIT SAVEPOINT <name> command.
+ */
+void
+CommitSavepoint(const char *name)
+{
+	TransactionState s = CurrentTransactionState;
+	TransactionState target,
+				xact;
+
+	if (IsInParallelMode() || IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot commit savepoints during a parallel operation")));
+
+	switch (s->blockState)
+	{
+		case TBLOCK_INPROGRESS:
+			ereport(ERROR,
+					(errcode(ERRCODE_S_E_INVALID_SPECIFICATION),
+					 errmsg("savepoint \"%s\" does not exist", name)));
+			break;
+
+		case TBLOCK_IMPLICIT_INPROGRESS:
+			ereport(ERROR,
+					(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+			/* translator: %s represents an SQL statement name */
+					 errmsg("%s can only be used in transaction blocks",
+							"COMMIT SAVEPOINT")));
+			break;
+
+		case TBLOCK_SUBINPROGRESS:
+			break;
+
+		case TBLOCK_ABORT:
+		case TBLOCK_SUBABORT:
+			ereport(ERROR,
+					(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION),
+					 errmsg("current transaction is aborted, commands ignored until end of transaction block")));
+			break;
+
+			/* These cases are invalid. */
+		case TBLOCK_DEFAULT:
+		case TBLOCK_STARTED:
+		case TBLOCK_BEGIN:
+		case TBLOCK_PARALLEL_INPROGRESS:
+		case TBLOCK_SUBBEGIN:
+		case TBLOCK_AUTONOMOUS_BEGIN:
+		case TBLOCK_END:
+		case TBLOCK_SUBRELEASE:
+		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
+		case TBLOCK_AUTONOMOUS_COMMIT:
+		case TBLOCK_ABORT_END:
+		case TBLOCK_SUBABORT_END:
+		case TBLOCK_ABORT_PENDING:
+		case TBLOCK_SUBABORT_PENDING:
+		case TBLOCK_SUBRESTART:
+		case TBLOCK_SUBABORT_RESTART:
+		case TBLOCK_PREPARE:
+			elog(FATAL, "CommitSavepoint: unexpected state %s",
+				 BlockStateAsString(s->blockState));
+			break;
+	}
+
+	for (target = s; target; target = target->parent)
+	{
+		if (target->name && strcmp(target->name, name) == 0)
+			break;
+	}
+
+	if (!target)
+		ereport(ERROR,
+				(errcode(ERRCODE_S_E_INVALID_SPECIFICATION),
+				 errmsg("savepoint \"%s\" does not exist", name)));
+
+	/* disallow crossing savepoint level boundaries */
+	if (target->savepointLevel != s->savepointLevel)
+		ereport(ERROR,
+				(errcode(ERRCODE_S_E_INVALID_SPECIFICATION),
+				 errmsg("savepoint \"%s\" does not exist within current savepoint level", name)));
+
+	/*
+	 * Verify all preconditions before transitioning any blockState so that if
+	 * any blocker raises an ERROR, only the current subtransaction enters
+	 * TBLOCK_SUBABORT and the user can recover via ROLLBACK TO SAVEPOINT.
+	 */
+	CheckCommitSavepointBlockers(target);
+
+	/*
+	 * Mark inner subtransactions above target as TBLOCK_SUBCOMMIT so they
+	 * roll up into target first, and mark target as TBLOCK_SUBCOMMIT_SAVEPOINT.
+	 */
+	xact = CurrentTransactionState;
+	for (;;)
+	{
+		Assert(xact->blockState == TBLOCK_SUBINPROGRESS);
+		if (xact == target)
+		{
+			xact->blockState = TBLOCK_SUBCOMMIT_SAVEPOINT;
+			break;
+		}
+		xact->blockState = TBLOCK_SUBCOMMIT;
+		xact = xact->parent;
+		Assert(xact);
+	}
+}
+
+/*
  * BeginInternalSubTransaction
  *		This is the same as DefineSavepoint except it allows TBLOCK_STARTED,
  *		TBLOCK_IMPLICIT_INPROGRESS, TBLOCK_PARALLEL_INPROGRESS, TBLOCK_END,
@@ -5501,6 +5993,7 @@ BeginInternalSubTransaction(const char *name)
 		case TBLOCK_SUBBEGIN:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
@@ -5586,6 +6079,7 @@ RollbackAndReleaseCurrentSubTransaction(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_ABORT:
 		case TBLOCK_ABORT_END:
@@ -5696,7 +6190,8 @@ AbortOutOfAnyTransaction(void)
 			case TBLOCK_SUBINPROGRESS:
 			case TBLOCK_SUBRELEASE:
 			case TBLOCK_SUBCOMMIT:
-				case TBLOCK_AUTONOMOUS_COMMIT:
+			case TBLOCK_SUBCOMMIT_SAVEPOINT:
+			case TBLOCK_AUTONOMOUS_COMMIT:
 			case TBLOCK_SUBABORT_PENDING:
 			case TBLOCK_SUBRESTART:
 				AbortSubTransaction();
@@ -5789,6 +6284,7 @@ TransactionBlockStatusCode(void)
 		case TBLOCK_END:
 		case TBLOCK_SUBRELEASE:
 		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
 		case TBLOCK_AUTONOMOUS_COMMIT:
 		case TBLOCK_PREPARE:
 			return 'T';			/* in transaction */
@@ -6035,6 +6531,121 @@ CommitAutonomousSubTransaction(void)
 }
 
 /*
+ * CommitSavepointSubTransaction
+ *
+ *	Durably commit a savepoint subtransaction (whose children have already
+ *	been subcommitted into it) and pop it from the transaction stack,
+ *	leaving the parent transaction in progress.
+ */
+static void
+CommitSavepointSubTransaction(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	ShowTransactionState("CommitSavepointSubTransaction");
+
+	if (s->state != TRANS_INPROGRESS)
+		elog(WARNING, "CommitSavepointSubTransaction while in %s state",
+			 TransStateAsString(s->state));
+
+	/* Pre-commit processing */
+	CallSubXactCallbacks(SUBXACT_EVENT_PRE_COMMIT_SUB, s->subTransactionId,
+						 s->parent->subTransactionId);
+
+	AtEOSubXact_Parallel(true, s->subTransactionId);
+	if (s->parallelModeLevel != 0)
+	{
+		elog(WARNING, "parallelModeLevel is %d not 0 at end of savepoint commit",
+			 s->parallelModeLevel);
+		s->parallelModeLevel = 0;
+	}
+
+	/* Must CCI to ensure commands of savepoint are seen as done */
+	CommandCounterIncrement();
+
+	/* Prevent cancel/die interrupt while cleaning up */
+	HOLD_INTERRUPTS();
+
+	/*
+	 * Do the actual durable WAL, CLOG, SubTrans, and ProcArray commit.
+	 * Record the committed XIDs in TopTransactionContext before
+	 * RecordSubTransactionCommit frees s->childXids, so any ancestor
+	 * snapshot taken before this savepoint commit continues to see its
+	 * changes (including inner savepoint changes) as committed.
+	 */
+	s->state = TRANS_COMMIT;
+	RecordCommittedSavepointXids(s);
+	(void) RecordSubTransactionCommit();
+
+	/*
+	 * All blocker checks have already verified that no pending triggers,
+	 * portals, large objects, notifications, relcache/catcache invalidations,
+	 * smgr deletes, temp namespaces, on-commit actions, or open files exist
+	 * in this savepoint subtree.  Call the standard subtransaction cleanup
+	 * hooks to release any non-blocking resources cleanly.
+	 */
+	AfterTriggerEndSubXact(true);
+	AtSubCommit_Portals(s->subTransactionId,
+						s->parent->subTransactionId,
+						s->parent->nestingLevel,
+						s->parent->curTransactionOwner);
+	AtEOSubXact_LargeObject(true, s->subTransactionId,
+							s->parent->subTransactionId);
+	AtSubCommit_Notify();
+
+	CallSubXactCallbacks(SUBXACT_EVENT_COMMIT_SUB, s->subTransactionId,
+						 s->parent->subTransactionId);
+
+	ResourceOwnerRelease(s->curTransactionOwner,
+						 RESOURCE_RELEASE_BEFORE_LOCKS,
+						 true, false);
+	AtEOSubXact_RelationCache(true, s->subTransactionId,
+							  InvalidSubTransactionId);
+	AtEOSubXact_TypeCache();
+	AtEOSubXact_Inval(true);
+	AtSubCommit_smgr();
+
+	/* Release the savepoint subtransaction XID lock and all locks it took */
+	CurrentResourceOwner = s->curTransactionOwner;
+	if (FullTransactionIdIsValid(s->fullTransactionId))
+		XactLockTableDelete(XidFromFullTransactionId(s->fullTransactionId));
+
+	ResourceOwnerRelease(s->curTransactionOwner,
+						 RESOURCE_RELEASE_LOCKS,
+						 false, false);
+	ResourceOwnerRelease(s->curTransactionOwner,
+						 RESOURCE_RELEASE_AFTER_LOCKS,
+						 true, false);
+
+	AtCommitSavepoint_GUC(s->gucNestLevel);
+	AtEOSubXact_SPI(true, s->subTransactionId);
+	AtEOSubXact_on_commit_actions(true, s->subTransactionId,
+								  s->parent->subTransactionId);
+	AtEOSubXact_Namespace(true, s->subTransactionId,
+						  s->parent->subTransactionId);
+	AtEOSubXact_Files(true, s->subTransactionId,
+					  s->parent->subTransactionId);
+	AtEOSubXact_HashTables(true, s->nestingLevel);
+	AtAutonomousCommit_PgStat(s->nestingLevel);
+	AtSubCommit_Snapshot(s->nestingLevel);
+
+	XactReadOnly = s->prevXactReadOnly;
+
+	CurrentResourceOwner = s->parent->curTransactionOwner;
+	CurTransactionResourceOwner = s->parent->curTransactionOwner;
+	ResourceOwnerDelete(s->curTransactionOwner);
+	s->curTransactionOwner = NULL;
+
+	AtSubCleanup_Memory();
+
+	s->state = TRANS_DEFAULT;
+
+	PopTransaction();
+
+	RESUME_INTERRUPTS();
+}
+
+/*
  * CommitSubTransaction
  *
  *	The caller has to make sure to always reassign CurrentTransactionState
@@ -6083,6 +6694,15 @@ CommitSubTransaction(void)
 	/* Post-commit cleanup */
 	if (FullTransactionIdIsValid(s->fullTransactionId))
 		AtSubCommit_childXids();
+	if (s->minModifiedAncestorLevel > 0 &&
+		s->minModifiedAncestorLevel < s->parent->nestingLevel)
+	{
+		if (s->parent->minModifiedAncestorLevel == 0 ||
+			s->minModifiedAncestorLevel < s->parent->minModifiedAncestorLevel)
+			s->parent->minModifiedAncestorLevel = s->minModifiedAncestorLevel;
+	}
+	if (s->hasExplicitLock)
+		s->parent->hasExplicitLock = true;
 	AfterTriggerEndSubXact(true);
 	AtSubCommit_Portals(s->subTransactionId,
 						s->parent->subTransactionId,
@@ -6492,6 +7112,9 @@ EstimateTransactionStateSpace(void)
 		if (FullTransactionIdIsValid(s->fullTransactionId))
 			nxids = add_size(nxids, 1);
 		nxids = add_size(nxids, s->nChildXids);
+		nxids = add_size(nxids, s->nCommittedSavepointXids);
+		if (s->isAutonomous)
+			break;
 	}
 
 	return add_size(size, mul_size(sizeof(TransactionId), nxids));
@@ -6513,7 +7136,9 @@ SerializeTransactionState(Size maxsize, char *start_address)
 {
 	TransactionState s;
 	Size		nxids = 0;
+	Size		ncsxids = 0;
 	Size		i = 0;
+	Size		j = 0;
 	TransactionId *workspace;
 	SerializedTransactionState *result;
 
@@ -6533,45 +7158,78 @@ SerializeTransactionState(Size maxsize, char *start_address)
 	 */
 	if (nParallelCurrentXids > 0)
 	{
+		int			ncs = TopTransactionStateData.nCommittedSavepointXids;
+
 		result->nParallelCurrentXids = nParallelCurrentXids;
+		result->nParallelCommittedSavepointXids = ncs;
 		memcpy(&result->parallelCurrentXids[0], ParallelCurrentXids,
 			   nParallelCurrentXids * sizeof(TransactionId));
+		if (ncs > 0)
+			memcpy(&result->parallelCurrentXids[nParallelCurrentXids],
+				   TopTransactionStateData.committedSavepointXids,
+				   ncs * sizeof(TransactionId));
 		return;
 	}
 
 	/*
 	 * OK, we need to generate a sorted list of XIDs that our workers should
-	 * view as current.  First, figure out how many there are.
+	 * view as current, plus any XIDs committed via COMMIT SAVEPOINT in the
+	 * current transaction scope.  First, figure out how many there are.
 	 */
 	for (s = CurrentTransactionState; s != NULL; s = s->parent)
 	{
 		if (FullTransactionIdIsValid(s->fullTransactionId))
 			nxids = add_size(nxids, 1);
 		nxids = add_size(nxids, s->nChildXids);
+		ncsxids = add_size(ncsxids, s->nCommittedSavepointXids);
+		if (s->isAutonomous)
+			break;
 	}
-	Assert(SerializedTransactionStateHeaderSize + nxids * sizeof(TransactionId)
-		   <= maxsize);
+	Assert(SerializedTransactionStateHeaderSize +
+		   (nxids + ncsxids) * sizeof(TransactionId) <= maxsize);
 
-	/* Copy them to our scratch space. */
-	workspace = palloc_array(TransactionId, nxids);
+	/* Copy current XIDs to our scratch space. */
+	if (nxids > 0)
+	{
+		workspace = palloc_array(TransactionId, nxids);
+		for (s = CurrentTransactionState; s != NULL; s = s->parent)
+		{
+			if (FullTransactionIdIsValid(s->fullTransactionId))
+				workspace[i++] = XidFromFullTransactionId(s->fullTransactionId);
+			if (s->nChildXids > 0)
+				memcpy(&workspace[i], s->childXids,
+					   s->nChildXids * sizeof(TransactionId));
+			i += s->nChildXids;
+			if (s->isAutonomous)
+				break;
+		}
+		Assert(i == nxids);
+
+		/* Sort them. */
+		qsort(workspace, nxids, sizeof(TransactionId), xidComparator);
+
+		/* Copy data into output area. */
+		memcpy(&result->parallelCurrentXids[0], workspace,
+			   nxids * sizeof(TransactionId));
+		pfree(workspace);
+	}
+	result->nParallelCurrentXids = nxids;
+
+	/* Copy committedSavepointXids right after parallelCurrentXids. */
 	for (s = CurrentTransactionState; s != NULL; s = s->parent)
 	{
-		if (FullTransactionIdIsValid(s->fullTransactionId))
-			workspace[i++] = XidFromFullTransactionId(s->fullTransactionId);
-		if (s->nChildXids > 0)
-			memcpy(&workspace[i], s->childXids,
-				   s->nChildXids * sizeof(TransactionId));
-		i += s->nChildXids;
+		if (s->nCommittedSavepointXids > 0)
+		{
+			memcpy(&result->parallelCurrentXids[nxids + j],
+				   s->committedSavepointXids,
+				   s->nCommittedSavepointXids * sizeof(TransactionId));
+			j += s->nCommittedSavepointXids;
+		}
+		if (s->isAutonomous)
+			break;
 	}
-	Assert(i == nxids);
-
-	/* Sort them. */
-	qsort(workspace, nxids, sizeof(TransactionId), xidComparator);
-
-	/* Copy data into output area. */
-	result->nParallelCurrentXids = nxids;
-	memcpy(&result->parallelCurrentXids[0], workspace,
-		   nxids * sizeof(TransactionId));
+	Assert(j == ncsxids);
+	result->nParallelCommittedSavepointXids = ncsxids;
 }
 
 /*
@@ -6596,6 +7254,19 @@ StartParallelWorkerTransaction(char *tstatespace)
 	currentCommandId = tstate->currentCommandId;
 	nParallelCurrentXids = tstate->nParallelCurrentXids;
 	ParallelCurrentXids = &tstate->parallelCurrentXids[0];
+	if (tstate->nParallelCommittedSavepointXids > 0)
+	{
+		int			ncs = tstate->nParallelCommittedSavepointXids;
+
+		TopTransactionStateData.committedSavepointXids =
+			MemoryContextAlloc(TopTransactionContext,
+							   ncs * sizeof(TransactionId));
+		memcpy(TopTransactionStateData.committedSavepointXids,
+			   &tstate->parallelCurrentXids[tstate->nParallelCurrentXids],
+			   ncs * sizeof(TransactionId));
+		TopTransactionStateData.nCommittedSavepointXids = ncs;
+		TopTransactionStateData.maxCommittedSavepointXids = ncs;
+	}
 
 	CurrentTransactionState->blockState = TBLOCK_PARALLEL_INPROGRESS;
 }
@@ -6714,6 +7385,8 @@ BlockStateAsString(TBlockState blockState)
 			return "SUBCOMMIT";
 		case TBLOCK_AUTONOMOUS_COMMIT:
 			return "AUTONOMOUS_COMMIT";
+		case TBLOCK_SUBCOMMIT_SAVEPOINT:
+			return "SUBCOMMIT_SAVEPOINT";
 		case TBLOCK_SUBABORT:
 			return "SUBABORT";
 		case TBLOCK_SUBABORT_END:

@@ -436,6 +436,8 @@ extern void AtStart_GUC(void);
 extern int	NewGUCNestLevel(void);
 extern void RestrictSearchPath(void);
 extern void AtEOXact_GUC(bool isCommit, int nestLevel);
+extern void AtCommitSavepoint_GUC(int nestLevel);
+extern bool GUCSubXactHasBlockers(int targetGucNestLevel);
 extern void BeginReportingGUCOptions(void);
 extern void ReportChangedGUCOptions(void);
 extern void ParseLongOption(const char *string, char **name, char **value);

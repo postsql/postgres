@@ -25,6 +25,7 @@
 #include "storage/lwlock.h"
 #include "storage/procnumber.h"
 #include "storage/shmem.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 
 /* struct PGPROC is declared in proc.h, but must forward-reference it */
@@ -399,6 +400,10 @@ extern void LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks);
 extern void LockReleaseSession(LOCKMETHODID lockmethodid);
 extern void LockReleaseCurrentOwner(LOCALLOCK **locallocks, int nlocks);
 extern void LockReassignCurrentOwner(LOCALLOCK **locallocks, int nlocks);
+extern void LockHasSavepointBlockers(ResourceOwner targetOwner,
+									 ResourceOwner rootOwner,
+									 bool *hasAdvisoryLock,
+									 bool *hasParentConflict);
 extern bool LockHeldByMe(const LOCKTAG *locktag,
 						 LOCKMODE lockmode, bool orstronger);
 extern bool GetAnyGrantedHeavyweightLock(LOCKTAG *locktag);

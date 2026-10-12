@@ -977,6 +977,32 @@ AtSubAbort_smgr(void)
 	smgrDoPendingDeletes(false);
 }
 
+bool
+smgrHasSubXactPendingDeletes(int targetLevel)
+{
+	PendingRelDelete *pending;
+
+	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
+	{
+		if (pending->nestLevel >= targetLevel)
+			return true;
+	}
+	return false;
+}
+
+bool
+smgrHasAncestorPendingDeletes(int minLevel, int targetLevel)
+{
+	PendingRelDelete *pending;
+
+	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
+	{
+		if (pending->nestLevel >= minLevel && pending->nestLevel < targetLevel)
+			return true;
+	}
+	return false;
+}
+
 void
 smgr_redo(XLogReaderState *record)
 {

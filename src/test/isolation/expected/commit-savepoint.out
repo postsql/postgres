@@ -1,0 +1,39 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_outer_ins s1_sp s1_inner_ins s2_select s1_sp_commit s2_select s2_update s1_rollback s2_select
+step s1_begin: BEGIN;
+step s1_outer_ins: INSERT INTO csp_iso_outer VALUES (1, 'outer uncommitted');
+step s1_sp: SAVEPOINT sp1;
+step s1_inner_ins: INSERT INTO csp_iso_inner VALUES (10, 'savepoint committed');
+step s2_select: SELECT id, val FROM csp_iso_outer ORDER BY id; SELECT id, val FROM csp_iso_inner ORDER BY id;
+id|val
+--+---
+(0 rows)
+
+id|val
+--+---
+(0 rows)
+
+step s1_sp_commit: COMMIT SAVEPOINT sp1;
+step s2_select: SELECT id, val FROM csp_iso_outer ORDER BY id; SELECT id, val FROM csp_iso_inner ORDER BY id;
+id|val
+--+---
+(0 rows)
+
+id|val                
+--+-------------------
+10|savepoint committed
+(1 row)
+
+step s2_update: UPDATE csp_iso_inner SET val = 'updated by s2 while s1 open' WHERE id = 10;
+step s1_rollback: ROLLBACK;
+step s2_select: SELECT id, val FROM csp_iso_outer ORDER BY id; SELECT id, val FROM csp_iso_inner ORDER BY id;
+id|val
+--+---
+(0 rows)
+
+id|val                        
+--+---------------------------
+10|updated by s2 while s1 open
+(1 row)
+

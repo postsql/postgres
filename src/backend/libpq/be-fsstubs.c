@@ -673,6 +673,22 @@ AtEOSubXact_LargeObject(bool isCommit, SubTransactionId mySubid,
 	}
 }
 
+bool
+LargeObjectHasSubXactBlockers(SubTransactionId targetSubid)
+{
+	if (fscxt == NULL)
+		return false;
+
+	for (int i = 0; i < cookies_size; i++)
+	{
+		LargeObjectDesc *lo = cookies[i];
+
+		if (lo != NULL && lo->subid >= targetSubid)
+			return true;
+	}
+	return false;
+}
+
 /*****************************************************************************
  *	Support routines for this file
  *****************************************************************************/

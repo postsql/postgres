@@ -2635,6 +2635,20 @@ AtAutonomousCommit_Notify(void)
 }
 
 /*
+ * AsyncHasSubXactBlockers() --- Return true if any LISTEN, UNLISTEN, or NOTIFY
+ * actions were executed at or below targetLevel.
+ */
+bool
+AsyncHasSubXactBlockers(int targetLevel)
+{
+	if (pendingActions != NULL && pendingActions->nestingLevel >= targetLevel)
+		return true;
+	if (pendingNotifies != NULL && pendingNotifies->nestingLevel >= targetLevel)
+		return true;
+	return false;
+}
+
+/*
  * HandleNotifyInterrupt
  *
  *		Signal handler portion of interrupt handling. Let the backend know

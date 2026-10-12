@@ -2807,6 +2807,127 @@ LockReassignOwner(LOCALLOCK *locallock, ResourceOwner parent)
 }
 
 /*
+ * Check whether 'owner' is equal to or a descendant of 'ancestor'.
+ */
+static bool
+ResourceOwnerIsOrDescendantOf(ResourceOwner owner, ResourceOwner ancestor)
+{
+	while (owner != NULL)
+	{
+		if (owner == ancestor)
+			return true;
+		owner = ResourceOwnerGetParent(owner);
+	}
+	return false;
+}
+
+/*
+ * LockHasSavepointBlockers
+ *		Check whether any lock held by a resource owner in targetOwner's
+ *		subtree prevents COMMIT SAVEPOINT:
+ *		1) Transaction-level advisory locks held by targetOwner's subtree.
+ *		2) Locks held by targetOwner's subtree whose lock mode conflicts with
+ *		   a lock on the same object held by an ancestor resource owner in
+ *		   [rootOwner .. parent(targetOwner)].
+ */
+void
+LockHasSavepointBlockers(ResourceOwner targetOwner,
+						 ResourceOwner rootOwner,
+						 bool *hasAdvisoryLock,
+						 bool *hasParentConflict)
+{
+	HASH_SEQ_STATUS status;
+	LOCALLOCK  *locallock;
+
+	*hasAdvisoryLock = false;
+	*hasParentConflict = false;
+
+	if (LockMethodLocalHash == NULL)
+		return;
+
+	hash_seq_init(&status, LockMethodLocalHash);
+
+	while ((locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
+	{
+		bool		heldByTargetSubtree = false;
+		int			i;
+
+		if (locallock->nLocks <= 0)
+			continue;
+
+		for (i = 0; i < locallock->numLockOwners; i++)
+		{
+			ResourceOwner owner = locallock->lockOwners[i].owner;
+
+			if (owner != NULL &&
+				locallock->lockOwners[i].nLocks > 0 &&
+				ResourceOwnerIsOrDescendantOf(owner, targetOwner))
+			{
+				heldByTargetSubtree = true;
+				break;
+			}
+		}
+
+		if (!heldByTargetSubtree)
+			continue;
+
+		if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_ADVISORY)
+		{
+			*hasAdvisoryLock = true;
+			continue;
+		}
+
+		if (LOCALLOCK_LOCKMETHOD(*locallock) == DEFAULT_LOCKMETHOD &&
+			LOCALLOCK_LOCKTAG(*locallock) != LOCKTAG_TRANSACTION &&
+			LOCALLOCK_LOCKTAG(*locallock) != LOCKTAG_VIRTUALTRANSACTION)
+		{
+			LOCKMODE	subMode = locallock->tag.mode;
+			LOCKMODE	parentMode;
+
+			for (parentMode = AccessShareLock;
+				 parentMode <= AccessExclusiveLock;
+				 parentMode++)
+			{
+				LOCALLOCKTAG checkTag;
+				LOCALLOCK  *parentLocalLock;
+				int			j;
+
+				if (!DoLockModesConflict(subMode, parentMode))
+					continue;
+
+				memset(&checkTag, 0, sizeof(checkTag));
+				checkTag.lock = locallock->tag.lock;
+				checkTag.mode = parentMode;
+
+				parentLocalLock = (LOCALLOCK *) hash_search(LockMethodLocalHash,
+															&checkTag,
+															HASH_FIND,
+															NULL);
+				if (parentLocalLock == NULL || parentLocalLock->nLocks <= 0)
+					continue;
+
+				for (j = 0; j < parentLocalLock->numLockOwners; j++)
+				{
+					ResourceOwner powner = parentLocalLock->lockOwners[j].owner;
+
+					if (powner != NULL &&
+						parentLocalLock->lockOwners[j].nLocks > 0 &&
+						ResourceOwnerIsOrDescendantOf(powner, rootOwner) &&
+						!ResourceOwnerIsOrDescendantOf(powner, targetOwner))
+					{
+						*hasParentConflict = true;
+						break;
+					}
+				}
+
+				if (*hasParentConflict)
+					break;
+			}
+		}
+	}
+}
+
+/*
  * FastPathGrantRelationLock
  *		Grant lock using per-backend fast-path array, if there is space.
  */

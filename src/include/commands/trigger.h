@@ -268,6 +268,7 @@ extern void AfterTriggerBeginSubXact(void);
 extern void AfterTriggerEndSubXact(bool isCommit);
 extern void AfterTriggerBeginAutonomousSubXact(void);
 extern void AfterTriggerEndAutonomousSubXact(bool isCommit);
+extern bool AfterTriggerHasSubXactBlockers(int targetLevel);
 extern void AfterTriggerSetState(ConstraintsSetStmt *stmt);
 extern bool AfterTriggerPendingOnRel(Oid relid);
 

@@ -45,6 +45,8 @@ extern void smgrDoPendingSyncs(bool isCommit, bool isParallelWorker);
 extern int	smgrGetPendingDeletes(bool forCommit, RelFileLocator **ptr);
 extern void AtSubCommit_smgr(void);
 extern void AtSubAbort_smgr(void);
+extern bool smgrHasSubXactPendingDeletes(int targetLevel);
+extern bool smgrHasAncestorPendingDeletes(int minLevel, int targetLevel);
 extern void PostPrepare_smgr(void);
 
 #endif							/* STORAGE_H */

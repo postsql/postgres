@@ -230,6 +230,7 @@ extern void AtSubAbort_Portals(SubTransactionId mySubid,
 							   ResourceOwner myXactOwner,
 							   ResourceOwner parentXactOwner);
 extern void AtSubCleanup_Portals(SubTransactionId mySubid);
+extern bool PortalHasSubXactBlockers(SubTransactionId targetSubid);
 extern Portal CreatePortal(const char *name, bool allowDup, bool dupSilent);
 extern Portal CreateNewPortal(void);
 extern void PinPortal(Portal portal);

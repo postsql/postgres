@@ -133,3 +133,4 @@ test: tablespace-dependency-locking
 test: pub-concurrent-drop
 test: drop-owned-grant
 test: autonomous-commit
+test: commit-savepoint

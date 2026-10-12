@@ -2448,6 +2448,71 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 }
 
 /*
+ * Check whether any GUC changes at nesting levels >= targetGucNestLevel
+ * prevent COMMIT SAVEPOINT:
+ * - SET LOCAL changes (GUC_LOCAL or GUC_SET_LOCAL)
+ * - SET changes (GUC_SET) when an ancestor transaction also has an
+ *   uncommitted stack entry on the same GUC.
+ */
+bool
+GUCSubXactHasBlockers(int targetGucNestLevel)
+{
+	slist_iter	iter;
+
+	slist_foreach(iter, &guc_stack_list)
+	{
+		struct config_generic *gconf = slist_container(struct config_generic,
+													   stack_link, iter.cur);
+		GucStack   *stack;
+
+		for (stack = gconf->stack;
+			 stack != NULL && stack->nest_level >= targetGucNestLevel;
+			 stack = stack->prev)
+		{
+			if (stack->state == GUC_LOCAL || stack->state == GUC_SET_LOCAL)
+				return true;
+			if (stack->state == GUC_SET && stack->prev != NULL &&
+				stack->prev->nest_level < targetGucNestLevel)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Commit GUC changes for COMMIT SAVEPOINT at nestLevel.
+ * Any GUC_SET at nestLevel with no ancestor stack entry is permanently
+ * committed (its prior value is discarded and its stack entry is popped).
+ */
+void
+AtCommitSavepoint_GUC(int nestLevel)
+{
+	slist_mutable_iter iter;
+
+	slist_foreach_modify(iter, &guc_stack_list)
+	{
+		struct config_generic *gconf = slist_container(struct config_generic,
+													   stack_link, iter.cur);
+		GucStack   *stack = gconf->stack;
+
+		if (stack != NULL &&
+			stack->nest_level == nestLevel &&
+			stack->state == GUC_SET &&
+			stack->prev == NULL)
+		{
+			discard_stack_value(gconf, &stack->prior);
+			gconf->stack = NULL;
+			slist_delete_current(&iter);
+			pfree(stack);
+		}
+	}
+
+	AtEOXact_GUC(true, nestLevel);
+}
+
+
+/*
  * Start up automatic reporting of changes to variables marked GUC_REPORT.
  * This is executed at completion of backend startup.
  */

@@ -2747,6 +2747,62 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
 }
 
 /*
+ * RecordSavepointTupleDependency
+ *		If the tuple being modified or locked was created, modified, or locked
+ *		by an active transaction or subtransaction in the current savepoint
+ *		hierarchy, record that nesting level on CurrentTransactionState so
+ *		COMMIT SAVEPOINT can detect dependencies on uncommitted parent state.
+ */
+static void
+RecordSavepointTupleDependency(HeapTupleHeader tup)
+{
+	TransactionId xmin;
+	uint16		infomask;
+
+	xmin = HeapTupleHeaderGetXmin(tup);
+	if (TransactionIdIsValid(xmin))
+	{
+		int			level = GetCurrentTransactionIdNestLevel(xmin);
+
+		if (level > 0)
+			RecordSubTransactionModifiedAncestorLevel(level);
+	}
+
+	infomask = tup->t_infomask;
+	if (!(infomask & HEAP_XMAX_INVALID))
+	{
+		TransactionId raw_xmax = HeapTupleHeaderGetRawXmax(tup);
+
+		if (infomask & HEAP_XMAX_IS_MULTI)
+		{
+			int			i;
+			int			nmembers;
+			MultiXactMember *members;
+
+			nmembers = GetMultiXactIdMembers((MultiXactId) raw_xmax, &members,
+											 false,
+											 HEAP_XMAX_IS_LOCKED_ONLY(infomask));
+			for (i = 0; i < nmembers; i++)
+			{
+				int			level = GetCurrentTransactionIdNestLevel(members[i].xid);
+
+				if (level > 0)
+					RecordSubTransactionModifiedAncestorLevel(level);
+			}
+			if (members)
+				pfree(members);
+		}
+		else if (TransactionIdIsValid(raw_xmax))
+		{
+			int			level = GetCurrentTransactionIdNestLevel(raw_xmax);
+
+			if (level > 0)
+				RecordSubTransactionModifiedAncestorLevel(level);
+		}
+	}
+}
+
+/*
  *	heap_delete - delete a tuple
  *
  * See table_tuple_delete() for an explanation of the parameters, except that
@@ -3022,6 +3078,8 @@ l1:
 	 * incorporate our XID into a MultiXact immediately afterwards.)
 	 */
 	MultiXactIdSetOldestMember();
+
+	RecordSavepointTupleDependency(tp.t_data);
 
 	compute_new_xmax_infomask(HeapTupleHeaderGetRawXmax(tp.t_data),
 							  tp.t_data->t_infomask, tp.t_data->t_infomask2,
@@ -3755,6 +3813,8 @@ l2:
 	 * If the tuple we're updating is locked, we need to preserve the locking
 	 * info in the old tuple's Xmax.  Prepare a new Xmax value for this.
 	 */
+	RecordSavepointTupleDependency(oldtup.t_data);
+
 	compute_new_xmax_infomask(HeapTupleHeaderGetRawXmax(oldtup.t_data),
 							  oldtup.t_data->t_infomask,
 							  oldtup.t_data->t_infomask2,
@@ -4794,6 +4854,7 @@ l3:
 			 result == TM_Deleted)
 	{
 		TransactionId xwait;
+		TransactionId tup_xmin;
 		uint16		infomask;
 		uint16		infomask2;
 		bool		require_sleep;
@@ -4801,6 +4862,7 @@ l3:
 
 		/* must copy state data before unlocking buffer */
 		xwait = HeapTupleHeaderGetRawXmax(tuple->t_data);
+		tup_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
 		infomask = tuple->t_data->t_infomask;
 		infomask2 = tuple->t_data->t_infomask2;
 		ItemPointerCopy(&tuple->t_data->t_ctid, &t_ctid);
@@ -4846,6 +4908,13 @@ l3:
 
 					if (TUPLOCK_from_mxstatus(members[i].status) >= mode)
 					{
+						int			xmin_level = GetCurrentTransactionIdNestLevel(tup_xmin);
+						int			xmax_level = GetCurrentTransactionIdNestLevel(members[i].xid);
+
+						if (xmin_level > 0)
+							RecordSubTransactionModifiedAncestorLevel(xmin_level);
+						if (xmax_level > 0)
+							RecordSubTransactionModifiedAncestorLevel(xmax_level);
 						pfree(members);
 						result = TM_Ok;
 						goto out_unlocked;
@@ -4872,37 +4941,43 @@ l3:
 			}
 			else if (TransactionIdIsCurrentTransactionId(xwait))
 			{
+				bool		reused_lock = false;
+
 				switch (mode)
 				{
 					case LockTupleKeyShare:
 						Assert(HEAP_XMAX_IS_KEYSHR_LOCKED(infomask) ||
 							   HEAP_XMAX_IS_SHR_LOCKED(infomask) ||
 							   HEAP_XMAX_IS_EXCL_LOCKED(infomask));
-						result = TM_Ok;
-						goto out_unlocked;
+						reused_lock = true;
+						break;
 					case LockTupleShare:
 						if (HEAP_XMAX_IS_SHR_LOCKED(infomask) ||
 							HEAP_XMAX_IS_EXCL_LOCKED(infomask))
-						{
-							result = TM_Ok;
-							goto out_unlocked;
-						}
+							reused_lock = true;
 						break;
 					case LockTupleNoKeyExclusive:
 						if (HEAP_XMAX_IS_EXCL_LOCKED(infomask))
-						{
-							result = TM_Ok;
-							goto out_unlocked;
-						}
+							reused_lock = true;
 						break;
 					case LockTupleExclusive:
 						if (HEAP_XMAX_IS_EXCL_LOCKED(infomask) &&
 							infomask2 & HEAP_KEYS_UPDATED)
-						{
-							result = TM_Ok;
-							goto out_unlocked;
-						}
+							reused_lock = true;
 						break;
+				}
+
+				if (reused_lock)
+				{
+					int			xmin_level = GetCurrentTransactionIdNestLevel(tup_xmin);
+					int			xmax_level = GetCurrentTransactionIdNestLevel(xwait);
+
+					if (xmin_level > 0)
+						RecordSubTransactionModifiedAncestorLevel(xmin_level);
+					if (xmax_level > 0)
+						RecordSubTransactionModifiedAncestorLevel(xmax_level);
+					result = TM_Ok;
+					goto out_unlocked;
 				}
 			}
 		}
@@ -5318,6 +5393,8 @@ failed:
 	 * not modify the tuple just yet, because that would leave it in the wrong
 	 * state if multixact.c elogs.
 	 */
+	RecordSavepointTupleDependency(tuple->t_data);
+
 	compute_new_xmax_infomask(xmax, old_infomask, tuple->t_data->t_infomask2,
 							  GetCurrentTransactionId(), mode, false,
 							  &xid, &new_infomask, &new_infomask2);

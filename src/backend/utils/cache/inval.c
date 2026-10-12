@@ -1323,6 +1323,37 @@ AtAutonomousCommit_Inval(void)
 }
 
 /*
+ * InvalHasSubXactChanges
+ *		Return true if any invalidation messages are queued at or below
+ *		targetLevel.
+ */
+bool
+InvalHasSubXactChanges(int targetLevel)
+{
+	return (transInvalInfo != NULL && transInvalInfo->my_level >= targetLevel);
+}
+
+/*
+ * InvalHasAncestorChanges
+ *		Return true if any invalidation messages are queued in an uncommitted
+ *		ancestor transaction in the nesting range [minLevel, targetLevel).
+ */
+bool
+InvalHasAncestorChanges(int minLevel, int targetLevel)
+{
+	TransInvalidationInfo *info;
+
+	for (info = transInvalInfo; info != NULL; info = info->parent)
+	{
+		if (info->my_level >= minLevel && info->my_level < targetLevel)
+			return true;
+		if (info->my_level < minLevel)
+			break;
+	}
+	return false;
+}
+
+/*
  * AtEOSubXact_Inval
  *		Process queued-up invalidation messages at end of subtransaction.
  *

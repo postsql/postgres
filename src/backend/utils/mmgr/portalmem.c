@@ -1027,6 +1027,36 @@ AtAutonomousCommit_Portals(SubTransactionId mySubid,
 }
 
 /*
+ * Return true if any open non-active portal (cursor) was created in or used in
+ * a subtransaction with SubTransactionId >= targetSubid.
+ */
+bool
+PortalHasSubXactBlockers(SubTransactionId targetSubid)
+{
+	HASH_SEQ_STATUS status;
+	PortalHashEnt *hentry;
+
+	hash_seq_init(&status, PortalHashTable);
+
+	while ((hentry = (PortalHashEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Portal		portal = hentry->portal;
+
+		/* Ignore the currently executing portal (which is running COMMIT SAVEPOINT) */
+		if (portal->status == PORTAL_ACTIVE && portal->createSubid >= targetSubid)
+			continue;
+
+		if (portal->createSubid >= targetSubid || portal->activeSubid >= targetSubid)
+		{
+			hash_seq_term(&status);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
  * Subtransaction abort handling for portals.
  *
  * Deactivate portals created or used during the failed subtransaction.
