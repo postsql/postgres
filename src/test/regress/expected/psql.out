@@ -7012,3 +7012,55 @@ Policies          |
 
 \pset null ''
 DROP TABLE defprivs;
+-- Test autocommit retry over Simple and Extended Query protocol (\bind)
+-- including discarding buffered partial DataRow messages on retry.
+CREATE SEQUENCE retry_ext_seq;
+CREATE FUNCTION retry_ext_fn(n int) RETURNS SETOF int LANGUAGE plpgsql AS $$
+DECLARE
+  attempt bigint;
+BEGIN
+  attempt := nextval('retry_ext_seq');
+  RETURN NEXT 100 + attempt::int;
+  IF attempt <= n THEN
+    RAISE SQLSTATE '40001' USING MESSAGE = 'simulated serialization failure';
+  END IF;
+  RETURN NEXT 200 + attempt::int;
+END;
+$$;
+SET max_autocommit_retries = 2;
+SET autocommit_retry_backoff_base_ms = 1;
+SET autocommit_retry_backoff_max_ms = 5;
+SELECT * FROM retry_ext_fn(2);
+ retry_ext_fn 
+--------------
+          103
+          203
+(2 rows)
+
+SELECT setval('retry_ext_seq', 1, false);
+ setval 
+--------
+      1
+(1 row)
+
+SELECT * FROM retry_ext_fn($1) \bind 2 \g
+ retry_ext_fn 
+--------------
+          103
+          203
+(2 rows)
+
+SELECT setval('retry_ext_seq', 1, false);
+ setval 
+--------
+      1
+(1 row)
+
+SELECT * FROM retry_ext_fn($1) \bind 3 \g
+ERROR:  simulated serialization failure
+CONTEXT:  PL/pgSQL function retry_ext_fn(integer) line 8 at RAISE
+RESET max_autocommit_retries;
+RESET autocommit_retry_backoff_base_ms;
+RESET autocommit_retry_backoff_max_ms;
+DROP FUNCTION retry_ext_fn(int);
+DROP SEQUENCE retry_ext_seq;

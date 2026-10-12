@@ -635,6 +635,7 @@
                                         # their durations, > 0 logs only
                                         # actions running at least this number
                                         # of milliseconds.
+#log_autocommit_retries = off           # log automatic retries of autocommit statements
 #log_checkpoints = on
 #log_connections = '' # log aspects of connection setup
           # options include receipt, authentication, authorization,
@@ -819,6 +820,10 @@
 #lock_timeout = 0                               # in milliseconds, 0 is disabled
 #idle_in_transaction_session_timeout = 0        # in milliseconds, 0 is disabled
 #idle_session_timeout = 0                       # in milliseconds, 0 is disabled
+#max_autocommit_retries = 0                     # max automatic retries for autocommit statements; 0 is disabled
+#enable_ddl_autocommit_retry = off              # retry autocommit DDL on lock or statement timeout
+#autocommit_retry_backoff_base_ms = 10ms        # initial backoff delay between autocommit retries
+#autocommit_retry_backoff_max_ms = 1s           # maximum backoff delay between autocommit retries
 #bytea_output = 'hex'                   # hex, escape
 #xmlbinary = 'base64'
 #xmloption = 'content'

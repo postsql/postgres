@@ -46,6 +46,12 @@ extern PGDLLIMPORT int log_statement;
 
 extern PGDLLIMPORT int restrict_nonsystem_relation_kind;
 
+extern PGDLLIMPORT int max_autocommit_retries;
+extern PGDLLIMPORT bool enable_ddl_autocommit_retry;
+extern PGDLLIMPORT int autocommit_retry_backoff_base_ms;
+extern PGDLLIMPORT int autocommit_retry_backoff_max_ms;
+extern PGDLLIMPORT bool log_autocommit_retries;
+
 extern List *pg_parse_query(const char *query_string);
 extern List *pg_rewrite_query(Query *query);
 extern List *pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,

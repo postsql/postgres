@@ -110,6 +110,13 @@ int			client_connection_check_interval = 0;
 /* flags for non-system relation kinds to restrict use */
 int			restrict_nonsystem_relation_kind;
 
+/* GUC variables for automatic retry of autocommit statements */
+int			max_autocommit_retries = 0;
+bool		enable_ddl_autocommit_retry = false;
+int			autocommit_retry_backoff_base_ms = 10;
+int			autocommit_retry_backoff_max_ms = 1000;
+bool		log_autocommit_retries = false;
+
 /*
  * Include signal sender PID/UID in the server log when available
  * (SA_SIGINFO). The caller must supply the already-captured pid and uid
@@ -132,6 +139,14 @@ typedef struct BindParamCbData
 	const char *paramval;		/* textual input string, if available */
 } BindParamCbData;
 
+/* statement classification for autocommit auto-retry */
+typedef enum AutocommitRetryClass
+{
+	AUTOCOMMIT_RETRY_NONE = 0,
+	AUTOCOMMIT_RETRY_DML,		/* SELECT, INSERT, UPDATE, DELETE, MERGE, CALL */
+	AUTOCOMMIT_RETRY_DDL,		/* Rollback-safe DDL / utility statements */
+} AutocommitRetryClass;
+
 /* ----------------
  *		private variables
  * ----------------
@@ -142,6 +157,12 @@ typedef struct BindParamCbData
  * For extended query protocol this has to be remembered across messages.
  */
 static bool xact_started = false;
+
+/*
+ * True if the most recent ERRCODE_QUERY_CANCELED was caused by
+ * statement_timeout rather than a user cancel request.
+ */
+static bool stmt_timeout_canceled = false;
 
 /*
  * Flag to indicate that we are doing the outer loop's read-from-client,
@@ -193,6 +214,12 @@ static bool IsTransactionExitStmt(Node *parsetree);
 static bool IsTransactionExitStmtList(List *pstmts);
 static bool IsTransactionStmtList(List *pstmts);
 static void drop_unnamed_stmt(void);
+static AutocommitRetryClass classify_autocommit_retry_stmt(Node *stmt);
+static bool is_autocommit_error_retryable(int sqlerrcode,
+										  AutocommitRetryClass retry_class);
+static void autocommit_retry_sleep(int retry_attempt, int sqlerrcode,
+								   const char *errmsg_str,
+								   const char *query_string);
 static void ProcessRecoveryConflictInterrupts(void);
 static void ProcessRecoveryConflictInterrupt(RecoveryConflictReason reason);
 static void report_recovery_conflict(RecoveryConflictReason reason);
@@ -1119,15 +1146,15 @@ exec_simple_query(const char *query_string)
 	foreach(parsetree_item, parsetree_list)
 	{
 		RawStmt    *parsetree = lfirst_node(RawStmt, parsetree_item);
-		bool		snapshot_set = false;
 		CommandTag	commandTag;
 		QueryCompletion qc;
 		MemoryContext per_parsetree_context = NULL;
-		List	   *querytree_list,
-				   *plantree_list;
-		Portal		portal;
-		DestReceiver *receiver;
-		int16		format;
+		MemoryContext retry_cxt = NULL;
+		AutocommitRetryClass retry_class = AUTOCOMMIT_RETRY_NONE;
+		bool		can_retry = false;
+		volatile int retry_attempt = 0;
+		volatile bool retry_done = false;
+		volatile LocalTransactionId initial_lxid = InvalidLocalTransactionId;
 		const char *cmdtagname;
 		size_t		cmdtaglen;
 
@@ -1175,193 +1202,327 @@ exec_simple_query(const char *query_string)
 		if (use_implicit_block)
 			BeginImplicitTransactionBlock();
 
-		/* If we got a cancel signal in parsing or prior command, quit */
-		CHECK_FOR_INTERRUPTS();
-
 		/*
-		 * Set up a snapshot if parse analysis/planning will need one.
+		 * Determine whether this statement is eligible for automatic retry
+		 * in autocommit mode.  Only single-statement query strings outside an
+		 * explicit transaction block qualify.
 		 */
-		if (analyze_requires_snapshot(parsetree))
+		if (!use_implicit_block && !IsTransactionBlock())
 		{
-			PushActiveSnapshot(GetTransactionSnapshot());
-			snapshot_set = true;
+			retry_class = classify_autocommit_retry_stmt((Node *) parsetree);
+			can_retry = (max_autocommit_retries > 0) &&
+				(retry_class == AUTOCOMMIT_RETRY_DML ||
+				 (retry_class == AUTOCOMMIT_RETRY_DDL && enable_ddl_autocommit_retry));
 		}
 
-		/*
-		 * OK to analyze, rewrite, and plan this query.
-		 *
-		 * Switch to appropriate context for constructing query and plan trees
-		 * (these can't be in the transaction context, as that will get reset
-		 * when the command is COMMIT/ROLLBACK).  If we have multiple
-		 * parsetrees, we use a separate context for each one, so that we can
-		 * free that memory before moving on to the next one.  But for the
-		 * last (or only) parsetree, just use MessageContext, which will be
-		 * reset shortly after completion anyway.  In event of an error, the
-		 * per_parsetree_context will be deleted when MessageContext is reset.
-		 */
-		if (lnext(parsetree_list, parsetree_item) != NULL)
+		if (can_retry)
+			retry_cxt = AllocSetContextCreate(MessageContext,
+											  "autocommit retry context",
+											  ALLOCSET_DEFAULT_SIZES);
+
+		for (;;)
 		{
-			per_parsetree_context =
-				AllocSetContextCreate(MessageContext,
-									  "per-parsetree message context",
-									  ALLOCSET_DEFAULT_SIZES);
-			oldcontext = MemoryContextSwitchTo(per_parsetree_context);
-		}
-		else
-			oldcontext = MemoryContextSwitchTo(MessageContext);
+			int			retry_errcode = 0;
+			char	   *retry_errmsg = NULL;
 
-		querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
-															NULL, 0, NULL);
+			stmt_timeout_canceled = false;
 
-		plantree_list = pg_plan_queries(querytree_list, query_string,
-										CURSOR_OPT_PARALLEL_OK, NULL);
-
-		/*
-		 * Done with the snapshot used for parsing/planning.
-		 *
-		 * While it looks promising to reuse the same snapshot for query
-		 * execution (at least for simple protocol), unfortunately it causes
-		 * execution to use a snapshot that has been acquired before locking
-		 * any of the tables mentioned in the query.  This creates user-
-		 * visible anomalies, so refrain.  Refer to
-		 * https://postgr.es/m/flat/5075D8DF.6050500@fuzzy.cz for details.
-		 */
-		if (snapshot_set)
-			PopActiveSnapshot();
-
-		/* If we got a cancel signal in analysis or planning, quit */
-		CHECK_FOR_INTERRUPTS();
-
-		/*
-		 * Create unnamed portal to run the query or queries in. If there
-		 * already is one, silently drop it.
-		 */
-		portal = CreatePortal("", true, true);
-		/* Don't display the portal in pg_cursors */
-		portal->visible = false;
-
-		/*
-		 * We don't have to copy anything into the portal, because everything
-		 * we are passing here is in MessageContext or the
-		 * per_parsetree_context, and so will outlive the portal anyway.
-		 */
-		PortalDefineQuery(portal,
-						  NULL,
-						  query_string,
-						  commandTag,
-						  plantree_list,
-						  NULL);
-
-		/*
-		 * Start the portal.  No parameters here.
-		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
-
-		/*
-		 * Select the appropriate output format: text unless we are doing a
-		 * FETCH from a binary cursor.  (Pretty grotty to have to do this here
-		 * --- but it avoids grottiness in other places.  Ah, the joys of
-		 * backward compatibility...)
-		 */
-		format = 0;				/* TEXT is default */
-		if (IsA(parsetree->stmt, FetchStmt))
-		{
-			FetchStmt  *stmt = (FetchStmt *) parsetree->stmt;
-
-			if (!stmt->ismove)
+			if (retry_attempt > 0)
 			{
-				Portal		fportal = GetPortalByName(stmt->portalname);
-
-				if (PortalIsValid(fportal) &&
-					(fportal->cursorOptions & CURSOR_OPT_BINARY))
-					format = 1; /* BINARY */
+				SetCurrentStatementStartTimestamp();
+				start_xact_command();
+				BeginCommand(commandTag, dest);
 			}
+
+			initial_lxid = MyProc ? MyProc->vxid.lxid : InvalidLocalTransactionId;
+
+			if (can_retry && whereToSendOutput == DestRemote)
+				pq_begin_retry_buffer();
+
+			PG_TRY();
+			{
+				RawStmt    *cur_parsetree = parsetree;
+				bool		snapshot_set = false;
+				List	   *querytree_list,
+						   *plantree_list;
+				Portal		portal;
+				DestReceiver *receiver;
+				int16		format;
+
+				/* If we got a cancel signal in parsing or prior command, quit */
+				CHECK_FOR_INTERRUPTS();
+
+				/*
+				 * Set up a snapshot if parse analysis/planning will need one.
+				 */
+				if (analyze_requires_snapshot(cur_parsetree))
+				{
+					PushActiveSnapshot(GetTransactionSnapshot());
+					snapshot_set = true;
+				}
+
+				/*
+				 * OK to analyze, rewrite, and plan this query.
+				 *
+				 * Switch to appropriate context for constructing query and
+				 * plan trees (these can't be in the transaction context, as
+				 * that will get reset when the command is COMMIT/ROLLBACK).
+				 * When autocommit retry is active, we allocate in retry_cxt
+				 * and work on a deep copy of parsetree because parse analysis
+				 * and utility execution can mutate raw parse nodes in-place.
+				 */
+				if (retry_cxt != NULL)
+				{
+					oldcontext = MemoryContextSwitchTo(retry_cxt);
+					cur_parsetree = copyObject(parsetree);
+				}
+				else if (lnext(parsetree_list, parsetree_item) != NULL)
+				{
+					per_parsetree_context =
+						AllocSetContextCreate(MessageContext,
+											  "per-parsetree message context",
+											  ALLOCSET_DEFAULT_SIZES);
+					oldcontext = MemoryContextSwitchTo(per_parsetree_context);
+				}
+				else
+					oldcontext = MemoryContextSwitchTo(MessageContext);
+
+				querytree_list = pg_analyze_and_rewrite_fixedparams(cur_parsetree,
+																	query_string,
+																	NULL, 0, NULL);
+
+				plantree_list = pg_plan_queries(querytree_list, query_string,
+												CURSOR_OPT_PARALLEL_OK, NULL);
+
+				/*
+				 * Done with the snapshot used for parsing/planning.
+				 *
+				 * While it looks promising to reuse the same snapshot for
+				 * query execution (at least for simple protocol),
+				 * unfortunately it causes execution to use a snapshot that
+				 * has been acquired before locking any of the tables
+				 * mentioned in the query.  This creates user-visible
+				 * anomalies, so refrain.  Refer to
+				 * https://postgr.es/m/flat/5075D8DF.6050500@fuzzy.cz for
+				 * details.
+				 */
+				if (snapshot_set)
+					PopActiveSnapshot();
+
+				/* If we got a cancel signal in analysis or planning, quit */
+				CHECK_FOR_INTERRUPTS();
+
+				/*
+				 * Create unnamed portal to run the query or queries in. If
+				 * there already is one, silently drop it.
+				 */
+				portal = CreatePortal("", true, true);
+				/* Don't display the portal in pg_cursors */
+				portal->visible = false;
+
+				/*
+				 * We don't have to copy anything into the portal, because
+				 * everything we are passing here is in MessageContext,
+				 * per_parsetree_context, or retry_cxt, and so will outlive
+				 * the portal anyway.
+				 */
+				PortalDefineQuery(portal,
+								  NULL,
+								  query_string,
+								  commandTag,
+								  plantree_list,
+								  NULL);
+
+				/*
+				 * Start the portal.  No parameters here.
+				 */
+				PortalStart(portal, NULL, 0, InvalidSnapshot);
+
+				/*
+				 * Select the appropriate output format: text unless we are
+				 * doing a FETCH from a binary cursor.  (Pretty grotty to have
+				 * to do this here --- but it avoids grottiness in other
+				 * places.  Ah, the joys of backward compatibility...)
+				 */
+				format = 0;		/* TEXT is default */
+				if (IsA(cur_parsetree->stmt, FetchStmt))
+				{
+					FetchStmt  *stmt = (FetchStmt *) cur_parsetree->stmt;
+
+					if (!stmt->ismove)
+					{
+						Portal		fportal = GetPortalByName(stmt->portalname);
+
+						if (PortalIsValid(fportal) &&
+							(fportal->cursorOptions & CURSOR_OPT_BINARY))
+							format = 1; /* BINARY */
+					}
+				}
+				PortalSetResultFormat(portal, 1, &format);
+
+				/*
+				 * Now we can create the destination receiver object.
+				 */
+				receiver = CreateDestReceiver(dest);
+				if (dest == DestRemote)
+					SetRemoteDestReceiverParams(receiver, portal);
+
+				/*
+				 * Switch back to transaction context for execution.
+				 */
+				MemoryContextSwitchTo(oldcontext);
+
+				/*
+				 * Run the portal to completion, and then drop it (and the
+				 * receiver).
+				 */
+				(void) PortalRun(portal,
+								 FETCH_ALL,
+								 true,	/* always top level */
+								 receiver,
+								 receiver,
+								 &qc);
+
+				receiver->rDestroy(receiver);
+
+				PortalDrop(portal, false);
+
+				if (lnext(parsetree_list, parsetree_item) == NULL)
+				{
+					/*
+					 * If this is the last parsetree of the query string,
+					 * close down transaction statement before reporting
+					 * command-complete.  This is so that any
+					 * end-of-transaction errors are reported before the
+					 * command-complete message is issued, to avoid confusing
+					 * clients who will expect either a command-complete
+					 * message or an error, not one and then the other.  Also,
+					 * if we're using an implicit transaction block, we must
+					 * close that out first.
+					 */
+					if (use_implicit_block)
+						EndImplicitTransactionBlock();
+					finish_xact_command();
+				}
+				else if (IsA(cur_parsetree->stmt, TransactionStmt))
+				{
+					/*
+					 * If this was a transaction control statement, commit it.
+					 * We will start a new xact command for the next command.
+					 */
+					finish_xact_command();
+				}
+				else
+				{
+					/*
+					 * We had better not see XACT_FLAGS_NEEDIMMEDIATECOMMIT
+					 * set if we're not calling finish_xact_command().  (The
+					 * implicit transaction block should have prevented it
+					 * from getting set.)
+					 */
+					Assert(!(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT));
+
+					/*
+					 * We need a CommandCounterIncrement after every query,
+					 * except those that start or end a transaction block.
+					 */
+					CommandCounterIncrement();
+
+					/*
+					 * Disable statement timeout between queries of a
+					 * multi-query string, so that the timeout applies
+					 * separately to each query.  (Our next loop iteration
+					 * will start a fresh timeout.)
+					 */
+					disable_statement_timeout();
+				}
+
+				if (can_retry && whereToSendOutput == DestRemote)
+					pq_end_retry_buffer();
+
+				/*
+				 * Tell client that we're done with this query.  Note we emit
+				 * exactly one EndCommand report for each raw parsetree, thus
+				 * one for each SQL command the client sent, regardless of
+				 * rewriting. (But a command aborted by error will not send an
+				 * EndCommand report at all.)
+				 */
+				EndCommand(&qc, dest, false);
+
+				/*
+				 * Now we may drop the per-parsetree or retry context, if one
+				 * was created.
+				 */
+				if (per_parsetree_context)
+					MemoryContextDelete(per_parsetree_context);
+				if (retry_cxt)
+					MemoryContextDelete(retry_cxt);
+
+				retry_done = true;
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+				int			errcode_val = geterrcode();
+
+				if (!can_retry ||
+					retry_attempt >= max_autocommit_retries ||
+					pq_retry_buffer_flushed() ||
+					IsTransactionBlock() ||
+					(MyProc != NULL && MyProc->vxid.lxid != initial_lxid) ||
+					!is_autocommit_error_retryable(errcode_val, retry_class))
+				{
+					pq_end_retry_buffer();
+					PG_RE_THROW();
+				}
+
+				HOLD_INTERRUPTS();
+				disable_all_timeouts(false);
+				QueryCancelPending = false;
+				stmt_timeout_canceled = false;
+
+				/*
+				 * Discard any uncommitted RowDescription, DataRow, or Notice
+				 * messages accumulated in PqSendBuffer during the failed
+				 * attempt.
+				 */
+				pq_discard_retry_buffer();
+				pq_end_retry_buffer();
+
+				MemoryContextSwitchTo(MessageContext);
+				edata = CopyErrorData();
+				retry_errcode = edata->sqlerrcode;
+				retry_errmsg = pstrdup(edata->message ? edata->message : "");
+				FreeErrorData(edata);
+				FlushErrorState();
+
+				AbortCurrentTransaction();
+				if (am_walsender)
+					WalSndErrorCleanup();
+				PortalErrorCleanup();
+				if (MyReplicationSlot != NULL)
+					ReplicationSlotRelease();
+				ReplicationSlotCleanup(false);
+				jit_reset_after_error();
+
+				xact_started = false;
+
+				MemoryContextSwitchTo(MessageContext);
+				MemoryContextReset(retry_cxt);
+
+				RESUME_INTERRUPTS();
+			}
+			PG_END_TRY();
+
+			if (retry_done)
+				break;
+
+			retry_attempt++;
+			autocommit_retry_sleep(retry_attempt, retry_errcode,
+								   retry_errmsg, query_string);
+			if (retry_errmsg)
+				pfree(retry_errmsg);
 		}
-		PortalSetResultFormat(portal, 1, &format);
-
-		/*
-		 * Now we can create the destination receiver object.
-		 */
-		receiver = CreateDestReceiver(dest);
-		if (dest == DestRemote)
-			SetRemoteDestReceiverParams(receiver, portal);
-
-		/*
-		 * Switch back to transaction context for execution.
-		 */
-		MemoryContextSwitchTo(oldcontext);
-
-		/*
-		 * Run the portal to completion, and then drop it (and the receiver).
-		 */
-		(void) PortalRun(portal,
-						 FETCH_ALL,
-						 true,	/* always top level */
-						 receiver,
-						 receiver,
-						 &qc);
-
-		receiver->rDestroy(receiver);
-
-		PortalDrop(portal, false);
-
-		if (lnext(parsetree_list, parsetree_item) == NULL)
-		{
-			/*
-			 * If this is the last parsetree of the query string, close down
-			 * transaction statement before reporting command-complete.  This
-			 * is so that any end-of-transaction errors are reported before
-			 * the command-complete message is issued, to avoid confusing
-			 * clients who will expect either a command-complete message or an
-			 * error, not one and then the other.  Also, if we're using an
-			 * implicit transaction block, we must close that out first.
-			 */
-			if (use_implicit_block)
-				EndImplicitTransactionBlock();
-			finish_xact_command();
-		}
-		else if (IsA(parsetree->stmt, TransactionStmt))
-		{
-			/*
-			 * If this was a transaction control statement, commit it. We will
-			 * start a new xact command for the next command.
-			 */
-			finish_xact_command();
-		}
-		else
-		{
-			/*
-			 * We had better not see XACT_FLAGS_NEEDIMMEDIATECOMMIT set if
-			 * we're not calling finish_xact_command().  (The implicit
-			 * transaction block should have prevented it from getting set.)
-			 */
-			Assert(!(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT));
-
-			/*
-			 * We need a CommandCounterIncrement after every query, except
-			 * those that start or end a transaction block.
-			 */
-			CommandCounterIncrement();
-
-			/*
-			 * Disable statement timeout between queries of a multi-query
-			 * string, so that the timeout applies separately to each query.
-			 * (Our next loop iteration will start a fresh timeout.)
-			 */
-			disable_statement_timeout();
-		}
-
-		/*
-		 * Tell client that we're done with this query.  Note we emit exactly
-		 * one EndCommand report for each raw parsetree, thus one for each SQL
-		 * command the client sent, regardless of rewriting. (But a command
-		 * aborted by error will not send an EndCommand report at all.)
-		 */
-		EndCommand(&qc, dest, false);
-
-		/* Now we may drop the per-parsetree context, if one was created. */
-		if (per_parsetree_context)
-			MemoryContextDelete(per_parsetree_context);
 	}							/* end loop over parsetrees */
 
 	/*
@@ -2151,13 +2312,21 @@ static void
 exec_execute_message(const char *portal_name, long max_rows)
 {
 	CommandDest dest;
-	DestReceiver *receiver;
 	Portal		portal;
-	bool		completed;
 	QueryCompletion qc;
 	const char *sourceText;
 	const char *prepStmtName;
+	const char *raw_stmt_name = NULL;
 	ParamListInfo portalParams;
+	CachedPlanSource *psrc = NULL;
+	ParamListInfo saved_params = NULL;
+	int16	   *saved_rformats = NULL;
+	int			saved_num_rformats = 0;
+	AutocommitRetryClass retry_class = AUTOCOMMIT_RETRY_NONE;
+	bool		can_retry = false;
+	volatile int retry_attempt = 0;
+	volatile bool retry_done = false;
+	volatile LocalTransactionId initial_lxid = InvalidLocalTransactionId;
 	bool		save_log_statement_stats = log_statement_stats;
 	bool		is_xact_command;
 	bool		execute_is_fetch;
@@ -2196,13 +2365,14 @@ exec_execute_message(const char *portal_name, long max_rows)
 
 	/*
 	 * We must copy the sourceText and prepStmtName into MessageContext in
-	 * case the portal is destroyed during finish_xact_command.  We do not
-	 * make a copy of the portalParams though, preferring to just not print
-	 * them in that case.
+	 * case the portal is destroyed during finish_xact_command.
 	 */
 	sourceText = pstrdup(portal->sourceText);
 	if (portal->prepStmtName)
-		prepStmtName = pstrdup(portal->prepStmtName);
+	{
+		raw_stmt_name = pstrdup(portal->prepStmtName);
+		prepStmtName = raw_stmt_name;
+	}
 	else
 		prepStmtName = "<unnamed>";
 	portalParams = portal->portalParams;
@@ -2244,14 +2414,6 @@ exec_execute_message(const char *portal_name, long max_rows)
 		ResetUsage();
 
 	BeginCommand(portal->commandTag, dest);
-
-	/*
-	 * Create dest receiver in MessageContext (we don't want it in transaction
-	 * context, because that may get deleted if portal contains VACUUM).
-	 */
-	receiver = CreateDestReceiver(dest);
-	if (dest == DestRemoteExecute)
-		SetRemoteDestReceiverParams(receiver, portal);
 
 	/*
 	 * Ensure we are in a transaction command (this should normally be the
@@ -2300,91 +2462,297 @@ exec_execute_message(const char *portal_name, long max_rows)
 				 errmsg("current transaction is aborted, "
 						"commands ignored until end of transaction block")));
 
-	/* Check for cancel signal before we start execution */
-	CHECK_FOR_INTERRUPTS();
-
-	/*
-	 * Okay to run the portal.  Set the error callback so that parameters are
-	 * logged.  The parameters must have been saved during the bind phase.
-	 */
-	params_data.portalName = portal->name;
-	params_data.params = portalParams;
-	params_errcxt.previous = error_context_stack;
-	params_errcxt.callback = ParamsErrorCallback;
-	params_errcxt.arg = &params_data;
-	error_context_stack = &params_errcxt;
-
 	if (max_rows <= 0)
 		max_rows = FETCH_ALL;
 
-	completed = PortalRun(portal,
-						  max_rows,
-						  true, /* always top level */
-						  receiver,
-						  receiver,
-						  &qc);
-
-	receiver->rDestroy(receiver);
-
-	/* Done executing; remove the params error callback */
-	error_context_stack = error_context_stack->previous;
-
-	if (completed)
+	/*
+	 * Determine whether this portal execution is eligible for automatic retry
+	 * in autocommit mode.
+	 */
+	if (!execute_is_fetch &&
+		max_rows == FETCH_ALL &&
+		!IsTransactionBlock() &&
+		!(MyXactFlags & XACT_FLAGS_PIPELINING) &&
+		list_length(portal->stmts) == 1)
 	{
-		if (is_xact_command || (MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT))
+		if (raw_stmt_name != NULL && raw_stmt_name[0] != '\0')
 		{
-			/*
-			 * If this was a transaction control statement, commit it.  We
-			 * will start a new xact command for the next command (if any).
-			 * Likewise if the statement required immediate commit.  Without
-			 * this provision, we wouldn't force commit until Sync is
-			 * received, which creates a hazard if the client tries to
-			 * pipeline immediate-commit statements.
-			 */
-			finish_xact_command();
+			PreparedStatement *pstmt = FetchPreparedStatement(raw_stmt_name, false);
 
-			/*
-			 * These commands typically don't have any parameters, and even if
-			 * one did we couldn't print them now because the storage went
-			 * away during finish_xact_command.  So pretend there were none.
-			 */
-			portalParams = NULL;
+			if (pstmt != NULL)
+				psrc = pstmt->plansource;
 		}
 		else
+			psrc = unnamed_stmt_psrc;
+
+		if (psrc != NULL)
 		{
-			/*
-			 * We need a CommandCounterIncrement after every query, except
-			 * those that start or end a transaction block.
-			 */
-			CommandCounterIncrement();
-
-			/*
-			 * Set XACT_FLAGS_PIPELINING whenever we complete an Execute
-			 * message without immediately committing the transaction.
-			 */
-			MyXactFlags |= XACT_FLAGS_PIPELINING;
-
-			/*
-			 * Disable statement timeout whenever we complete an Execute
-			 * message.  The next protocol message will start a fresh timeout.
-			 */
-			disable_statement_timeout();
+			retry_class = (psrc->raw_parse_tree != NULL) ?
+				classify_autocommit_retry_stmt((Node *) psrc->raw_parse_tree) :
+				classify_autocommit_retry_stmt((Node *) linitial(portal->stmts));
+			can_retry = (max_autocommit_retries > 0) &&
+				(retry_class == AUTOCOMMIT_RETRY_DML ||
+				 (retry_class == AUTOCOMMIT_RETRY_DDL && enable_ddl_autocommit_retry));
 		}
-
-		/* Send appropriate CommandComplete to client */
-		EndCommand(&qc, dest, false);
 	}
-	else
-	{
-		/* Portal run not complete, so send PortalSuspended */
-		if (whereToSendOutput == DestRemote)
-			pq_putemptymessage(PqMsg_PortalSuspended);
 
-		/*
-		 * Set XACT_FLAGS_PIPELINING whenever we suspend an Execute message,
-		 * too.
-		 */
-		MyXactFlags |= XACT_FLAGS_PIPELINING;
+	if (can_retry)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(MessageContext);
+
+		if (portalParams != NULL)
+		{
+			saved_params = copyParamList(portalParams);
+			if (portalParams->paramValuesStr != NULL)
+				saved_params->paramValuesStr = pstrdup(portalParams->paramValuesStr);
+		}
+		if (portal->tupDesc != NULL && portal->formats != NULL)
+		{
+			saved_num_rformats = portal->tupDesc->natts;
+			saved_rformats = palloc_array(int16, saved_num_rformats);
+			memcpy(saved_rformats, portal->formats,
+				   saved_num_rformats * sizeof(int16));
+		}
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	for (;;)
+	{
+		int			retry_errcode = 0;
+		char	   *retry_errmsg = NULL;
+
+		stmt_timeout_canceled = false;
+
+		if (can_retry && whereToSendOutput == DestRemote)
+			pq_begin_retry_buffer();
+
+		PG_TRY();
+		{
+			DestReceiver *receiver;
+			MemoryContext oldcxt;
+			bool		completed;
+
+			if (retry_attempt > 0)
+			{
+				ParamListInfo retry_params = NULL;
+				CachedPlan *cplan;
+				bool		snapshot_set = false;
+				char	   *portal_query_string;
+				char	   *portal_stmt_name;
+
+				SetCurrentStatementStartTimestamp();
+				start_xact_command();
+				BeginCommand(psrc->commandTag, dest);
+
+				if (portal_name[0] == '\0')
+					portal = CreatePortal(portal_name, true, true);
+				else
+					portal = CreatePortal(portal_name, false, false);
+
+				oldcxt = MemoryContextSwitchTo(portal->portalContext);
+				portal_query_string = pstrdup(psrc->query_string);
+				portal_stmt_name = (raw_stmt_name && raw_stmt_name[0] != '\0') ?
+					pstrdup(raw_stmt_name) : NULL;
+				if (saved_params != NULL)
+				{
+					retry_params = copyParamList(saved_params);
+					if (saved_params->paramValuesStr != NULL)
+						retry_params->paramValuesStr = pstrdup(saved_params->paramValuesStr);
+				}
+				MemoryContextSwitchTo(oldcxt);
+
+				if (retry_params != NULL ||
+					(psrc->raw_parse_tree &&
+					 analyze_requires_snapshot(psrc->raw_parse_tree)))
+				{
+					PushActiveSnapshot(GetTransactionSnapshot());
+					snapshot_set = true;
+				}
+
+				oldcxt = MemoryContextSwitchTo(MessageContext);
+				cplan = GetCachedPlan(psrc, retry_params, NULL, NULL);
+				PortalDefineQuery(portal,
+								  portal_stmt_name,
+								  portal_query_string,
+								  psrc->commandTag,
+								  cplan->stmt_list,
+								  cplan);
+				if (snapshot_set)
+					PopActiveSnapshot();
+				MemoryContextSwitchTo(oldcxt);
+
+				PortalStart(portal, retry_params, 0, InvalidSnapshot);
+				if (saved_num_rformats > 0)
+					PortalSetResultFormat(portal, saved_num_rformats, saved_rformats);
+
+				portalParams = retry_params;
+			}
+
+			initial_lxid = MyProc ? MyProc->vxid.lxid : InvalidLocalTransactionId;
+
+			/*
+			 * Create dest receiver in MessageContext (we don't want it in
+			 * transaction context, because that may get deleted if portal
+			 * contains VACUUM).
+			 */
+			oldcxt = MemoryContextSwitchTo(MessageContext);
+			receiver = CreateDestReceiver(dest);
+			if (dest == DestRemoteExecute)
+				SetRemoteDestReceiverParams(receiver, portal);
+			MemoryContextSwitchTo(oldcxt);
+
+			/* Check for cancel signal before we start execution */
+			CHECK_FOR_INTERRUPTS();
+
+			/*
+			 * Okay to run the portal.  Set the error callback so that
+			 * parameters are logged.  The parameters must have been saved
+			 * during the bind phase.
+			 */
+			params_data.portalName = portal->name;
+			params_data.params = portalParams;
+			params_errcxt.previous = error_context_stack;
+			params_errcxt.callback = ParamsErrorCallback;
+			params_errcxt.arg = &params_data;
+			error_context_stack = &params_errcxt;
+
+			completed = PortalRun(portal,
+								  max_rows,
+								  true, /* always top level */
+								  receiver,
+								  receiver,
+								  &qc);
+
+			receiver->rDestroy(receiver);
+
+			/* Done executing; remove the params error callback */
+			error_context_stack = error_context_stack->previous;
+
+			if (completed)
+			{
+				if (is_xact_command ||
+					(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT) ||
+					(can_retry && pq_is_next_msg_sync()))
+				{
+					/*
+					 * If this was a transaction control statement, commit it.
+					 * We will start a new xact command for the next command
+					 * (if any).  Likewise if the statement required immediate
+					 * commit, or if autocommit retry is active and the next
+					 * client message is Sync (so commit-time serialization
+					 * failures are caught inside the retry loop).
+					 */
+					finish_xact_command();
+
+					/*
+					 * Use saved_params if available, since portal storage
+					 * went away during finish_xact_command.
+					 */
+					portalParams = saved_params;
+				}
+				else
+				{
+					/*
+					 * We need a CommandCounterIncrement after every query,
+					 * except those that start or end a transaction block.
+					 */
+					CommandCounterIncrement();
+
+					/*
+					 * Set XACT_FLAGS_PIPELINING whenever we complete an
+					 * Execute message without immediately committing the
+					 * transaction.
+					 */
+					MyXactFlags |= XACT_FLAGS_PIPELINING;
+
+					/*
+					 * Disable statement timeout whenever we complete an
+					 * Execute message.  The next protocol message will start
+					 * a fresh timeout.
+					 */
+					disable_statement_timeout();
+				}
+
+				if (can_retry && whereToSendOutput == DestRemote)
+					pq_end_retry_buffer();
+
+				/* Send appropriate CommandComplete to client */
+				EndCommand(&qc, dest, false);
+			}
+			else
+			{
+				if (can_retry && whereToSendOutput == DestRemote)
+					pq_end_retry_buffer();
+
+				/* Portal run not complete, so send PortalSuspended */
+				if (whereToSendOutput == DestRemote)
+					pq_putemptymessage(PqMsg_PortalSuspended);
+
+				/*
+				 * Set XACT_FLAGS_PIPELINING whenever we suspend an Execute
+				 * message, too.
+				 */
+				MyXactFlags |= XACT_FLAGS_PIPELINING;
+			}
+
+			retry_done = true;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			int			errcode_val = geterrcode();
+
+			if (!can_retry ||
+				retry_attempt >= max_autocommit_retries ||
+				pq_retry_buffer_flushed() ||
+				IsTransactionBlock() ||
+				(MyProc != NULL && MyProc->vxid.lxid != initial_lxid) ||
+				!is_autocommit_error_retryable(errcode_val, retry_class))
+			{
+				pq_end_retry_buffer();
+				PG_RE_THROW();
+			}
+
+			HOLD_INTERRUPTS();
+			disable_all_timeouts(false);
+			QueryCancelPending = false;
+			stmt_timeout_canceled = false;
+
+			pq_discard_retry_buffer();
+			pq_end_retry_buffer();
+
+			MemoryContextSwitchTo(MessageContext);
+			edata = CopyErrorData();
+			retry_errcode = edata->sqlerrcode;
+			retry_errmsg = pstrdup(edata->message ? edata->message : "");
+			FreeErrorData(edata);
+			FlushErrorState();
+
+			AbortCurrentTransaction();
+			if (am_walsender)
+				WalSndErrorCleanup();
+			PortalErrorCleanup();
+			if (MyReplicationSlot != NULL)
+				ReplicationSlotRelease();
+			ReplicationSlotCleanup(false);
+			jit_reset_after_error();
+
+			xact_started = false;
+
+			MemoryContextSwitchTo(MessageContext);
+
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+
+		if (retry_done)
+			break;
+
+		retry_attempt++;
+		autocommit_retry_sleep(retry_attempt, retry_errcode,
+							   retry_errmsg, sourceText);
+		if (retry_errmsg)
+			pfree(retry_errmsg);
 	}
 
 	/*
@@ -3001,6 +3369,173 @@ drop_unnamed_stmt(void)
 	}
 }
 
+/*
+ * Classify a statement (RawStmt, PlannedStmt, or parse/utility Node) for
+ * autocommit automatic retry eligibility.
+ */
+static AutocommitRetryClass
+classify_autocommit_retry_stmt(Node *stmt)
+{
+	if (stmt == NULL)
+		return AUTOCOMMIT_RETRY_NONE;
+
+	if (IsA(stmt, RawStmt))
+		stmt = ((RawStmt *) stmt)->stmt;
+
+	if (IsA(stmt, PlannedStmt))
+	{
+		PlannedStmt *pstmt = (PlannedStmt *) stmt;
+
+		switch (pstmt->commandType)
+		{
+			case CMD_SELECT:
+			case CMD_INSERT:
+			case CMD_UPDATE:
+			case CMD_DELETE:
+			case CMD_MERGE:
+				return AUTOCOMMIT_RETRY_DML;
+			case CMD_UTILITY:
+				stmt = pstmt->utilityStmt;
+				if (stmt == NULL)
+					return AUTOCOMMIT_RETRY_NONE;
+				break;
+			default:
+				return AUTOCOMMIT_RETRY_NONE;
+		}
+	}
+
+	switch (nodeTag(stmt))
+	{
+		case T_SelectStmt:
+			if (((SelectStmt *) stmt)->intoClause != NULL)
+				return AUTOCOMMIT_RETRY_DDL;
+			return AUTOCOMMIT_RETRY_DML;
+
+		case T_InsertStmt:
+		case T_UpdateStmt:
+		case T_DeleteStmt:
+		case T_MergeStmt:
+		case T_CallStmt:
+			return AUTOCOMMIT_RETRY_DML;
+
+		/*
+		 * Non-transactional / filesystem-level commands that cannot be
+		 * rolled back cleanly or run inside a transaction.
+		 */
+		case T_CreatedbStmt:
+		case T_DropdbStmt:
+		case T_CreateTableSpaceStmt:
+		case T_DropTableSpaceStmt:
+		case T_AlterSystemStmt:
+			return AUTOCOMMIT_RETRY_NONE;
+
+		/*
+		 * Additional table-level utility commands that acquire heavyweight
+		 * relation locks and are safe to retry if they fail before committing
+		 * an internal transaction.
+		 */
+		case T_TruncateStmt:
+		case T_ReindexStmt:
+		case T_VacuumStmt:
+			return AUTOCOMMIT_RETRY_DDL;
+
+		default:
+			if (GetCommandLogLevel(stmt) == LOGSTMT_DDL)
+				return AUTOCOMMIT_RETRY_DDL;
+			return AUTOCOMMIT_RETRY_NONE;
+	}
+}
+
+/*
+ * Return true if the given SQLSTATE error code is eligible for autocommit
+ * retry for the given statement class under the current GUC settings.
+ */
+static bool
+is_autocommit_error_retryable(int sqlerrcode, AutocommitRetryClass retry_class)
+{
+	if (max_autocommit_retries <= 0 || retry_class == AUTOCOMMIT_RETRY_NONE)
+		return false;
+
+	if (retry_class == AUTOCOMMIT_RETRY_DDL && !enable_ddl_autocommit_retry)
+		return false;
+
+	if (sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
+		sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED)
+		return true;
+
+	if (retry_class == AUTOCOMMIT_RETRY_DDL)
+	{
+		if (sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
+			return true;
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED && stmt_timeout_canceled)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Sleep with exponential backoff and jitter before an autocommit retry
+ * attempt, optionally logging the retry event.  Interruptible via WaitLatch
+ * so user cancel (SIGINT) or backend termination (SIGTERM) aborts the sleep
+ * immediately.
+ */
+static void
+autocommit_retry_sleep(int retry_attempt, int sqlerrcode,
+					   const char *errmsg_str, const char *query_string)
+{
+	int64		base_ms = Max(1, autocommit_retry_backoff_base_ms);
+	int64		max_ms = Max(base_ms, autocommit_retry_backoff_max_ms);
+	int			shift = Min(retry_attempt - 1, 20);
+	int64		cap_ms = Min(max_ms, base_ms * (INT64CONST(1) << shift));
+	int64		half_ms = cap_ms / 2;
+	int64		jitter_ms = (cap_ms - half_ms > 0) ?
+		(int64) pg_prng_uint64_range(&pg_global_prng_state, 0, cap_ms - half_ms) : 0;
+	long		sleep_ms = (long) Max(1, half_ms + jitter_ms);
+	TimestampTz end_time;
+
+	if (log_autocommit_retries)
+	{
+		char	   *truncated_stmt = truncate_query_log(query_string);
+
+		ereport(LOG,
+				(errmsg("autocommit retry %d/%d after %s (%s) in %ld ms: %s",
+						retry_attempt,
+						max_autocommit_retries,
+						unpack_sql_state(sqlerrcode),
+						errmsg_str ? errmsg_str : "",
+						sleep_ms,
+						(truncated_stmt != NULL) ? truncated_stmt : query_string),
+				 errhidestmt(true)));
+
+		if (truncated_stmt != NULL)
+			pfree(truncated_stmt);
+	}
+
+	end_time = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), sleep_ms);
+	for (;;)
+	{
+		TimestampTz now;
+		long		rem_ms;
+
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+
+		now = GetCurrentTimestamp();
+		if (now >= end_time)
+			break;
+
+		rem_ms = (long) ((TimestampDifferenceMicroseconds(now, end_time) + 999) / 1000);
+		if (rem_ms <= 0)
+			break;
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 rem_ms,
+						 PG_WAIT_TIMEOUT);
+	}
+}
+
 
 /* --------------------------------
  *		signal handler routines used in PostgresMain()
@@ -3605,6 +4140,7 @@ ProcessInterrupts(void)
 		}
 		if (stmt_timeout_occurred)
 		{
+			stmt_timeout_canceled = true;
 			LockErrorCleanup();
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
@@ -4599,6 +5135,7 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		disable_all_timeouts(false);	/* do first to avoid race condition */
 		QueryCancelPending = false;
+		stmt_timeout_canceled = false;
 		idle_in_transaction_timeout_enabled = false;
 		idle_session_timeout_enabled = false;
 

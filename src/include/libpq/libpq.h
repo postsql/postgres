@@ -85,6 +85,11 @@ extern int	pq_getbyte_if_available(unsigned char *c);
 extern ssize_t pq_buffer_remaining_data(void);
 extern int	pq_putmessage_v2(char msgtype, const char *s, size_t len);
 extern bool pq_check_connection(void);
+extern void pq_begin_retry_buffer(void);
+extern void pq_end_retry_buffer(void);
+extern bool pq_retry_buffer_flushed(void);
+extern void pq_discard_retry_buffer(void);
+extern bool pq_is_next_msg_sync(void);
 
 /*
  * prototypes for functions in be-secure.c

@@ -114,6 +114,24 @@
   max => '600',
 },
 
+{ name => 'autocommit_retry_backoff_base_ms', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the initial backoff delay in milliseconds before retrying an autocommit statement.',
+  flags => 'GUC_UNIT_MS',
+  variable => 'autocommit_retry_backoff_base_ms',
+  boot_val => '10',
+  min => '1',
+  max => '60000',
+},
+
+{ name => 'autocommit_retry_backoff_max_ms', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the maximum backoff delay in milliseconds between retries of an autocommit statement.',
+  flags => 'GUC_UNIT_MS',
+  variable => 'autocommit_retry_backoff_max_ms',
+  boot_val => '1000',
+  min => '1',
+  max => '300000',
+},
+
 { name => 'autovacuum', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Starts the autovacuum subprocess.',
   variable => 'autovacuum_start_daemon',
@@ -867,6 +885,12 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_bitmapscan',
   boot_val => 'true',
+},
+
+{ name => 'enable_ddl_autocommit_retry', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Enables automatic retry of autocommit DDL statements on lock or statement timeout.',
+  variable => 'enable_ddl_autocommit_retry',
+  boot_val => 'false',
 },
 
 { name => 'enable_distinct_reordering', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1627,6 +1651,12 @@
   max => 'INT_MAX',
 },
 
+{ name => 'log_autocommit_retries', type => 'bool', context => 'PGC_USERSET', group => 'LOGGING_WHAT',
+  short_desc => 'Logs each automatic retry of an autocommit statement.',
+  variable => 'log_autocommit_retries',
+  boot_val => 'false',
+},
+
 { name => 'log_autovacuum_min_duration', type => 'int', context => 'PGC_SIGHUP', group => 'LOGGING_WHAT',
   short_desc => 'Sets the minimum execution time above which vacuum actions by autovacuum will be logged.',
   long_desc => '-1 disables logging vacuum actions by autovacuum. 0 means log all vacuum actions by autovacuum.',
@@ -1975,6 +2005,15 @@
   boot_val => '10',
   min => '0',
   max => 'MAX_BACKENDS',
+},
+
+{ name => 'max_autocommit_retries', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the maximum number of automatic retries for autocommit statements encountering transient errors.',
+  long_desc => '0 disables automatic retries.',
+  variable => 'max_autocommit_retries',
+  boot_val => '0',
+  min => '0',
+  max => '100',
 },
 
 { name => 'max_connections', type => 'int', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',

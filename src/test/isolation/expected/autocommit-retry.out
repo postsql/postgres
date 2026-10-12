@@ -1,0 +1,258 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_retries_0 s1_begin s1_upd2 s2_upd_ret s1_commit s2_check_tbl
+step s2_retries_0: SET max_autocommit_retries = 0;
+step s1_begin: BEGIN;
+step s1_upd2: UPDATE retry_tbl SET val = val + 100 WHERE id = 2;
+step s2_upd_ret: UPDATE retry_tbl SET val = val + 1 RETURNING id, val; <waiting ...>
+step s1_commit: COMMIT;
+step s2_upd_ret: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2_check_tbl: SELECT id, val FROM retry_tbl ORDER BY id;
+id|val
+--+---
+ 1| 10
+ 2|120
+(2 rows)
+
+
+starting permutation: s2_retries_3 s1_begin s1_upd2 s2_upd_ret s1_commit s2_check_tbl
+step s2_retries_3: SET max_autocommit_retries = 3;
+step s1_begin: BEGIN;
+step s1_upd2: UPDATE retry_tbl SET val = val + 100 WHERE id = 2;
+step s2_upd_ret: UPDATE retry_tbl SET val = val + 1 RETURNING id, val; <waiting ...>
+step s1_commit: COMMIT;
+step s2_upd_ret: <... completed>
+id|val
+--+---
+ 1| 11
+ 2|121
+(2 rows)
+
+step s2_check_tbl: SELECT id, val FROM retry_tbl ORDER BY id;
+id|val
+--+---
+ 1| 11
+ 2|121
+(2 rows)
+
+
+starting permutation: s2_retries_3 s1_begin s1_upd2 s2_begin s2_upd_ret s1_commit s2_rollback s2_check_tbl
+step s2_retries_3: SET max_autocommit_retries = 3;
+step s1_begin: BEGIN;
+step s1_upd2: UPDATE retry_tbl SET val = val + 100 WHERE id = 2;
+step s2_begin: BEGIN;
+step s2_upd_ret: UPDATE retry_tbl SET val = val + 1 RETURNING id, val; <waiting ...>
+step s1_commit: COMMIT;
+step s2_upd_ret: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2_rollback: ROLLBACK;
+step s2_check_tbl: SELECT id, val FROM retry_tbl ORDER BY id;
+id|val
+--+---
+ 1| 10
+ 2|120
+(2 rows)
+
+
+starting permutation: s2_retries_3 s1_begin s1_upd2 s2_multistmt s1_commit s2_check_tbl
+step s2_retries_3: SET max_autocommit_retries = 3;
+step s1_begin: BEGIN;
+step s1_upd2: UPDATE retry_tbl SET val = val + 100 WHERE id = 2;
+step s2_multistmt: SELECT 1; UPDATE retry_tbl SET val = val + 1 WHERE id = 2; <waiting ...>
+step s1_commit: COMMIT;
+step s2_multistmt: <... completed>
+?column?
+--------
+       1
+(1 row)
+
+ERROR:  could not serialize access due to concurrent update
+step s2_check_tbl: SELECT id, val FROM retry_tbl ORDER BY id;
+id|val
+--+---
+ 1| 10
+ 2|120
+(2 rows)
+
+
+starting permutation: s2_retries_3 s1_begin s1_upd2 s2_call_simple s1_commit s2_check_tbl
+step s2_retries_3: SET max_autocommit_retries = 3;
+step s1_begin: BEGIN;
+step s1_upd2: UPDATE retry_tbl SET val = val + 100 WHERE id = 2;
+step s2_call_simple: CALL retry_proc_simple(); <waiting ...>
+step s1_commit: COMMIT;
+step s2_call_simple: <... completed>
+step s2_check_tbl: SELECT id, val FROM retry_tbl ORDER BY id;
+id|val
+--+---
+ 1| 10
+ 2|121
+(2 rows)
+
+
+starting permutation: s2_retries_3 s1_begin s1_upd2 s2_call_commit s1_commit s2_check_tbl
+step s2_retries_3: SET max_autocommit_retries = 3;
+step s1_begin: BEGIN;
+step s1_upd2: UPDATE retry_tbl SET val = val + 100 WHERE id = 2;
+step s2_call_commit: CALL retry_proc_with_commit(); <waiting ...>
+step s1_commit: COMMIT;
+step s2_call_commit: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2_check_tbl: SELECT id, val FROM retry_tbl ORDER BY id;
+id|val
+--+---
+ 1| 11
+ 2|120
+(2 rows)
+
+
+starting permutation: s2_retries_2 s2_reset_seq s2_test_40001 s2_reset_seq s2_test_40p01 s2_reset_seq s2_exhaust s2_check_seq s2_ddl_setup s2_ddl_alter s2_check_seq s2_ddl_enable s2_ddl_alter s2_ddl_stmttimeout_setup s2_ddl_alter2 s2_check_seq s2_ddl_stmttimeout_enable s2_ddl_alter2 s2_ddl_cleanup
+step s2_retries_2: SET max_autocommit_retries = 2;
+step s2_reset_seq: 
+  SET log_autocommit_retries = on;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+setval
+------
+     1
+(1 row)
+
+step s2_test_40001: SELECT fail_n_times(2, '40001') AS attempts_40001;
+attempts_40001
+--------------
+             3
+(1 row)
+
+step s2_reset_seq: 
+  SET log_autocommit_retries = on;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+setval
+------
+     1
+(1 row)
+
+step s2_test_40p01: SELECT fail_n_times(2, '40P01') AS attempts_40p01;
+attempts_40p01
+--------------
+             3
+(1 row)
+
+step s2_reset_seq: 
+  SET log_autocommit_retries = on;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+setval
+------
+     1
+(1 row)
+
+step s2_exhaust: SELECT fail_n_times(3, '40001') AS should_fail;
+ERROR:  simulated transient failure on attempt 3
+step s2_check_seq: SELECT last_value FROM retry_attempt_seq;
+last_value
+----------
+         3
+(1 row)
+
+step s2_ddl_setup: 
+  CREATE FUNCTION ddl_fail_once() RETURNS event_trigger LANGUAGE plpgsql AS $$
+  BEGIN
+    IF nextval('retry_attempt_seq') <= 1 THEN
+      RAISE EXCEPTION 'simulated DDL lock timeout' USING ERRCODE = '55P03';
+    END IF;
+  END;
+  $$;
+  CREATE EVENT TRIGGER ddl_retry_trig ON ddl_command_start
+    WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION ddl_fail_once();
+  SET enable_ddl_autocommit_retry = off;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+setval
+------
+     1
+(1 row)
+
+step s2_ddl_alter: ALTER TABLE retry_tbl ADD COLUMN extra int DEFAULT 42;
+ERROR:  simulated DDL lock timeout
+step s2_check_seq: SELECT last_value FROM retry_attempt_seq;
+last_value
+----------
+         1
+(1 row)
+
+step s2_ddl_enable: 
+  SET enable_ddl_autocommit_retry = on;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+setval
+------
+     1
+(1 row)
+
+step s2_ddl_alter: ALTER TABLE retry_tbl ADD COLUMN extra int DEFAULT 42;
+step s2_ddl_stmttimeout_setup: 
+  SELECT last_value AS ddl_lock_attempts FROM retry_attempt_seq;
+  DROP EVENT TRIGGER ddl_retry_trig;
+  DROP FUNCTION ddl_fail_once();
+
+  CREATE FUNCTION ddl_sleep_once() RETURNS event_trigger LANGUAGE plpgsql AS $$
+  BEGIN
+    IF nextval('retry_attempt_seq') <= 1 THEN
+      PERFORM pg_sleep(1);
+    END IF;
+  END;
+  $$;
+  CREATE EVENT TRIGGER ddl_stmt_timeout_trig ON ddl_command_start
+    WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION ddl_sleep_once();
+  SET statement_timeout = '15ms';
+  SET enable_ddl_autocommit_retry = off;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+ddl_lock_attempts
+-----------------
+                2
+(1 row)
+
+setval
+------
+     1
+(1 row)
+
+step s2_ddl_alter2: ALTER TABLE retry_tbl ADD COLUMN extra2 int DEFAULT 99;
+ERROR:  canceling statement due to statement timeout
+step s2_check_seq: SELECT last_value FROM retry_attempt_seq;
+last_value
+----------
+         1
+(1 row)
+
+step s2_ddl_stmttimeout_enable: 
+  SET enable_ddl_autocommit_retry = on;
+  SELECT setval('retry_attempt_seq', 1, false);
+
+setval
+------
+     1
+(1 row)
+
+step s2_ddl_alter2: ALTER TABLE retry_tbl ADD COLUMN extra2 int DEFAULT 99;
+step s2_ddl_cleanup: 
+  SET statement_timeout = 0;
+  SELECT last_value AS ddl_stmttimeout_attempts FROM retry_attempt_seq;
+  SELECT id, val, extra, extra2 FROM retry_tbl ORDER BY id;
+  DROP EVENT TRIGGER ddl_stmt_timeout_trig;
+  DROP FUNCTION ddl_sleep_once();
+
+ddl_stmttimeout_attempts
+------------------------
+                       2
+(1 row)
+
+id|val|extra|extra2
+--+---+-----+------
+ 1| 10|   42|    99
+ 2| 20|   42|    99
+(2 rows)
+

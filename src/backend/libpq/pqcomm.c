@@ -71,6 +71,7 @@
 
 #include "common/ip.h"
 #include "libpq/libpq.h"
+#include "libpq/protocol.h"
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "postmaster/postmaster.h"
@@ -116,11 +117,17 @@ static List *sock_paths = NIL;
 
 #define PQ_SEND_BUFFER_SIZE 8192
 #define PQ_RECV_BUFFER_SIZE 8192
+#define PQ_MAX_RETRY_BUFFER_SIZE (8 * 1024 * 1024)
 
 static char *PqSendBuffer;
 static int	PqSendBufferSize;	/* Size send buffer */
 static size_t PqSendPointer;	/* Next index to store a byte in PqSendBuffer */
 static size_t PqSendStart;		/* Next index to send a byte in PqSendBuffer */
+
+/* State for buffering output during retryable autocommit statements */
+static bool PqRetryBuffering = false;
+static bool PqRetryBufferFlushed = false;
+static size_t PqSendRetryStart = 0;
 
 static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
 static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
@@ -333,6 +340,9 @@ socket_comm_reset(void)
 {
 	/* Do not throw away pending data, but do reset the busy flag */
 	PqCommBusy = false;
+	PqRetryBuffering = false;
+	PqRetryBufferFlushed = false;
+	PqSendRetryStart = 0;
 }
 
 /* --------------------------------
@@ -1278,6 +1288,34 @@ internal_putbytes(const void *b, size_t len)
 
 	while (len > 0)
 	{
+		/*
+		 * If retry buffering is active and we haven't flushed yet, expand
+		 * PqSendBuffer up to PQ_MAX_RETRY_BUFFER_SIZE instead of flushing
+		 * uncommitted output to the client socket.
+		 */
+		if (PqRetryBuffering && !PqRetryBufferFlushed &&
+			PqSendPointer + len > PqSendBufferSize)
+		{
+			size_t		required = PqSendPointer + len;
+
+			if (required <= PQ_MAX_RETRY_BUFFER_SIZE)
+			{
+				size_t		newsize = PqSendBufferSize;
+
+				while (newsize < required)
+					newsize *= 2;
+				if (newsize > PQ_MAX_RETRY_BUFFER_SIZE)
+					newsize = PQ_MAX_RETRY_BUFFER_SIZE;
+				PqSendBuffer = repalloc(PqSendBuffer, newsize);
+				PqSendBufferSize = (int) newsize;
+			}
+			else
+			{
+				/* Buffer limit exceeded; allow flush and mark un-retryable */
+				PqRetryBufferFlushed = true;
+			}
+		}
+
 		/* If buffer is full, then flush it out */
 		if (PqSendPointer >= PqSendBufferSize)
 		{
@@ -1329,6 +1367,14 @@ socket_flush(void)
 	/* No-op if reentrant call */
 	if (PqCommBusy)
 		return 0;
+
+	/*
+	 * Defer explicit flushes (e.g., from send_message_to_frontend on NOTICE)
+	 * while buffering uncommitted output for a retryable statement.
+	 */
+	if (PqRetryBuffering && !PqRetryBufferFlushed)
+		return 0;
+
 	PqCommBusy = true;
 	socket_set_nonblocking(false);
 	res = internal_flush();
@@ -1363,6 +1409,9 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 
 	const char *bufptr = buf + *start;
 	const char *bufend = buf + *end;
+
+	if (PqRetryBuffering && bufptr < bufend)
+		PqRetryBufferFlushed = true;
 
 	while (bufptr < bufend)
 	{
@@ -1442,6 +1491,10 @@ socket_flush_if_writable(void)
 	if (PqCommBusy)
 		return 0;
 
+	/* Defer flush while buffering uncommitted output for retry */
+	if (PqRetryBuffering && !PqRetryBufferFlushed)
+		return 0;
+
 	/* Temporarily put the socket into non-blocking mode */
 	socket_set_nonblocking(true);
 
@@ -1459,6 +1512,51 @@ static bool
 socket_is_send_pending(void)
 {
 	return (PqSendStart < PqSendPointer);
+}
+
+/* --------------------------------
+ *	Autocommit retry output buffering support
+ * --------------------------------
+ */
+void
+pq_begin_retry_buffer(void)
+{
+	PqRetryBuffering = true;
+	PqRetryBufferFlushed = false;
+	PqSendRetryStart = PqSendPointer;
+}
+
+void
+pq_end_retry_buffer(void)
+{
+	PqRetryBuffering = false;
+	PqRetryBufferFlushed = false;
+	PqSendRetryStart = 0;
+}
+
+bool
+pq_retry_buffer_flushed(void)
+{
+	return PqRetryBufferFlushed;
+}
+
+void
+pq_discard_retry_buffer(void)
+{
+	Assert(PqRetryBuffering);
+	Assert(!PqRetryBufferFlushed);
+	Assert(PqSendStart <= PqSendRetryStart);
+	Assert(PqSendRetryStart <= PqSendPointer);
+	PqSendPointer = PqSendRetryStart;
+}
+
+bool
+pq_is_next_msg_sync(void)
+{
+	if (PqRecvLength - PqRecvPointer >= 5 &&
+		PqRecvBuffer[PqRecvPointer] == PqMsg_Sync)
+		return true;
+	return false;
 }
 
 /* --------------------------------
