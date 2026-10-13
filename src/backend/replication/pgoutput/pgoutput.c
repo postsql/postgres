@@ -1321,7 +1321,7 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 	 *
 	 * For deletes, we only have the old tuple.
 	 */
-	if (!new_slot || !old_slot)
+	if (!new_slot || !old_slot || TTS_EMPTY(old_slot))
 	{
 		ecxt->ecxt_scantuple = new_slot ? new_slot : old_slot;
 		result = pgoutput_row_filter_exec_expr(filter_exprstate, ecxt);
@@ -1490,7 +1490,8 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			 * identity is not defined for a table. Since the DELETE action
 			 * can't be published, we simply return.
 			 */
-			if (!change->data.tp.oldtuple)
+			if (!change->data.tp.oldtuple &&
+				relation->rd_rel->relreplident != REPLICA_IDENTITY_ROWID)
 			{
 				elog(DEBUG1, "didn't send DELETE change because of missing oldtuple");
 				return;
@@ -1525,6 +1526,12 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			old_slot = execute_attr_map_slot(relentry->attrmap, old_slot, slot);
 		}
 	}
+	else if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID ||
+			 targetrel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+	{
+		old_slot = relentry->old_slot;
+		ExecClearTuple(old_slot);
+	}
 
 	if (change->data.tp.newtuple)
 	{
@@ -1549,6 +1556,11 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 */
 	if (!pgoutput_row_filter(targetrel, old_slot, &new_slot, relentry, &action))
 		goto cleanup;
+
+	if (old_slot)
+		old_slot->tts_tid = change->old_tid;
+	if (new_slot)
+		new_slot->tts_tid = change->new_tid;
 
 	/*
 	 * Send BEGIN if we haven't yet.

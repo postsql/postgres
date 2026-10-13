@@ -770,7 +770,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
-	ROUTINE ROUTINES ROW ROWS RULE
+	ROUTINE ROUTINES ROW ROWID ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
@@ -3010,6 +3010,14 @@ replica_identity:
 					ReplicaIdentityStmt *n = makeNode(ReplicaIdentityStmt);
 
 					n->identity_type = REPLICA_IDENTITY_DEFAULT;
+					n->name = NULL;
+					$$ = (Node *) n;
+				}
+			| ROWID
+				{
+					ReplicaIdentityStmt *n = makeNode(ReplicaIdentityStmt);
+
+					n->identity_type = REPLICA_IDENTITY_ROWID;
 					n->name = NULL;
 					$$ = (Node *) n;
 				}
@@ -17768,6 +17776,7 @@ unreserved_keyword:
 			| ROLLUP
 			| ROUTINE
 			| ROUTINES
+			| ROWID
 			| ROWS
 			| RULE
 			| SAVEPOINT
@@ -18399,6 +18408,7 @@ bare_label_keyword:
 			| ROUTINE
 			| ROUTINES
 			| ROW
+			| ROWID
 			| ROWS
 			| RULE
 			| SAVEPOINT

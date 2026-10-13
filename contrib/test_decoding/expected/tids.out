@@ -1,0 +1,179 @@
+-- Test logical decoding with TIDs and header metadata
+SET synchronous_commit = on;
+-- 1. Test GUC values
+SHOW logical_decoding_expose_headers;
+ logical_decoding_expose_headers 
+---------------------------------
+ off
+(1 row)
+
+SET logical_decoding_expose_headers = 'invalid'; -- should fail
+ERROR:  parameter "logical_decoding_expose_headers" requires a Boolean value
+SET logical_decoding_expose_headers = on;
+SHOW logical_decoding_expose_headers;
+ logical_decoding_expose_headers 
+---------------------------------
+ on
+(1 row)
+
+SET logical_decoding_expose_headers = off;
+SHOW logical_decoding_expose_headers;
+ logical_decoding_expose_headers 
+---------------------------------
+ off
+(1 row)
+
+-- 2. Setup slot
+SELECT 'init' FROM pg_create_logical_replication_slot('tid_slot', 'test_decoding');
+ ?column? 
+----------
+ init
+(1 row)
+
+CREATE TABLE tid_test (id int PRIMARY KEY, val text);
+-- 3. With GUC = off, include-tids should not expose any TIDs
+SET logical_decoding_expose_headers = off;
+INSERT INTO tid_test VALUES (1, 'one');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                             data                             
+--------------------------------------------------------------
+ BEGIN
+ COMMIT
+ BEGIN
+ table public.tid_test: INSERT: id[integer]:1 val[text]:'one'
+ COMMIT
+(5 rows)
+
+-- 4. With GUC = on
+SET logical_decoding_expose_headers = on;
+-- Single insert
+INSERT INTO tid_test VALUES (2, 'two');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                                    data                                     
+-----------------------------------------------------------------------------
+ BEGIN
+ table public.tid_test: INSERT: new-tid: (0,2) id[integer]:2 val[text]:'two'
+ COMMIT
+(3 rows)
+
+-- Multi insert
+INSERT INTO tid_test VALUES (3, 'three'), (4, 'four');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                                     data                                      
+-------------------------------------------------------------------------------
+ BEGIN
+ table public.tid_test: INSERT: new-tid: (0,3) id[integer]:3 val[text]:'three'
+ table public.tid_test: INSERT: new-tid: (0,4) id[integer]:4 val[text]:'four'
+ COMMIT
+(4 rows)
+
+-- Update (in-place / new page)
+UPDATE tid_test SET val = 'two-updated' WHERE id = 2;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                                                data                                                
+----------------------------------------------------------------------------------------------------
+ BEGIN
+ table public.tid_test: UPDATE: old-tid: (0,2) new-tid: (0,5) id[integer]:2 val[text]:'two-updated'
+ COMMIT
+(3 rows)
+
+-- Delete
+DELETE FROM tid_test WHERE id = 2;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                            data                             
+-------------------------------------------------------------
+ BEGIN
+ table public.tid_test: DELETE: old-tid: (0,5) id[integer]:2
+ COMMIT
+(3 rows)
+
+-- 5. Delete on table without replica identity (no old tuple logged, but old TID is still present)
+CREATE TABLE tid_nopk (val text);
+ALTER TABLE tid_nopk REPLICA IDENTITY NOTHING;
+INSERT INTO tid_nopk VALUES ('hello');
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                              data                               
+-----------------------------------------------------------------
+ BEGIN
+ COMMIT
+ BEGIN
+ COMMIT
+ BEGIN
+ table public.tid_nopk: INSERT: new-tid: (0,1) val[text]:'hello'
+ COMMIT
+(7 rows)
+
+DELETE FROM tid_nopk WHERE val = 'hello';
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                             data                              
+---------------------------------------------------------------
+ BEGIN
+ table public.tid_nopk: DELETE: old-tid: (0,1) (no-tuple-data)
+ COMMIT
+(3 rows)
+
+-- 6. Speculative insert (ON CONFLICT)
+CREATE TABLE tid_conflict (id int PRIMARY KEY, val text);
+INSERT INTO tid_conflict VALUES (1, 'initial') ON CONFLICT (id) DO NOTHING;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                                        data                                         
+-------------------------------------------------------------------------------------
+ BEGIN
+ COMMIT
+ BEGIN
+ table public.tid_conflict: INSERT: new-tid: (0,1) id[integer]:1 val[text]:'initial'
+ COMMIT
+(5 rows)
+
+INSERT INTO tid_conflict VALUES (1, 'duplicate') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT data FROM pg_logical_slot_get_changes('tid_slot', NULL, NULL, 'include-xids', '0', 'include-tids', '1');
+                                                 data                                                 
+------------------------------------------------------------------------------------------------------
+ BEGIN
+ table public.tid_conflict: UPDATE: old-tid: (0,1) new-tid: (0,2) id[integer]:1 val[text]:'duplicate'
+ COMMIT
+(3 rows)
+
+-- 7. REPLICA IDENTITY ROWID and COPY tests
+CREATE TABLE tid_rowid (id int, val text);
+ALTER TABLE tid_rowid REPLICA IDENTITY ROWID;
+INSERT INTO tid_rowid VALUES (10, 'ten');
+COPY tid_rowid (val, ".rowid") TO stdout;
+ten	(0,1)
+COPY tid_rowid (val, ctid) TO stdout;
+ten	(0,1)
+-- Test pgoutput with REPLICA IDENTITY ROWID
+CREATE PUBLICATION pub_rowid FOR TABLE tid_rowid;
+SELECT 'init' FROM pg_create_logical_replication_slot('pgout_slot', 'pgoutput');
+ ?column? 
+----------
+ init
+(1 row)
+
+INSERT INTO tid_rowid VALUES (20, 'twenty');
+UPDATE tid_rowid SET val = 'twenty-upd' WHERE id = 20;
+DELETE FROM tid_rowid WHERE id = 20;
+SELECT count(*) > 0 AS got_changes FROM pg_logical_slot_get_binary_changes('pgout_slot', NULL, NULL, 'proto_version', '1', 'publication_names', 'pub_rowid');
+ got_changes 
+-------------
+ t
+(1 row)
+
+SELECT pg_drop_replication_slot('pgout_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+DROP PUBLICATION pub_rowid;
+DROP TABLE tid_rowid;
+-- 8. Cleanup
+DROP TABLE tid_test;
+DROP TABLE tid_nopk;
+DROP TABLE tid_conflict;
+SELECT pg_drop_replication_slot('tid_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
