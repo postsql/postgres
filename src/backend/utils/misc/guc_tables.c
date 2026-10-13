@@ -1913,6 +1913,16 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"logical_decoding_expose_headers", PGC_USERSET, REPLICATION_SENDING,
+			gettext_noop("Exposes tuple identifiers (TIDs) and tuple header metadata during logical decoding."),
+			NULL
+		},
+		&logical_decoding_expose_headers,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"in_hot_standby", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows whether hot standby is currently active."),
 			NULL,

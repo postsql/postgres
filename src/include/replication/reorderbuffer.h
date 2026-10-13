@@ -26,6 +26,7 @@
 /* GUC variables */
 extern PGDLLIMPORT int logical_decoding_work_mem;
 extern PGDLLIMPORT int debug_logical_replication_streaming;
+extern PGDLLIMPORT bool logical_decoding_expose_headers;
 
 /* possible values for debug_logical_replication_streaming */
 typedef enum
@@ -161,6 +162,15 @@ typedef struct ReorderBufferChange
 	 * otherwise it's the preallocated list.
 	 */
 	dlist_node	node;
+
+	/*
+	 * Tuple identifiers (TIDs) of the changes, valid even if tuple data is
+	 * not logged.  Placed at the end of the struct to maintain binary (ABI)
+	 * compatibility with logical decoding output plugins compiled without
+	 * this patch.
+	 */
+	ItemPointerData old_tid;
+	ItemPointerData new_tid;
 } ReorderBufferChange;
 
 /* ReorderBufferTXN txn_flags */

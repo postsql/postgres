@@ -213,7 +213,8 @@ CopyToTextLikeStart(CopyToState cstate, TupleDesc tupDesc)
 				CopySendChar(cstate, cstate->opts.delim[0]);
 			hdr_delim = true;
 
-			colname = NameStr(TupleDescAttr(tupDesc, attnum - 1)->attname);
+			colname = (attnum == SelfItemPointerAttributeNumber) ?
+				".rowid" : NameStr(TupleDescAttr(tupDesc, attnum - 1)->attname);
 
 			if (cstate->opts.csv_mode)
 				CopyAttributeOutCSV(cstate, colname, false);
@@ -267,11 +268,23 @@ CopyToTextLikeOneRow(CopyToState cstate,
 {
 	bool		need_delim = false;
 	FmgrInfo   *out_functions = cstate->out_functions;
+	int			att_idx = 0;
 
 	foreach_int(attnum, cstate->attnumlist)
 	{
-		Datum		value = slot->tts_values[attnum - 1];
-		bool		isnull = slot->tts_isnull[attnum - 1];
+		Datum		value;
+		bool		isnull;
+
+		if (attnum == SelfItemPointerAttributeNumber)
+		{
+			value = PointerGetDatum(&slot->tts_tid);
+			isnull = !ItemPointerIsValid(&slot->tts_tid);
+		}
+		else
+		{
+			value = slot->tts_values[attnum - 1];
+			isnull = slot->tts_isnull[attnum - 1];
+		}
 
 		if (need_delim)
 			CopySendChar(cstate, cstate->opts.delim[0]);
@@ -285,15 +298,17 @@ CopyToTextLikeOneRow(CopyToState cstate,
 		{
 			char	   *string;
 
-			string = OutputFunctionCall(&out_functions[attnum - 1],
+			string = OutputFunctionCall(&out_functions[att_idx],
 										value);
 
 			if (is_csv)
 				CopyAttributeOutCSV(cstate, string,
-									cstate->opts.force_quote_flags[attnum - 1]);
+									(attnum > 0 && cstate->opts.force_quote_flags) ?
+									cstate->opts.force_quote_flags[attnum - 1] : false);
 			else
 				CopyAttributeOutText(cstate, string);
 		}
+		att_idx++;
 	}
 
 	CopySendTextLikeEndOfRow(cstate);
@@ -345,14 +360,26 @@ static void
 CopyToBinaryOneRow(CopyToState cstate, TupleTableSlot *slot)
 {
 	FmgrInfo   *out_functions = cstate->out_functions;
+	int			att_idx = 0;
 
 	/* Binary per-tuple header */
 	CopySendInt16(cstate, list_length(cstate->attnumlist));
 
 	foreach_int(attnum, cstate->attnumlist)
 	{
-		Datum		value = slot->tts_values[attnum - 1];
-		bool		isnull = slot->tts_isnull[attnum - 1];
+		Datum		value;
+		bool		isnull;
+
+		if (attnum == SelfItemPointerAttributeNumber)
+		{
+			value = PointerGetDatum(&slot->tts_tid);
+			isnull = !ItemPointerIsValid(&slot->tts_tid);
+		}
+		else
+		{
+			value = slot->tts_values[attnum - 1];
+			isnull = slot->tts_isnull[attnum - 1];
+		}
 
 		if (isnull)
 		{
@@ -362,12 +389,13 @@ CopyToBinaryOneRow(CopyToState cstate, TupleTableSlot *slot)
 		{
 			bytea	   *outputbytes;
 
-			outputbytes = SendFunctionCall(&out_functions[attnum - 1],
+			outputbytes = SendFunctionCall(&out_functions[att_idx],
 										   value);
 			CopySendInt32(cstate, VARSIZE(outputbytes) - VARHDRSZ);
 			CopySendData(cstate, VARDATA(outputbytes),
 						 VARSIZE(outputbytes) - VARHDRSZ);
 		}
+		att_idx++;
 	}
 
 	CopySendEndOfRow(cstate);
@@ -1028,7 +1056,6 @@ DoCopyTo(CopyToState cstate)
 	bool		pipe = (cstate->filename == NULL && cstate->data_dest_cb == NULL);
 	bool		fe_copy = (pipe && whereToSendOutput == DestRemote);
 	TupleDesc	tupDesc;
-	int			num_phys_attrs;
 	ListCell   *cur;
 	uint64		processed;
 
@@ -1039,21 +1066,30 @@ DoCopyTo(CopyToState cstate)
 		tupDesc = RelationGetDescr(cstate->rel);
 	else
 		tupDesc = cstate->queryDesc->tupDesc;
-	num_phys_attrs = tupDesc->natts;
 	cstate->opts.null_print_client = cstate->opts.null_print;	/* default */
 
 	/* We use fe_msgbuf as a per-row buffer regardless of copy_dest */
 	cstate->fe_msgbuf = makeStringInfo();
 
 	/* Get info about the columns we need to process. */
-	cstate->out_functions = (FmgrInfo *) palloc(num_phys_attrs * sizeof(FmgrInfo));
-	foreach(cur, cstate->attnumlist)
+	cstate->out_functions = (FmgrInfo *) palloc(list_length(cstate->attnumlist) * sizeof(FmgrInfo));
 	{
-		int			attnum = lfirst_int(cur);
-		Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
+		int			att_idx = 0;
 
-		cstate->routine->CopyToOutFunc(cstate, attr->atttypid,
-									   &cstate->out_functions[attnum - 1]);
+		foreach(cur, cstate->attnumlist)
+		{
+			int			attnum = lfirst_int(cur);
+			Oid			atttypid;
+
+			if (attnum == SelfItemPointerAttributeNumber)
+				atttypid = TIDOID;
+			else
+				atttypid = TupleDescAttr(tupDesc, attnum - 1)->atttypid;
+
+			cstate->routine->CopyToOutFunc(cstate, atttypid,
+										   &cstate->out_functions[att_idx]);
+			att_idx++;
+		}
 	}
 
 	/*

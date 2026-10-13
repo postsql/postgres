@@ -886,6 +886,25 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 }
 
 /*
+ * Helpers to set tuple identifiers (TIDs) on changes and their associated tuples.
+ */
+static inline void
+ReorderBufferChangeSetNewTid(ReorderBufferChange *change, BlockNumber blk, OffsetNumber off)
+{
+	ItemPointerSet(&change->new_tid, blk, off);
+	if (logical_decoding_expose_headers && change->data.tp.newtuple)
+		change->data.tp.newtuple->t_self = change->new_tid;
+}
+
+static inline void
+ReorderBufferChangeSetOldTid(ReorderBufferChange *change, BlockNumber blk, OffsetNumber off)
+{
+	ItemPointerSet(&change->old_tid, blk, off);
+	if (logical_decoding_expose_headers && change->data.tp.oldtuple)
+		change->data.tp.oldtuple->t_self = change->old_tid;
+}
+
+/*
  * Parse XLOG_HEAP_INSERT (not MULTI_INSERT!) records into tuplebufs.
  *
  * Inserts can contain the new tuple.
@@ -900,6 +919,7 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	xl_heap_insert *xlrec;
 	ReorderBufferChange *change;
 	RelFileLocator target_locator;
+	BlockNumber blk;
 
 	xlrec = (xl_heap_insert *) XLogRecGetData(r);
 
@@ -911,7 +931,7 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &blk);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -936,6 +956,8 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	DecodeXLogTuple(tupledata, datalen, change->data.tp.newtuple);
 
+	ReorderBufferChangeSetNewTid(change, blk, xlrec->offnum);
+
 	change->data.tp.clear_toast_afterwards = true;
 
 	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr,
@@ -957,11 +979,13 @@ DecodeUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	ReorderBufferChange *change;
 	char	   *data;
 	RelFileLocator target_locator;
+	BlockNumber newblk;
+	BlockNumber oldblk;
 
 	xlrec = (xl_heap_update *) XLogRecGetData(r);
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &newblk);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -1005,6 +1029,14 @@ DecodeUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		DecodeXLogTuple(data, datalen, change->data.tp.oldtuple);
 	}
 
+	if (XLogRecHasBlockRef(r, 1))
+		XLogRecGetBlockTag(r, 1, NULL, NULL, &oldblk);
+	else
+		oldblk = newblk;
+
+	ReorderBufferChangeSetOldTid(change, oldblk, xlrec->old_offnum);
+	ReorderBufferChangeSetNewTid(change, newblk, xlrec->new_offnum);
+
 	change->data.tp.clear_toast_afterwards = true;
 
 	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr,
@@ -1023,11 +1055,12 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	xl_heap_delete *xlrec;
 	ReorderBufferChange *change;
 	RelFileLocator target_locator;
+	BlockNumber blk;
 
 	xlrec = (xl_heap_delete *) XLogRecGetData(r);
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &blk);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -1060,6 +1093,8 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		DecodeXLogTuple((char *) xlrec + SizeOfHeapDelete,
 						datalen, change->data.tp.oldtuple);
 	}
+
+	ReorderBufferChangeSetOldTid(change, blk, xlrec->offnum);
 
 	change->data.tp.clear_toast_afterwards = true;
 
@@ -1118,6 +1153,8 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	char	   *tupledata;
 	Size		tuplelen;
 	RelFileLocator rlocator;
+	BlockNumber blk;
+	bool		isinit;
 
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(r);
 
@@ -1129,13 +1166,15 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &rlocator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &rlocator, NULL, &blk);
 	if (rlocator.dbOid != ctx->slot->data.database)
 		return;
 
 	/* output plugin doesn't look for this origin, no need to queue */
 	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
 		return;
+
+	isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
 
 	/*
 	 * We know that this multi_insert isn't for a catalog, so the block should
@@ -1152,6 +1191,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		int			datalen;
 		HeapTuple	tuple;
 		HeapTupleHeader header;
+		OffsetNumber offnum;
 
 		change = ReorderBufferAllocChange(ctx->reorder);
 		change->action = REORDER_BUFFER_CHANGE_INSERT;
@@ -1185,6 +1225,9 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		header->t_infomask = xlhdr->t_infomask;
 		header->t_infomask2 = xlhdr->t_infomask2;
 		header->t_hoff = xlhdr->t_hoff;
+
+		offnum = isinit ? (FirstOffsetNumber + i) : xlrec->offsets[i];
+		ReorderBufferChangeSetNewTid(change, blk, offnum);
 
 		/*
 		 * Reset toast reassembly state only after the last row in the last
