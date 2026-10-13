@@ -3679,7 +3679,9 @@ describeOneTableDetails(const char *schemaname,
 			printfPQExpBuffer(&buf, "%s: %s",
 							  s,
 							  tableinfo.relreplident == 'f' ? "FULL" :
+							  tableinfo.relreplident == 'r' ? "ROWID" :
 							  tableinfo.relreplident == 'n' ? "NOTHING" :
+							  tableinfo.relreplident == 'd' ? "NOTHING" :
 							  "???");
 
 			printTableAddFooter(&cont, buf.data);

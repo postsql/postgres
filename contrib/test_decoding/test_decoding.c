@@ -33,6 +33,7 @@ typedef struct
 	MemoryContext context;
 	bool		include_xids;
 	bool		include_timestamp;
+	bool		include_tids;
 	bool		skip_empty_xacts;
 	bool		only_local;
 } TestDecodingData;
@@ -202,6 +203,16 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 			if (elem->arg == NULL)
 				data->include_timestamp = true;
 			else if (!parse_bool(strVal(elem->arg), &data->include_timestamp))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+								strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-tids") == 0)
+		{
+			if (elem->arg == NULL)
+				data->include_tids = true;
+			else if (!parse_bool(strVal(elem->arg), &data->include_tids))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -587,6 +598,15 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 	}
 }
 
+static inline void
+append_tid(StringInfo str, const char *label, const ItemPointer tid)
+{
+	if (ItemPointerIsValid(tid))
+		appendStringInfo(str, " %s: (%u,%u)", label,
+						 ItemPointerGetBlockNumberNoCheck(tid),
+						 ItemPointerGetOffsetNumberNoCheck(tid));
+}
+
 /*
  * callback for individual changed tuples
  */
@@ -630,6 +650,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
 			appendStringInfoString(ctx->out, " INSERT:");
+			if (data->include_tids && logical_decoding_expose_headers)
+				append_tid(ctx->out, "new-tid", &change->new_tid);
 			if (change->data.tp.newtuple == NULL)
 				appendStringInfoString(ctx->out, " (no-tuple-data)");
 			else
@@ -639,6 +661,11 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			appendStringInfoString(ctx->out, " UPDATE:");
+			if (data->include_tids && logical_decoding_expose_headers)
+			{
+				append_tid(ctx->out, "old-tid", &change->old_tid);
+				append_tid(ctx->out, "new-tid", &change->new_tid);
+			}
 			if (change->data.tp.oldtuple != NULL)
 			{
 				appendStringInfoString(ctx->out, " old-key:");
@@ -657,6 +684,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			appendStringInfoString(ctx->out, " DELETE:");
+			if (data->include_tids && logical_decoding_expose_headers)
+				append_tid(ctx->out, "old-tid", &change->old_tid);
 
 			/* if there was no PK, we only know that a delete happened */
 			if (change->data.tp.oldtuple == NULL)

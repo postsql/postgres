@@ -2125,6 +2125,17 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"logical_decoding_expose_headers", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Expose tuple headers like ctid in logical decoding."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&logical_decoding_expose_headers,
+		false,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL

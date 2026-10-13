@@ -643,6 +643,8 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 						tuple = execute_attr_map_tuple(tuple, relentry->map);
 				}
 
+				tuple->t_self = change->new_tid;
+
 				OutputPluginPrepareWrite(ctx, true);
 				logicalrep_write_insert(ctx->out, xid, relation, tuple,
 										data->binary);
@@ -651,6 +653,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			}
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			{
+				HeapTupleData dummy_oldtuple;
 				HeapTuple	oldtuple = change->data.tp.oldtuple ?
 				&change->data.tp.oldtuple->tuple : NULL;
 				HeapTuple	newtuple = &change->data.tp.newtuple->tuple;
@@ -672,6 +675,17 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					}
 				}
 
+				if (!oldtuple &&
+					relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+				{
+					MemSet(&dummy_oldtuple, 0, sizeof(HeapTupleData));
+					oldtuple = &dummy_oldtuple;
+				}
+
+				if (oldtuple)
+					oldtuple->t_self = change->old_tid;
+				newtuple->t_self = change->new_tid;
+
 				OutputPluginPrepareWrite(ctx, true);
 				logicalrep_write_update(ctx->out, xid, relation, oldtuple,
 										newtuple, data->binary);
@@ -679,9 +693,19 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				break;
 			}
 		case REORDER_BUFFER_CHANGE_DELETE:
-			if (change->data.tp.oldtuple)
+			if (change->data.tp.oldtuple ||
+				relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
 			{
-				HeapTuple	oldtuple = &change->data.tp.oldtuple->tuple;
+				HeapTupleData dummy_oldtuple;
+				HeapTuple	oldtuple;
+
+				if (change->data.tp.oldtuple)
+					oldtuple = &change->data.tp.oldtuple->tuple;
+				else
+				{
+					MemSet(&dummy_oldtuple, 0, sizeof(HeapTupleData));
+					oldtuple = &dummy_oldtuple;
+				}
 
 				/* Switch relation if publishing via root. */
 				if (relentry->publish_as_relid != RelationGetRelid(relation))
@@ -690,9 +714,11 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					ancestor = RelationIdGetRelation(relentry->publish_as_relid);
 					relation = ancestor;
 					/* Convert tuple if needed. */
-					if (relentry->map)
+					if (change->data.tp.oldtuple && relentry->map)
 						oldtuple = execute_attr_map_tuple(oldtuple, relentry->map);
 				}
+
+				oldtuple->t_self = change->old_tid;
 
 				OutputPluginPrepareWrite(ctx, true);
 				logicalrep_write_delete(ctx->out, xid, relation, oldtuple,

@@ -594,6 +594,7 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 
 	/* If relation has replica identity we are always good. */
 	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
+		rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID ||
 		OidIsValid(RelationGetReplicaIndex(rel)))
 		return;
 
