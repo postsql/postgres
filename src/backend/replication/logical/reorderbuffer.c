@@ -222,6 +222,7 @@ static const Size max_changes_in_memory = 4096; /* XXX for restore only */
 
 /* GUC variable */
 int			debug_logical_replication_streaming = DEBUG_LOGICAL_REP_STREAMING_BUFFERED;
+bool		logical_decoding_expose_headers = false;
 
 /* ---------------------------------------
  * primary reorderbuffer support routines
