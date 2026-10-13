@@ -1117,6 +1117,11 @@ CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist)
 			}
 			if (attnum == InvalidAttrNumber)
 			{
+				if (strcmp(name, ".rowid") == 0 || strcmp(name, "ctid") == 0)
+					attnum = SelfItemPointerAttributeNumber;
+			}
+			if (attnum == InvalidAttrNumber)
+			{
 				if (rel != NULL)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),

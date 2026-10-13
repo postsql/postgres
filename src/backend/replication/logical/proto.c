@@ -17,6 +17,7 @@
 #include "catalog/pg_type.h"
 #include "libpq/pqformat.h"
 #include "replication/logicalproto.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -456,7 +457,8 @@ logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX ||
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID);
 
 	/* transaction ID (if not valid, we're not streaming) */
 	if (TransactionIdIsValid(xid))
@@ -465,7 +467,7 @@ logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 	/* use Oid as relation identifier */
 	pq_sendint32(out, RelationGetRelid(rel));
 
-	if (oldslot != NULL)
+	if (oldslot != NULL || rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
 	{
 		if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
 			pq_sendbyte(out, 'O');	/* old tuple follows */
@@ -532,7 +534,8 @@ logicalrep_write_delete(StringInfo out, TransactionId xid, Relation rel,
 {
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX ||
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID);
 
 	pq_sendbyte(out, LOGICAL_REP_MSG_DELETE);
 
@@ -789,11 +792,21 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 
 		nliveatts++;
 	}
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+		nliveatts++;
 	pq_sendint16(out, nliveatts);
 
-	slot_getallattrs(slot);
-	values = slot->tts_values;
-	isnull = slot->tts_isnull;
+	if (slot != NULL && !TTS_EMPTY(slot))
+	{
+		slot_getallattrs(slot);
+		values = slot->tts_values;
+		isnull = slot->tts_isnull;
+	}
+	else
+	{
+		values = NULL;
+		isnull = NULL;
+	}
 
 	/* Write the values */
 	for (i = 0; i < desc->natts; i++)
@@ -806,7 +819,7 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 											  include_gencols_type))
 			continue;
 
-		if (isnull[i])
+		if (isnull == NULL || isnull[i])
 		{
 			pq_sendbyte(out, LOGICALREP_COLUMN_NULL);
 			continue;
@@ -854,6 +867,40 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 		}
 
 		ReleaseSysCache(typtup);
+	}
+
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+	{
+		if (slot != NULL && ItemPointerIsValid(&slot->tts_tid))
+		{
+			Datum		tidval = PointerGetDatum(&slot->tts_tid);
+
+			if (binary)
+			{
+				bytea	   *outputbytes;
+				int			len;
+
+				pq_sendbyte(out, LOGICALREP_COLUMN_BINARY);
+				outputbytes = DatumGetByteaP(DirectFunctionCall1(tidsend, tidval));
+				len = VARSIZE(outputbytes) - VARHDRSZ;
+				pq_sendint(out, len, 4);
+				pq_sendbytes(out, VARDATA(outputbytes), len);
+				pfree(outputbytes);
+			}
+			else
+			{
+				char	   *outputstr;
+
+				pq_sendbyte(out, LOGICALREP_COLUMN_TEXT);
+				outputstr = DatumGetCString(DirectFunctionCall1(tidout, tidval));
+				pq_sendcountedtext(out, outputstr, strlen(outputstr));
+				pfree(outputstr);
+			}
+		}
+		else
+		{
+			pq_sendbyte(out, LOGICALREP_COLUMN_NULL);
+		}
 	}
 }
 
@@ -943,11 +990,13 @@ logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns,
 
 		nliveatts++;
 	}
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+		nliveatts++;
 	pq_sendint16(out, nliveatts);
 
 	/* fetch bitmap of REPLICATION IDENTITY attributes */
 	replidentfull = (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL);
-	if (!replidentfull)
+	if (!replidentfull && rel->rd_rel->relreplident != REPLICA_IDENTITY_ROWID)
 		idattrs = RelationGetIdentityKeyBitmap(rel);
 
 	/* send the attributes */
@@ -976,6 +1025,14 @@ logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns,
 
 		/* attribute mode */
 		pq_sendint32(out, att->atttypmod);
+	}
+
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+	{
+		pq_sendbyte(out, LOGICALREP_IS_REPLICA_IDENTITY);
+		pq_sendstring(out, ".rowid");
+		pq_sendint32(out, (int) TIDOID);
+		pq_sendint32(out, -1);
 	}
 
 	bms_free(idattrs);
