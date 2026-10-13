@@ -1276,7 +1276,7 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 	 *
 	 * For deletes, we only have the old tuple.
 	 */
-	if (!new_slot || !old_slot)
+	if (!new_slot || !old_slot || TTS_EMPTY(old_slot))
 	{
 		ecxt->ecxt_scantuple = new_slot ? new_slot : old_slot;
 		result = pgoutput_row_filter_exec_expr(filter_exprstate, ecxt);
@@ -1479,6 +1479,8 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 									 &action))
 				break;
 
+			new_slot->tts_tid = change->new_tid;
+
 			/*
 			 * Send BEGIN if we haven't yet.
 			 *
@@ -1534,10 +1536,23 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				}
 			}
 
+			if (!old_slot &&
+				(relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID ||
+				 targetrel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID))
+			{
+				old_slot = relentry->old_slot;
+				ExecClearTuple(old_slot);
+			}
+
 			/* Check row filter */
 			if (!pgoutput_row_filter(targetrel, old_slot, &new_slot,
 									 relentry, &action))
 				break;
+
+			if (old_slot)
+				old_slot->tts_tid = change->old_tid;
+			if (new_slot)
+				new_slot->tts_tid = change->new_tid;
 
 			/* Send BEGIN if we haven't yet */
 			if (txndata && !txndata->sent_begin_txn)
@@ -1575,12 +1590,16 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			OutputPluginWrite(ctx, true);
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
-			if (change->data.tp.oldtuple)
+			if (change->data.tp.oldtuple ||
+				relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
 			{
 				old_slot = relentry->old_slot;
 
-				ExecStoreHeapTuple(&change->data.tp.oldtuple->tuple,
-								   old_slot, false);
+				if (change->data.tp.oldtuple)
+					ExecStoreHeapTuple(&change->data.tp.oldtuple->tuple,
+									   old_slot, false);
+				else
+					ExecClearTuple(old_slot);
 
 				/* Switch relation if publishing via root. */
 				if (relentry->publish_as_relid != RelationGetRelid(relation))
@@ -1589,7 +1608,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					ancestor = RelationIdGetRelation(relentry->publish_as_relid);
 					targetrel = ancestor;
 					/* Convert tuple if needed. */
-					if (relentry->attrmap)
+					if (change->data.tp.oldtuple && relentry->attrmap)
 					{
 						TupleDesc	tupdesc = RelationGetDescr(targetrel);
 
@@ -1600,9 +1619,12 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				}
 
 				/* Check row filter */
-				if (!pgoutput_row_filter(targetrel, old_slot, &new_slot,
+				if (change->data.tp.oldtuple &&
+					!pgoutput_row_filter(targetrel, old_slot, &new_slot,
 										 relentry, &action))
 					break;
+
+				old_slot->tts_tid = change->old_tid;
 
 				/* Send BEGIN if we haven't yet */
 				if (txndata && !txndata->sent_begin_txn)
@@ -1632,7 +1654,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	/* Drop the new slots that were used to store the converted tuples. */
 	if (relentry->attrmap)
 	{
-		if (old_slot)
+		if (old_slot && change->data.tp.oldtuple)
 			ExecDropSingleTupleTableSlot(old_slot);
 
 		if (new_slot)

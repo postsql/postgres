@@ -221,6 +221,8 @@ typedef struct ReorderBufferDiskChange
 int			logical_decoding_work_mem;
 static const Size max_changes_in_memory = 4096; /* XXX for restore only */
 
+/* GUC variable */
+bool		logical_decoding_expose_headers = false;
 /* ---------------------------------------
  * primary reorderbuffer support routines
  * ---------------------------------------

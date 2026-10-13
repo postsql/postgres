@@ -18,6 +18,7 @@
 #include "utils/timestamp.h"
 
 extern PGDLLIMPORT int logical_decoding_work_mem;
+extern PGDLLIMPORT bool logical_decoding_expose_headers;
 
 /* an individual tuple, stored in one chunk of memory */
 typedef struct ReorderBufferTupleBuf
@@ -165,6 +166,15 @@ typedef struct ReorderBufferChange
 	 * otherwise it's the preallocated list.
 	 */
 	dlist_node	node;
+
+	/*
+	 * Tuple identifiers (TIDs) of the changes, valid even if tuple data is
+	 * not logged.  Placed at the end of the struct to maintain binary (ABI)
+	 * compatibility with logical decoding output plugins compiled without
+	 * this patch.
+	 */
+	ItemPointerData old_tid;
+	ItemPointerData new_tid;
 } ReorderBufferChange;
 
 /* ReorderBufferTXN txn_flags */
