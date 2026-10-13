@@ -2113,6 +2113,50 @@ $node->pgbench(
 	],
 	'pgbench heterogeneous client groups and sequential streams');
 
+# Test latency percentiles, SLA pass/fail validation, composite metrics (nopm, qph), and JSON report export
+my $tpcc_no = $node->basedir . '/001_pgbench_tpcc_new_order.sql';
+my $json_out = $node->basedir . '/001_pgbench_report.json';
+append_to_file($tpcc_no, "SELECT 1;\n");
+
+$node->pgbench(
+	"-n -t 2 --group name=oltp,clients=1,threads=1,file=$tpcc_no --group name=olap,clients=1,threads=1,file=$grp_s1,sequential=true --sla new_order:p90<=10s --sla olap:p95<=10000ms --json-report=$json_out",
+	0,
+	[
+		qr{processed: 4/4},
+		qr{latency percentiles: p50 = \d+\.\d+ ms, p90 = \d+\.\d+ ms, p95 = \d+\.\d+ ms, p99 = \d+\.\d+ ms, p99\.9 = \d+\.\d+ ms},
+		qr{nopm = \d+\.\d+ \(New-Order transactions: 2\)},
+		qr{qph\@SF1 = \d+\.\d+ \(queries: 2\)},
+		qr{SLA new_order:p90 <= 10000\.000 ms: actual = \d+\.\d+ ms \[PASS\]},
+		qr{SLA olap:p95 <= 10000\.000 ms: actual = \d+\.\d+ ms \[PASS\]},
+	],
+	[
+		qr{text 'olap:0:s1'},
+	],
+	'pgbench percentiles, SLA pass, nopm, qph, and json-report');
+
+ok(-f $json_out, 'JSON report file was created');
+my $json_content = slurp_file($json_out);
+like($json_content, qr/"sla_all_passed": true/, 'JSON report indicates sla_all_passed: true');
+like($json_content, qr/"nopm": \d+\.\d+/, 'JSON report contains nopm');
+like($json_content, qr/"qph": \d+\.\d+/, 'JSON report contains qph');
+
+# Test SLA failure returns exit code 1
+$node->pgbench(
+	'-n -t 1 --sla total:p50<=1us',
+	1,
+	[
+		qr{SLA total:p50 <= 0\.001 ms: actual = \d+\.\d+ ms \[FAIL\]},
+	],
+	[
+		qr{One or more SLA compliance checks failed},
+	],
+	'pgbench SLA failure exit status',
+	{
+		'001_pgbench_sla_fail' => q{
+SELECT pg_sleep(0.005);
+}
+	});
+
 # done
 $node->safe_psql('postgres', 'DROP TABLESPACE regress_pgbench_tap_1_ts');
 $node->stop;
