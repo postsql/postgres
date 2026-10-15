@@ -4,6 +4,7 @@
 use strict;
 use warnings FATAL => 'all';
 
+use FindBin;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -2156,6 +2157,289 @@ $node->pgbench(
 SELECT pg_sleep(0.005);
 }
 	});
+
+# Test standard benchmark workload suites (pgbench-banking, pgbench-order, pgbench-brokerage, pgbench-analytics, pgbench-retail, pgbench-htap)
+my $wl_dir = "$FindBin::RealBin/../workloads";
+
+for my $db (qw(wl_pgbench_banking wl_pgbench_order wl_pgbench_brokerage wl_pgbench_analytics wl_pgbench_retail wl_pgbench_htap))
+{
+	$node->safe_psql('postgres', "CREATE DATABASE $db;");
+}
+
+# 0. pgbench-banking parallel initialization and workload execution
+$node->pgbench(
+	"-n -d wl_pgbench_banking -t 1 -f $wl_dir/pgbench-banking/pgbench_banking_schema.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-banking schema creation');
+
+$node->pgbench(
+	"-n -d wl_pgbench_banking -c 2 -j 2 -t 1 -s 2 -D num_workers=2 -f $wl_dir/pgbench-banking/pgbench_banking_init.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-banking parallel in-database initialization');
+
+$node->pgbench(
+	"-n -d wl_pgbench_banking -t 1 -f $wl_dir/pgbench-banking/pgbench_banking_constraints.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-banking post-load constraints');
+
+is($node->safe_psql('wl_pgbench_banking', 'SELECT count(*) FROM pgbench_branches;'), '2', 'pgbench-banking branches count');
+is($node->safe_psql('wl_pgbench_banking', 'SELECT count(*) FROM pgbench_tellers;'), '20', 'pgbench-banking tellers count');
+is($node->safe_psql('wl_pgbench_banking', 'SELECT count(*) FROM pgbench_accounts;'), '200000', 'pgbench-banking accounts count');
+
+my $b_json = $node->basedir . '/001_pgbench_b_report.json';
+$node->pgbench(
+	"-n -d wl_pgbench_banking -c 2 -j 2 -t 5 -s 2 "
+	  . "-f $wl_dir/pgbench-banking/pgbench_banking_tx.sql\@70 "
+	  . "-f $wl_dir/pgbench-banking/pgbench_banking_simple_update.sql\@20 "
+	  . "-f $wl_dir/pgbench-banking/pgbench_banking_select_only.sql\@10 "
+	  . "--sla total:p95<=60s --json-report=$b_json",
+	0,
+	[
+		qr{processed: 10/10},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{SLA total:p95 <= 60000\.000 ms: actual = \d+\.\d+ ms \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-banking workload suite execution');
+
+# 1. pgbench-order parallel initialization and workload execution
+$node->pgbench(
+	"-n -d wl_pgbench_order -t 1 -f $wl_dir/pgbench-order/pgbench_order_schema.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-order schema creation');
+
+$node->pgbench(
+	"-n -d wl_pgbench_order -c 2 -j 2 -t 1 -s 2 -D num_workers=2 -f $wl_dir/pgbench-order/pgbench_order_init.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-order parallel in-database initialization');
+
+$node->pgbench(
+	"-n -d wl_pgbench_order -t 1 -f $wl_dir/pgbench-order/pgbench_order_constraints.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-order post-load constraints');
+
+is($node->safe_psql('wl_pgbench_order', 'SELECT count(*) FROM warehouse;'), '2', 'pgbench-order warehouse count');
+is($node->safe_psql('wl_pgbench_order', 'SELECT count(*) FROM district;'), '20', 'pgbench-order district count');
+is($node->safe_psql('wl_pgbench_order', 'SELECT count(*) FROM item;'), '1000', 'pgbench-order item count');
+
+my $c_json = $node->basedir . '/001_pgbench_c_report.json';
+$node->pgbench(
+	"-n -d wl_pgbench_order -c 2 -j 2 -t 5 -s 2 "
+	  . "-f $wl_dir/pgbench-order/pgbench_order_new_order.sql\@45 "
+	  . "-f $wl_dir/pgbench-order/pgbench_order_payment.sql\@43 "
+	  . "-f $wl_dir/pgbench-order/pgbench_order_order_status.sql\@4 "
+	  . "-f $wl_dir/pgbench-order/pgbench_order_delivery.sql\@4 "
+	  . "-f $wl_dir/pgbench-order/pgbench_order_stock_level.sql\@4 "
+	  . "--sla total:p95<=60s --json-report=$c_json",
+	0,
+	[
+		qr{processed: 10/10},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{SLA total:p95 <= 60000\.000 ms: actual = \d+\.\d+ ms \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-order workload suite execution');
+
+# 2. pgbench-brokerage parallel initialization and workload execution
+$node->pgbench(
+	"-n -d wl_pgbench_brokerage -t 1 -f $wl_dir/pgbench-brokerage/pgbench_brokerage_schema.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-brokerage schema creation');
+
+$node->pgbench(
+	"-n -d wl_pgbench_brokerage -c 2 -j 2 -t 1 -s 2 -D num_workers=2 -f $wl_dir/pgbench-brokerage/pgbench_brokerage_init.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-brokerage parallel in-database initialization');
+
+$node->pgbench(
+	"-n -d wl_pgbench_brokerage -t 1 -f $wl_dir/pgbench-brokerage/pgbench_brokerage_constraints.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-brokerage post-load constraints');
+
+is($node->safe_psql('wl_pgbench_brokerage', 'SELECT count(*) FROM broker;'), '20', 'pgbench-brokerage broker count');
+is($node->safe_psql('wl_pgbench_brokerage', 'SELECT count(*) FROM security;'), '200', 'pgbench-brokerage security count');
+
+$node->pgbench(
+	"-n -d wl_pgbench_brokerage -c 2 -j 2 -t 5 -s 2 "
+	  . "-f $wl_dir/pgbench-brokerage/pgbench_brokerage_trade_order.sql\@10 "
+	  . "-f $wl_dir/pgbench-brokerage/pgbench_brokerage_trade_result.sql\@10 "
+	  . "-f $wl_dir/pgbench-brokerage/pgbench_brokerage_customer_position.sql\@13 "
+	  . "-f $wl_dir/pgbench-brokerage/pgbench_brokerage_market_watch.sql\@18 "
+	  . "-f $wl_dir/pgbench-brokerage/pgbench_brokerage_broker_volume.sql\@5 "
+	  . "-f $wl_dir/pgbench-brokerage/pgbench_brokerage_trade_status.sql\@44",
+	0,
+	[
+		qr{processed: 10/10},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-brokerage workload suite execution');
+
+# 3. pgbench-analytics parallel initialization and workload execution
+$node->pgbench(
+	"-n -d wl_pgbench_analytics -t 1 -f $wl_dir/pgbench-analytics/pgbench_analytics_schema.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-analytics schema creation');
+
+$node->pgbench(
+	"-n -d wl_pgbench_analytics -c 2 -j 2 -t 1 -s 1 -D num_workers=2 -f $wl_dir/pgbench-analytics/pgbench_analytics_init.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-analytics parallel in-database initialization');
+
+$node->pgbench(
+	"-n -d wl_pgbench_analytics -t 1 -f $wl_dir/pgbench-analytics/pgbench_analytics_constraints.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-analytics post-load constraints');
+
+is($node->safe_psql('wl_pgbench_analytics', 'SELECT count(*) FROM region;'), '5', 'pgbench-analytics region count');
+is($node->safe_psql('wl_pgbench_analytics', 'SELECT count(*) FROM nation;'), '25', 'pgbench-analytics nation count');
+is($node->safe_psql('wl_pgbench_analytics', 'SELECT count(*) FROM supplier;'), '100', 'pgbench-analytics supplier count');
+
+$node->pgbench(
+	"-n -d wl_pgbench_analytics -t 1 -s 1 "
+	  . "--group name=queries,clients=1,threads=1,file=$wl_dir/pgbench-analytics/pgbench_analytics_queries.sql "
+	  . "--group name=refresh,clients=1,threads=1,file=$wl_dir/pgbench-analytics/pgbench_analytics_refresh.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-analytics workload suite execution (queries + refresh groups)');
+
+# 4. pgbench-retail parallel initialization and workload execution
+$node->pgbench(
+	"-n -d wl_pgbench_retail -t 1 -f $wl_dir/pgbench-retail/pgbench_retail_schema.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-retail schema creation');
+
+$node->pgbench(
+	"-n -d wl_pgbench_retail -c 2 -j 2 -t 1 -s 1 -D num_workers=2 -f $wl_dir/pgbench-retail/pgbench_retail_init.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-retail parallel in-database initialization');
+
+$node->pgbench(
+	"-n -d wl_pgbench_retail -t 1 -f $wl_dir/pgbench-retail/pgbench_retail_constraints.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-retail post-load constraints');
+
+is($node->safe_psql('wl_pgbench_retail', 'SELECT count(*) FROM date_dim;'), '730', 'pgbench-retail date_dim count');
+is($node->safe_psql('wl_pgbench_retail', 'SELECT count(*) FROM item;'), '200', 'pgbench-retail item count');
+
+$node->pgbench(
+	"-n -d wl_pgbench_retail -t 2 -s 1 "
+	  . "--group name=ds_queries,clients=1,threads=1,"
+	  . "file=$wl_dir/pgbench-retail/pgbench_retail_q_store_sales.sql\@25,"
+	  . "file=$wl_dir/pgbench-retail/pgbench_retail_q_cross_channel.sql\@25,"
+	  . "file=$wl_dir/pgbench-retail/pgbench_retail_q_inventory.sql\@25,"
+	  . "file=$wl_dir/pgbench-retail/pgbench_retail_q_promotion.sql\@25 "
+	  . "--group name=ds_maint,clients=1,threads=1,file=$wl_dir/pgbench-retail/pgbench_retail_maintenance.sql",
+	0,
+	[
+		qr{processed: 4/4},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-retail workload suite execution');
+
+# 5. pgbench-htap parallel initialization and hybrid HTAP execution
+$node->pgbench(
+	"-n -d wl_pgbench_htap -t 1 -f $wl_dir/pgbench-htap/pgbench_htap_schema.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-htap schema creation');
+
+$node->pgbench(
+	"-n -d wl_pgbench_htap -c 2 -j 2 -t 1 -s 2 -D num_workers=2 -f $wl_dir/pgbench-htap/pgbench_htap_init.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+	],
+	[qr{^$}],
+	'pgbench-htap parallel in-database initialization');
+
+$node->pgbench(
+	"-n -d wl_pgbench_htap -t 1 -f $wl_dir/pgbench-htap/pgbench_htap_constraints.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-htap post-load constraints');
+
+is($node->safe_psql('wl_pgbench_htap', 'SELECT count(*) FROM htap_supplier;'), '100', 'pgbench-htap supplier count');
+is($node->safe_psql('wl_pgbench_htap', 'SELECT count(*) FROM warehouse;'), '2', 'pgbench-htap warehouse count');
+
+my $htap_json = $node->basedir . '/001_htap_report.json';
+$node->pgbench(
+	"-n -d wl_pgbench_htap -t 2 -s 2 "
+	  . "--group name=oltp,clients=2,threads=1,file=$wl_dir/pgbench-htap/pgbench_htap_oltp.sql "
+	  . "--group name=olap,clients=1,threads=1,"
+	  . "file=$wl_dir/pgbench-htap/pgbench_htap_olap_q1.sql,"
+	  . "file=$wl_dir/pgbench-htap/pgbench_htap_olap_q3.sql,"
+	  . "file=$wl_dir/pgbench-htap/pgbench_htap_olap_q5.sql,"
+	  . "file=$wl_dir/pgbench-htap/pgbench_htap_olap_q6.sql,"
+	  . "file=$wl_dir/pgbench-htap/pgbench_htap_olap_q18.sql,sequential=true "
+	  . "--sla oltp:p95<=60s --sla olap:p95<=60s --json-report=$htap_json",
+	0,
+	[
+		qr{processed: 6/6},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{SLA oltp:p95 <= 60000\.000 ms: actual = \d+\.\d+ ms \[PASS\]},
+		qr{SLA olap:p95 <= 60000\.000 ms: actual = \d+\.\d+ ms \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-htap hybrid OLTP + OLAP workload execution');
+
+for my $db (qw(wl_pgbench_order wl_pgbench_brokerage wl_pgbench_analytics wl_pgbench_retail wl_pgbench_htap))
+{
+	$node->safe_psql('postgres', "DROP DATABASE $db;");
+}
 
 # done
 $node->safe_psql('postgres', 'DROP TABLESPACE regress_pgbench_tap_1_ts');

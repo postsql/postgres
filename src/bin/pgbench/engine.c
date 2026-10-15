@@ -2297,14 +2297,10 @@ printResults(StatsData *total,
 			{
 				const char *desc = sql_script[i].desc;
 
-				if (strstr(desc, "tpch") != NULL ||
-					strstr(desc, "qphh") != NULL ||
-					strstr(desc, "qph") != NULL ||
-					strstr(desc, "analytics") != NULL ||
-					strstr(desc, "pgbench-analytics") != NULL ||
-					strstr(desc, "pgbench_analytics") != NULL ||
-					strstr(desc, "pgbench-h") != NULL ||
-					strstr(desc, "pgbench_h") != NULL)
+				if (strstr(desc, "analytics") != NULL || strstr(desc, "tpch") != NULL ||
+					strstr(desc, "qph") != NULL || strstr(desc, "qphh") != NULL ||
+					strstr(desc, "pgbench-analytics") != NULL || strstr(desc, "pgbench_analytics") != NULL ||
+					strstr(desc, "pgbench-h") != NULL || strstr(desc, "pgbench_h") != NULL)
 				{
 					has_qph = true;
 					tpch_query_cnt += (per_script_stats ? sql_script[i].stats.cnt : total->cnt);

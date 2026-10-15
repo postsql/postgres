@@ -1,0 +1,41 @@
+/*
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * DISCLAIMER: This workload is an independent engineering benchmark designed
+ * for database performance research, development, and regression testing.
+ * While inspired by industry transactional and decision support concepts,
+ * this suite is NOT an official TPC Benchmark, has NOT been audited or
+ * certified by the Transaction Processing Performance Council (TPC), and
+ * does NOT produce official TPC Benchmark Results (such as tpmC or QphH).
+ * TPC, TPC-C, TPC-E, TPC-H, TPC-DS, tpmC, and QphH are registered trademarks
+ * of the Transaction Processing Performance Council.
+ */
+
+--
+-- pgbench-h (TPC-H-inspired) Query 1: Pricing Summary Report Query
+--
+
+\set delta random(60, 120)
+\set ship_cutoff int_to_date('1998-12-01', -:delta, 'day')
+
+SELECT
+    l_returnflag,
+    l_linestatus,
+    sum(l_quantity) AS sum_qty,
+    sum(l_extendedprice) AS sum_base_price,
+    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+    avg(l_quantity) AS avg_qty,
+    avg(l_extendedprice) AS avg_price,
+    avg(l_discount) AS avg_disc,
+    count(*) AS count_order
+FROM
+    lineitem
+WHERE
+    l_shipdate <= :ship_cutoff::date
+GROUP BY
+    l_returnflag,
+    l_linestatus
+ORDER BY
+    l_returnflag,
+    l_linestatus;
