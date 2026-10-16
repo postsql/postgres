@@ -24,6 +24,7 @@ SUBDIRS = \
 		hstore		\
 		intagg		\
 		intarray	\
+		invisible_indexes \
 		isn		\
 		lo		\
 		ltree		\
