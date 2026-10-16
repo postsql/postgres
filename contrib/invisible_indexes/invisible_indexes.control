@@ -1,0 +1,6 @@
+# invisible_indexes extension
+comment = 'Invisible and excluded indexes management for PostgreSQL optimizer'
+default_version = '1.0'
+module_pathname = '$libdir/invisible_indexes'
+relocatable = false
+schema = 'invisible_indexes'
