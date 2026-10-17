@@ -106,6 +106,11 @@ typedef enum PgBenchFunction
 	PGBENCH_DATASET_COUNT,
 	PGBENCH_DATASET_GET,
 	PGBENCH_DATASET_NEXT_ID,
+	PGBENCH_GET_WATERMARK,
+	PGBENCH_SET_WATERMARK,
+	PGBENCH_RESERVOIR_PUSH,
+	PGBENCH_RESERVOIR_SAMPLE,
+	PGBENCH_RESERVOIR_COUNT,
 } PgBenchFunction;
 
 typedef struct PgBenchExpr PgBenchExpr;
@@ -206,6 +211,10 @@ typedef enum
 	CSTATE_START_COMMAND,
 	CSTATE_WAIT_RESULT,
 	CSTATE_SLEEP,
+	CSTATE_WAIT_SYNC,
+	CSTATE_IDLE,
+	CSTATE_CONNECTING,
+	CSTATE_DISCONNECTING,
 	CSTATE_END_COMMAND,
 	CSTATE_SKIP_COMMAND,
 
@@ -257,6 +266,7 @@ typedef enum
 
 #define MAX_LOOP_DEPTH	32
 #define MAX_TRY_DEPTH	32
+#define MAX_CALL_DEPTH	8
 
 typedef struct ForLoopState
 {
@@ -277,6 +287,18 @@ typedef struct TryState
 	int			loop_depth;		/* loop stack depth at \try entry */
 	bool		in_catch;		/* true once execution enters \catch */
 } TryState;
+
+typedef struct CallFrame
+{
+	int			script_idx;		/* caller script index in sql_script[] */
+	int			return_cmd;		/* command index to resume in caller */
+	ConditionalStack cstack;	/* caller conditional stack */
+	int			loop_depth;
+	ForLoopState loop_stack[MAX_LOOP_DEPTH];
+	int			try_depth;
+	TryState	try_stack[MAX_TRY_DEPTH];
+	pg_time_usec_t call_begin;
+} CallFrame;
 
 /*
  * Connection state.
@@ -301,6 +323,10 @@ typedef struct
 	int			command;		/* command number in script */
 	int			next_command;	/* explicit jump target, or -1 */
 	int			num_syncs;		/* number of ongoing sync commands */
+
+	/* sub-script call stack (\call) */
+	CallFrame	call_stack[MAX_CALL_DEPTH];
+	int			call_depth;
 
 	/* loop and exception handling state */
 	ForLoopState loop_stack[MAX_LOOP_DEPTH];
@@ -331,6 +357,19 @@ typedef struct
 	bool		has_think_time;
 	pg_time_usec_t txn_begin;	/* used for measuring schedule lag times */
 	pg_time_usec_t stmt_begin;	/* used for measuring statement latencies */
+
+	/* Pillar 2: Event-time pacing and causal watermark synchronization */
+	pg_time_usec_t bench_start_us;	/* thread benchmark start timestamp */
+	pg_time_usec_t sync_scheduled_us;	/* target wall-clock time for \wait_until */
+	int64		sync_dep_watermark; /* required causal watermark */
+	bool		has_sync_dep;	/* true if waiting on sync_dep_watermark */
+	bool		has_scheduled_time; /* true if scheduled via \wait_until or replay */
+
+	/* Pillar 6: Non-blocking session connect polling state */
+	PostgresPollingStatusType connect_poll_mode;
+	pg_time_usec_t session_conn_start;
+	char	   *session_target_db;
+	char	   *session_target_user;
 
 	/* whether client prepared each command of each script */
 	bool	  **prepared;

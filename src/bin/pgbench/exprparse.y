@@ -484,6 +484,21 @@ static const struct
 	{
 		"dataset_next_id", PGBENCH_NARGS_1_TO_2, PGBENCH_DATASET_NEXT_ID
 	},
+	{
+		"get_watermark", 0, PGBENCH_GET_WATERMARK
+	},
+	{
+		"set_watermark", 1, PGBENCH_SET_WATERMARK
+	},
+	{
+		"reservoir_push", 2, PGBENCH_RESERVOIR_PUSH
+	},
+	{
+		"reservoir_sample", PGBENCH_NARGS_1_TO_2, PGBENCH_RESERVOIR_SAMPLE
+	},
+	{
+		"reservoir_count", 1, PGBENCH_RESERVOIR_COUNT
+	},
 	/* keep as last array element */
 	{
 		NULL, 0, 0

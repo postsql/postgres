@@ -135,12 +135,17 @@ usage(void)
 		   "  --json-report=FILENAME   write structured JSON benchmark report to FILENAME\n"
 		   "  --log-prefix=PREFIX      prefix for transaction time log file\n"
 		   "                           (default: \"pgbench_log\")\n"
+		   "  --max-concurrent-sessions=NUM\n"
+		   "                           limit initially established sessions to NUM\n"
 		   "  --max-tries=NUM          max number of tries to run transaction (default: 1)\n"
 		   "  --progress-timestamp     use Unix epoch timestamps for progress\n"
 		   "  --random-seed=SEED       set random seed (\"time\", \"rand\", integer)\n"
+		   "  --replay-speed=FACTOR    scale relative timestamps in \\wait_until (default: 1.0)\n"
+		   "  --reservoir=NAME:CAP     create a shared bounded reservoir of capacity CAP\n"
 		   "  --sampling-rate=NUM      fraction of transactions to log (e.g., 0.01 for 1%%)\n"
 		   "  --show-script=NAME       show builtin script code, then exit\n"
 		   "  --sla=SPEC               define SLA latency threshold (<target>:p<pct><=<val>[us|ms|s])\n"
+		   "  --tcr=RATIO              alias for --replay-speed (time compression ratio)\n"
 		   "  --vector-dataset=NAME=PATH\n"
 		   "                           alias for --dataset=NAME=PATH\n"
 		   "  --verbose-errors         print messages of all errors\n"
@@ -455,6 +460,10 @@ main(int argc, char **argv)
 		{"dataset", required_argument, NULL, 22},
 		{"vector-dataset", required_argument, NULL, 23},
 		{"copy-dataset", required_argument, NULL, 24},
+		{"tcr", required_argument, NULL, 25},
+		{"replay-speed", required_argument, NULL, 26},
+		{"reservoir", required_argument, NULL, 27},
+		{"max-concurrent-sessions", required_argument, NULL, 28},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -839,6 +848,31 @@ main(int argc, char **argv)
 			case 24:			/* copy-dataset */
 				registerCopyDatasetSpec(optarg);
 				break;
+			case 25:			/* tcr */
+			case 26:			/* replay-speed */
+				{
+					char	   *endp = NULL;
+					double		spd;
+
+					benchmarking_option_set = true;
+					errno = 0;
+					spd = strtod(optarg, &endp);
+					if (errno != 0 || endp == optarg || (endp && *endp != '\0') ||
+						spd <= 0.0)
+						pg_fatal("invalid replay speed / TCR value: \"%s\"", optarg);
+					replay_speed = spd;
+				}
+				break;
+			case 27:			/* reservoir */
+				benchmarking_option_set = true;
+				parseReservoirSpec(optarg);
+				break;
+			case 28:			/* max-concurrent-sessions */
+				benchmarking_option_set = true;
+				if (!option_parse_int(optarg, "--max-concurrent-sessions", 1, INT_MAX,
+									  &max_concurrent_sessions))
+					exit(1);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -1105,6 +1139,7 @@ main(int argc, char **argv)
 	}
 
 	/* opening connection... */
+	resolveHostAddrOnce();
 	con = doConnect();
 	if (con == NULL)
 		pg_fatal("could not create connection for setup");

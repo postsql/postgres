@@ -70,6 +70,13 @@ typedef enum MetaCommand
 	META_GSET_META,				/* \gset_meta */
 	META_DATASET_BIND,			/* \dataset_bind */
 	META_COPY_DATASET,			/* \copy_dataset */
+	META_WAIT_UNTIL,			/* \wait_until */
+	META_ADVANCE_WATERMARK,		/* \advance_watermark */
+	META_RESERVOIR_PUSH,		/* \reservoir_push */
+	META_RESERVOIR_SAMPLE,		/* \reservoir_sample */
+	META_SESSION_CONNECT,		/* \session_connect */
+	META_SESSION_DISCONNECT,	/* \session_disconnect */
+	META_CALL,					/* \call */
 	META_IF,					/* \if */
 	META_ELIF,					/* \elif */
 	META_ELSE,					/* \else */

@@ -2090,6 +2090,101 @@ evalStandardFunc(CState *st,
 				goto cleanup;
 			}
 
+		case PGBENCH_GET_WATERMARK:
+			{
+				Assert(nargs == 0);
+				setIntValue(retval, getWatermark());
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_SET_WATERMARK:
+			{
+				int64		wm = 0;
+
+				Assert(nargs == 1);
+				if (!coerceToInt(&vargs[0], &wm))
+					goto cleanup;
+				setIntValue(retval, advanceWatermark(wm));
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RESERVOIR_PUSH:
+			{
+				char	   *res_name = NULL;
+				int64		val = 0;
+
+				Assert(nargs == 2);
+				if (!coerceToText(&vargs[0], &res_name) ||
+					!coerceToInt(&vargs[1], &val))
+				{
+					pg_free(res_name);
+					goto cleanup;
+				}
+				if (!reservoirPush(res_name, val))
+				{
+					pg_free(res_name);
+					goto cleanup;
+				}
+				pg_free(res_name);
+				setIntValue(retval, val);
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RESERVOIR_SAMPLE:
+			{
+				char	   *res_name = NULL;
+				int64		sampled_val = 0;
+				bool		is_empty = false;
+
+				Assert(nargs == 1 || nargs == 2);
+				if (!coerceToText(&vargs[0], &res_name))
+					goto cleanup;
+				if (!reservoirSample(res_name, &st->cs_func_rs, &sampled_val, &is_empty))
+				{
+					pg_free(res_name);
+					goto cleanup;
+				}
+				pg_free(res_name);
+
+				if (is_empty)
+				{
+					if (nargs == 2)
+						copyValue(retval, &vargs[1]);
+					else
+						setNullValue(retval);
+				}
+				else
+				{
+					setIntValue(retval, sampled_val);
+				}
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RESERVOIR_COUNT:
+			{
+				char	   *res_name = NULL;
+				int64		cnt;
+
+				Assert(nargs == 1);
+				if (!coerceToText(&vargs[0], &res_name))
+					goto cleanup;
+				cnt = reservoirCount(res_name);
+				if (cnt < 0)
+				{
+					pg_log_error("unknown reservoir \"%s\" in reservoir_count", res_name);
+					pg_free(res_name);
+					goto cleanup;
+				}
+				pg_free(res_name);
+				setIntValue(retval, cnt);
+				ok = true;
+				goto cleanup;
+			}
+
 		default:
 			/* cannot get here */
 			Assert(0);
@@ -2217,6 +2312,20 @@ getMetaCommand(const char *cmd)
 		mc = META_DATASET_BIND;
 	else if (pg_strcasecmp(cmd, "copy_dataset") == 0)
 		mc = META_COPY_DATASET;
+	else if (pg_strcasecmp(cmd, "wait_until") == 0)
+		mc = META_WAIT_UNTIL;
+	else if (pg_strcasecmp(cmd, "advance_watermark") == 0)
+		mc = META_ADVANCE_WATERMARK;
+	else if (pg_strcasecmp(cmd, "reservoir_push") == 0)
+		mc = META_RESERVOIR_PUSH;
+	else if (pg_strcasecmp(cmd, "reservoir_sample") == 0)
+		mc = META_RESERVOIR_SAMPLE;
+	else if (pg_strcasecmp(cmd, "session_connect") == 0)
+		mc = META_SESSION_CONNECT;
+	else if (pg_strcasecmp(cmd, "session_disconnect") == 0)
+		mc = META_SESSION_DISCONNECT;
+	else if (pg_strcasecmp(cmd, "call") == 0)
+		mc = META_CALL;
 	else if (pg_strcasecmp(cmd, "startpipeline") == 0)
 		mc = META_STARTPIPELINE;
 	else if (pg_strcasecmp(cmd, "syncpipeline") == 0)
@@ -2986,6 +3095,107 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 		if (my_command->argc < 3)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
 						 "\\copy_dataset requires <dataset> <table> [(cols)]",
+						 NULL, -1);
+	}
+	else if (my_command->meta == META_WAIT_UNTIL)
+	{
+		int			dep_arg_idx = -1;
+
+		if (my_command->argc < 2)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "missing argument", NULL, -1);
+
+		for (int k = 2; k < my_command->argc; k++)
+		{
+			if (pg_strncasecmp(my_command->argv[k], "dep=", 4) == 0)
+			{
+				dep_arg_idx = k;
+				break;
+			}
+		}
+
+		if (dep_arg_idx != -1)
+		{
+			int			off_start = offsets[1] - start_offset;
+			int			off_end = offsets[dep_arg_idx] - start_offset;
+			char	   *off_str = pg_malloc((off_end - off_start) + 1);
+			const char *dep_str = my_command->first_line + off_end + 4;
+
+			memcpy(off_str, my_command->first_line + off_start, off_end - off_start);
+			off_str[off_end - off_start] = '\0';
+
+			my_command->expr = parse_sub_expr(off_str, source, lineno,
+											  my_command->argv[0]);
+			pg_free(off_str);
+
+			if (*dep_str == '\0')
+				syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+							 "missing dependency expression after dep=", NULL, -1);
+			my_command->end_expr = parse_sub_expr(dep_str, source, lineno,
+												  my_command->argv[0]);
+		}
+		else if (my_command->argc == 3)
+		{
+			my_command->expr = parse_sub_expr(my_command->argv[1], source, lineno,
+											  my_command->argv[0]);
+			my_command->end_expr = parse_sub_expr(
+				my_command->first_line + (offsets[2] - start_offset),
+				source, lineno, my_command->argv[0]);
+		}
+		else
+		{
+			my_command->expr = parse_sub_expr(
+				my_command->first_line + (offsets[1] - start_offset),
+				source, lineno, my_command->argv[0]);
+		}
+	}
+	else if (my_command->meta == META_ADVANCE_WATERMARK)
+	{
+		if (my_command->argc < 2)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "missing argument", NULL, -1);
+		my_command->expr = parse_sub_expr(
+			my_command->first_line + (offsets[1] - start_offset),
+			source, lineno, my_command->argv[0]);
+	}
+	else if (my_command->meta == META_RESERVOIR_PUSH)
+	{
+		if (my_command->argc < 3)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "\\reservoir_push requires <reservoir> <expr>",
+						 NULL, -1);
+		my_command->expr = parse_sub_expr(
+			my_command->first_line + (offsets[2] - start_offset),
+			source, lineno, my_command->argv[0]);
+	}
+	else if (my_command->meta == META_RESERVOIR_SAMPLE)
+	{
+		if (my_command->argc < 3)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "\\reservoir_sample requires <reservoir> <varname> [<default_expr>]",
+						 NULL, -1);
+		if (my_command->argc >= 4)
+		{
+			my_command->expr = parse_sub_expr(
+				my_command->first_line + (offsets[3] - start_offset),
+				source, lineno, my_command->argv[0]);
+		}
+	}
+	else if (my_command->meta == META_SESSION_CONNECT)
+	{
+		/* Optional [db=<dbname>] [user=<username>] arguments */
+	}
+	else if (my_command->meta == META_SESSION_DISCONNECT)
+	{
+		if (my_command->argc > 2)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "too many arguments", NULL, -1);
+	}
+	else if (my_command->meta == META_CALL)
+	{
+		if (my_command->argc < 2)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "\\call requires <script_name> [var=val ...]",
 						 NULL, -1);
 	}
 	else

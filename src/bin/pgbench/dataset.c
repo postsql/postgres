@@ -38,6 +38,9 @@ static PgBenchDataset datasets[MAX_DATASETS];
 static int	num_datasets = 0;
 static bool atexit_registered = false;
 
+#define MAX_RESERVOIRS 64
+#define MAX_WAKEUP_THREADS 1024
+
 typedef struct CopyDatasetSpec
 {
 	char	   *dataset_name;
@@ -47,8 +50,22 @@ typedef struct CopyDatasetSpec
 static CopyDatasetSpec copy_specs[MAX_COPY_SPECS];
 int			num_copy_dataset_specs = 0;
 
+static PgBenchReservoir reservoirs[MAX_RESERVOIRS];
+static int	num_reservoirs = 0;
+
+typedef struct PgBenchCausalClock
+{
+	int64		safe_watermark_us __attribute__((aligned(64)));
+	int64		global_virtual_time_us __attribute__((aligned(64)));
+	char		pad[64];
+} PgBenchCausalClock;
+
+static PgBenchCausalClock causal_clock = {0, 0, {0}};
+static int	thread_wakeup_fds[MAX_WAKEUP_THREADS];
+static bool wakeup_fds_initialized = false;
+
 /*
- * Cleanup all registered datasets at process exit.
+ * Cleanup all registered datasets and reservoirs at process exit.
  * Datasets remain mapped for the entire process lifetime so that borrowed
  * PGBT_VECTOR / PGBT_BYTEA pointers in client variables never dangle.
  */
@@ -84,6 +101,15 @@ freeAllDatasets(void)
 		pg_free(copy_specs[i].table_spec);
 	}
 	num_copy_dataset_specs = 0;
+
+	for (int i = 0; i < num_reservoirs; i++)
+	{
+		pg_free(reservoirs[i].name);
+		pg_free(reservoirs[i].slots);
+		reservoirs[i].name = NULL;
+		reservoirs[i].slots = NULL;
+	}
+	num_reservoirs = 0;
 }
 
 /*
@@ -1365,3 +1391,415 @@ handle_cmd_copy_dataset(CState *st, Command *cmd, pg_time_usec_t *now)
 
 	return CSTATE_END_COMMAND;
 }
+
+/*-------------------------------------------------------------------------
+ * Pillar 2: Global Monotonic Clock & Causal Watermark Coordination
+ *-------------------------------------------------------------------------
+ */
+
+void
+registerThreadWakeupPipe(int tid, int write_fd)
+{
+	if (!wakeup_fds_initialized)
+	{
+		for (int i = 0; i < MAX_WAKEUP_THREADS; i++)
+			thread_wakeup_fds[i] = -1;
+		wakeup_fds_initialized = true;
+	}
+	if (tid >= 0 && tid < MAX_WAKEUP_THREADS)
+		__atomic_store_n(&thread_wakeup_fds[tid], write_fd, __ATOMIC_RELEASE);
+}
+
+void
+unregisterThreadWakeupPipe(int tid)
+{
+	if (tid >= 0 && tid < MAX_WAKEUP_THREADS)
+		__atomic_store_n(&thread_wakeup_fds[tid], -1, __ATOMIC_RELEASE);
+}
+
+void
+wakeWatermarkWaiters(void)
+{
+	if (!wakeup_fds_initialized)
+		return;
+
+	for (int i = 0; i < nthreads && i < MAX_WAKEUP_THREADS; i++)
+	{
+		int			wfd = __atomic_load_n(&thread_wakeup_fds[i], __ATOMIC_ACQUIRE);
+
+		if (wfd >= 0)
+		{
+			char		byte = 'W';
+			ssize_t		rc;
+
+			rc = write(wfd, &byte, 1);
+			(void) rc;
+		}
+	}
+}
+
+int64
+getWatermark(void)
+{
+	return __atomic_load_n(&causal_clock.safe_watermark_us, __ATOMIC_ACQUIRE);
+}
+
+int64
+setWatermark(int64 wm)
+{
+	__atomic_store_n(&causal_clock.safe_watermark_us, wm, __ATOMIC_RELEASE);
+	wakeWatermarkWaiters();
+	return wm;
+}
+
+int64
+advanceWatermark(int64 wm)
+{
+	int64		cur = __atomic_load_n(&causal_clock.safe_watermark_us, __ATOMIC_RELAXED);
+
+	while (wm > cur)
+	{
+		if (__atomic_compare_exchange_n(&causal_clock.safe_watermark_us,
+										&cur, wm, true,
+										__ATOMIC_RELEASE, __ATOMIC_RELAXED))
+		{
+			wakeWatermarkWaiters();
+			return wm;
+		}
+	}
+	return cur;
+}
+
+/*
+ * Handler for \wait_until <offset_us_expr> [<dep_watermark_expr>]
+ */
+ConnectionStateEnum
+handle_cmd_wait_until(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	PgBenchValue offset_val;
+	int64		offset_us = 0;
+	double		speed = (replay_speed > 0.0) ? replay_speed : 1.0;
+
+	if (!evaluateExpr(st, cmd->expr, &offset_val))
+	{
+		commandFailed(st, cmd->argv[0], "evaluation of offset expression failed");
+		return CSTATE_ABORTED;
+	}
+	if (!coerceToInt(&offset_val, &offset_us))
+	{
+		freeValue(&offset_val);
+		commandFailed(st, cmd->argv[0], "offset expression is not an integer");
+		return CSTATE_ABORTED;
+	}
+	freeValue(&offset_val);
+
+	if (offset_us > 0)
+	{
+		pg_time_usec_t base_us = (st->bench_start_us > 0) ? st->bench_start_us : st->txn_begin;
+		pg_time_usec_t scaled_us = (pg_time_usec_t) ((double) offset_us / speed + 0.5);
+
+		st->sync_scheduled_us = base_us + scaled_us;
+		st->txn_scheduled = st->sync_scheduled_us;
+		st->has_scheduled_time = true;
+	}
+	else
+	{
+		st->sync_scheduled_us = 0;
+	}
+
+	if (cmd->end_expr != NULL)
+	{
+		PgBenchValue dep_val;
+		int64		dep_wm = 0;
+
+		if (!evaluateExpr(st, cmd->end_expr, &dep_val))
+		{
+			commandFailed(st, cmd->argv[0], "evaluation of watermark dependency expression failed");
+			return CSTATE_ABORTED;
+		}
+		if (!coerceToInt(&dep_val, &dep_wm))
+		{
+			freeValue(&dep_val);
+			commandFailed(st, cmd->argv[0], "watermark dependency expression is not an integer");
+			return CSTATE_ABORTED;
+		}
+		freeValue(&dep_val);
+
+		st->has_sync_dep = true;
+		st->sync_dep_watermark = dep_wm;
+	}
+	else
+	{
+		st->has_sync_dep = false;
+		st->sync_dep_watermark = 0;
+	}
+
+	return CSTATE_WAIT_SYNC;
+}
+
+/*
+ * Handler for \advance_watermark <watermark_expr>
+ */
+ConnectionStateEnum
+handle_cmd_advance_watermark(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	PgBenchValue wm_val;
+	int64		wm = 0;
+
+	if (!evaluateExpr(st, cmd->expr, &wm_val))
+	{
+		commandFailed(st, cmd->argv[0], "evaluation of watermark expression failed");
+		return CSTATE_ABORTED;
+	}
+	if (!coerceToInt(&wm_val, &wm))
+	{
+		freeValue(&wm_val);
+		commandFailed(st, cmd->argv[0], "watermark expression is not an integer");
+		return CSTATE_ABORTED;
+	}
+	freeValue(&wm_val);
+
+	(void) advanceWatermark(wm);
+	return CSTATE_END_COMMAND;
+}
+
+/*-------------------------------------------------------------------------
+ * Pillar 3: Shared Entity Reservoirs (Bounded Ring Buffers)
+ *-------------------------------------------------------------------------
+ */
+
+PgBenchReservoir *
+findReservoir(const char *name)
+{
+	if (name == NULL)
+		return NULL;
+
+	for (int i = 0; i < num_reservoirs; i++)
+	{
+		if (strcmp(reservoirs[i].name, name) == 0)
+			return &reservoirs[i];
+	}
+	return NULL;
+}
+
+void
+registerReservoir(const char *name, uint64 capacity)
+{
+	PgBenchReservoir *res;
+
+	if (name == NULL || *name == '\0')
+		pg_fatal("reservoir name cannot be empty");
+	if (capacity == 0 || capacity > (100ULL * 1000 * 1000))
+		pg_fatal("reservoir \"%s\": invalid capacity " UINT64_FORMAT " (must be 1..100000000)",
+				 name, capacity);
+
+	if (findReservoir(name) != NULL)
+		pg_fatal("duplicate reservoir name \"%s\"", name);
+	if (num_reservoirs >= MAX_RESERVOIRS)
+		pg_fatal("too many reservoirs registered (maximum %d)", MAX_RESERVOIRS);
+
+	if (!atexit_registered)
+	{
+		atexit(freeAllDatasets);
+		atexit_registered = true;
+	}
+
+	res = &reservoirs[num_reservoirs++];
+	memset(res, 0, sizeof(PgBenchReservoir));
+	res->name = pg_strdup(name);
+	res->capacity = capacity;
+	res->slots = pg_malloc0_array(int64, capacity);
+	__atomic_store_n(&res->write_idx, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&res->valid_count, 0, __ATOMIC_RELAXED);
+}
+
+void
+parseReservoirSpec(const char *spec)
+{
+	const char *sep = NULL;
+	char	   *name;
+	const char *cap_str;
+	int64		cap = 0;
+
+	if (spec == NULL || *spec == '\0')
+		pg_fatal("invalid --reservoir specification: empty string");
+
+	for (const char *p = spec; *p != '\0'; p++)
+	{
+		if (*p == ':' || *p == '=')
+		{
+			sep = p;
+			break;
+		}
+	}
+
+	if (sep == NULL || sep == spec || *(sep + 1) == '\0')
+		pg_fatal("invalid --reservoir specification \"%s\" (expected <name>:<capacity>)",
+				 spec);
+
+	name = pg_malloc((sep - spec) + 1);
+	memcpy(name, spec, sep - spec);
+	name[sep - spec] = '\0';
+	cap_str = sep + 1;
+
+	if (!strtoint64(cap_str, true, &cap) || cap <= 0)
+	{
+		pg_free(name);
+		pg_fatal("invalid capacity \"%s\" in --reservoir=\"%s\"", cap_str, spec);
+	}
+
+	registerReservoir(name, (uint64) cap);
+	pg_free(name);
+}
+
+bool
+reservoirPush(const char *name, int64 val)
+{
+	PgBenchReservoir *res = findReservoir(name);
+	uint64		idx;
+	uint64		cur_valid;
+
+	if (res == NULL)
+	{
+		pg_log_error("unknown reservoir \"%s\"", name ? name : "");
+		return false;
+	}
+
+	idx = __atomic_fetch_add(&res->write_idx, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&res->slots[idx % res->capacity], val, __ATOMIC_RELEASE);
+
+	cur_valid = __atomic_load_n(&res->valid_count, __ATOMIC_RELAXED);
+	while (cur_valid < res->capacity && (idx + 1) > cur_valid)
+	{
+		uint64		next_valid = ((idx + 1) < res->capacity) ? (idx + 1) : res->capacity;
+
+		if (__atomic_compare_exchange_n(&res->valid_count, &cur_valid, next_valid,
+										true, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+			break;
+	}
+
+	return true;
+}
+
+bool
+reservoirSample(const char *name, pg_prng_state *rstate,
+				int64 *out_val, bool *is_empty)
+{
+	PgBenchReservoir *res = findReservoir(name);
+	uint64		cnt;
+	int64		pos;
+
+	if (res == NULL)
+	{
+		pg_log_error("unknown reservoir \"%s\"", name ? name : "");
+		return false;
+	}
+
+	cnt = __atomic_load_n(&res->valid_count, __ATOMIC_ACQUIRE);
+	if (cnt == 0)
+	{
+		*is_empty = true;
+		*out_val = 0;
+		return true;
+	}
+
+	*is_empty = false;
+	pos = pgbench_random(rstate, 0, (int64) cnt - 1);
+	*out_val = __atomic_load_n(&res->slots[pos], __ATOMIC_RELAXED);
+	return true;
+}
+
+int64
+reservoirCount(const char *name)
+{
+	PgBenchReservoir *res = findReservoir(name);
+
+	if (res == NULL)
+		return -1;
+	return (int64) __atomic_load_n(&res->valid_count, __ATOMIC_ACQUIRE);
+}
+
+/*
+ * Handler for \reservoir_push <name> <expr>
+ */
+ConnectionStateEnum
+handle_cmd_reservoir_push(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	const char *res_name = cmd->argv[1];
+	PgBenchValue v;
+	int64		ival = 0;
+
+	if (!evaluateExpr(st, cmd->expr, &v))
+	{
+		commandFailed(st, cmd->argv[0], "evaluation of reservoir_push expression failed");
+		return CSTATE_ABORTED;
+	}
+	if (!coerceToInt(&v, &ival))
+	{
+		freeValue(&v);
+		commandFailed(st, cmd->argv[0], "reservoir_push value is not an integer");
+		return CSTATE_ABORTED;
+	}
+	freeValue(&v);
+
+	if (!reservoirPush(res_name, ival))
+	{
+		commandFailed(st, cmd->argv[0], "reservoir_push failed");
+		return CSTATE_ABORTED;
+	}
+
+	return CSTATE_END_COMMAND;
+}
+
+/*
+ * Handler for \reservoir_sample <name> <varname> [<default_expr>]
+ */
+ConnectionStateEnum
+handle_cmd_reservoir_sample(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	const char *res_name = cmd->argv[1];
+	const char *varname = normalizeVarArg(cmd->argv[2]);
+	int64		sampled_val = 0;
+	bool		is_empty = false;
+
+	if (!reservoirSample(res_name, &st->cs_func_rs, &sampled_val, &is_empty))
+	{
+		commandFailed(st, cmd->argv[0], "reservoir_sample failed");
+		return CSTATE_ABORTED;
+	}
+
+	if (is_empty)
+	{
+		if (cmd->expr != NULL)
+		{
+			PgBenchValue def_v;
+			bool		ok;
+
+			if (!evaluateExpr(st, cmd->expr, &def_v))
+			{
+				commandFailed(st, cmd->argv[0], "evaluation of default expression failed");
+				return CSTATE_ABORTED;
+			}
+			ok = putVariableValue(&st->variables, "reservoir_sample", (char *) varname, &def_v);
+			freeValue(&def_v);
+			if (!ok)
+				return CSTATE_ABORTED;
+		}
+		else
+		{
+			PgBenchValue null_v;
+
+			setNullValue(&null_v);
+			if (!putVariableValue(&st->variables, "reservoir_sample", (char *) varname, &null_v))
+				return CSTATE_ABORTED;
+		}
+	}
+	else
+	{
+		if (!putVariableInt(&st->variables, "reservoir_sample", (char *) varname, sampled_val))
+			return CSTATE_ABORTED;
+	}
+
+	return CSTATE_END_COMMAND;
+}
+

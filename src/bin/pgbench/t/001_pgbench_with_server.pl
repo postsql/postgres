@@ -2325,6 +2325,147 @@ $node->pgbench(
 is($node->safe_psql('postgres', 'SELECT count(*) FROM copy_tsv;'), '4', 'copy_tsv row count after parallel \copy_dataset');
 $node->safe_psql('postgres', 'DROP TABLE copy_vecs, copy_csv, copy_tsv;');
 
+# Test Tier 2 Pillar 2: Global Monotonic Clock, Causal Watermarks (\wait_until, \advance_watermark, get_watermark, set_watermark), and --tcr
+$node->safe_psql('postgres', 'CREATE TABLE causal_log(seq serial, msg text);');
+
+$node->pgbench(
+	'-n -c 2 -j 2 -t 1 --tcr=10.0',
+	0,
+	[qr{processed: 2/2}],
+	[
+		qr{int 100\b},
+		qr{int 250\b}
+	],
+	'pgbench causal watermarks (\wait_until, \advance_watermark) across threads',
+	{
+		'001_pgbench_causal_watermark' => q{
+\if :client_id = 1
+\wait_until 5000 dep=100
+\set wm get_watermark()
+\set d debug(:wm)
+INSERT INTO causal_log(msg) VALUES ('c1_after_wm:' || :wm);
+\set wm2 set_watermark(250)
+\set d debug(get_watermark())
+\else
+\sleep 2 ms
+INSERT INTO causal_log(msg) VALUES ('c0_before_wm');
+\advance_watermark 100
+\endif
+}
+	});
+
+is(
+	$node->safe_psql('postgres', "SELECT string_agg(msg, ',' ORDER BY seq) FROM causal_log;"),
+	'c0_before_wm,c1_after_wm:100',
+	'cross-thread causal watermark ordering enforced by \wait_until and \advance_watermark');
+$node->safe_psql('postgres', 'DROP TABLE causal_log;');
+
+# Test Tier 2 Pillar 3: Shared Entity Reservoirs (--reservoir, \reservoir_push, \reservoir_sample, reservoir_push/sample/count)
+$node->pgbench(
+	'-n -t 1 --reservoir=orders:3',
+	0,
+	[qr{processed: 1/1}],
+	[
+		qr{command=2.: int 0\b},
+		qr{command=4.: null\b},
+		qr{command=6.: int 999\b},
+		qr{command=8.: null\b},
+		qr{command=12.: int 2\b},
+		qr{command=17.: int 3\b},
+		qr{command=20.: boolean true\b},
+		qr{command=23.: boolean true\b}
+	],
+	'pgbench shared entity reservoirs (empty handling, push, sample, ring wraparound)',
+	{
+		'001_pgbench_reservoirs' => q{
+\set c0 reservoir_count('orders')
+\set d debug(:c0)
+\set s0 reservoir_sample('orders')
+\set d debug(:s0)
+\reservoir_sample orders def_ord 999
+\set d debug(:def_ord)
+\reservoir_sample orders null_ord
+\set d debug(:null_ord)
+\reservoir_push orders 101
+\set p_ok reservoir_push('orders', 102)
+\set c2 reservoir_count('orders')
+\set d debug(:c2)
+\reservoir_push orders 103
+\reservoir_push orders 104
+\reservoir_push orders 105
+\set c3 reservoir_count('orders')
+\set d debug(:c3)
+\reservoir_sample orders samp1
+\set s1_ok (:samp1 >= 101 and :samp1 <= 105)
+\set d debug(:s1_ok)
+\set samp2 reservoir_sample('orders')
+\set s2_ok (:samp2 >= 101 and :samp2 <= 105)
+\set d debug(:s2_ok)
+SELECT :samp1, :samp2;
+}
+	});
+
+# Test Tier 2 Pillar 6: Non-blocking session lifecycle (\session_disconnect, \session_connect, --max-concurrent-sessions) and \call sub-scripts
+my $call_sub = $node->basedir . '/001_pgbench_call_sub.sql';
+my $call_err = $node->basedir . '/001_pgbench_call_err.sql';
+my $call_main = $node->basedir . '/001_pgbench_call_main.sql';
+
+append_to_file($call_sub, q{
+\set sub_res (:arg_x * 10 + :shared_v)
+SELECT :sub_res AS sub_col \gset
+});
+
+append_to_file($call_err, q{
+SELECT 1/0;
+});
+
+append_to_file($call_main, q{
+\set shared_v 7
+\call 001_pgbench_call_sub arg_x=4
+\set d debug(:sub_col)
+\set caught_sub 0
+\try
+\call 001_pgbench_call_err
+\catch '22012'
+\set caught_sub 1
+\endtry
+\set d debug(:caught_sub)
+\session_disconnect
+\session_connect db=postgres
+SELECT current_database() AS cur_db \gset
+\set d debug(:cur_db)
+});
+
+$node->pgbench(
+	"-n -t 1 -f $call_main\@100 -f $call_sub\@0 -f $call_err\@0",
+	0,
+	[
+		qr{processed: 1/1},
+		qr{001_pgbench_call_sub\.sql},
+		qr{number of expected rollbacks: 1\b}
+	],
+	[
+		qr{int 47\b},
+		qr{int 1\b},
+		qr{text 'postgres'}
+	],
+	'pgbench \call sub-scripts (arguments, error catching across frames) and non-blocking \session_disconnect / \session_connect');
+
+# Test --max-concurrent-sessions=1 with 2 clients across 2 threads
+$node->pgbench(
+	'-n -c 2 -j 2 -t 1 --max-concurrent-sessions=1',
+	0,
+	[qr{processed: 2/2}],
+	[qr{^$}],
+	'pgbench --max-concurrent-sessions=1 admission control across 2 clients',
+	{
+		'001_pgbench_max_sessions' => q{
+\session_connect
+SELECT 1;
+\session_disconnect
+}
+	});
+
 # Test standard benchmark workload suites (pgbench-b, pgbench-c, pgbench-e, pgbench-h, pgbench-ds, pgbench-htap)
 my $wl_dir = "$FindBin::RealBin/../workloads";
 

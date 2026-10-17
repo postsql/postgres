@@ -185,6 +185,18 @@ allocCStatePrepared(CState *st)
 	}
 }
 
+void
+freeCStatePrepared(CState *st)
+{
+	if (st->prepared != NULL)
+	{
+		for (int i = 0; i < num_scripts; i++)
+			pg_free(st->prepared[i]);
+		pg_free(st->prepared);
+		st->prepared = NULL;
+	}
+}
+
 /*
  * Prepare the SQL command from st->use_file at command_num.
  */
@@ -859,6 +871,283 @@ handle_cmd_endpipeline(CState *st, Command *cmd, pg_time_usec_t *now)
 	return CSTATE_WAIT_RESULT;
 }
 
+ConnectionStateEnum
+handle_cmd_session_connect(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	const char *db_val = NULL;
+	const char *user_val = NULL;
+	int			pos_arg = 0;
+
+	for (int k = 1; k < cmd->argc; k++)
+	{
+		const char *arg = cmd->argv[k];
+		const char *target = NULL;
+		bool		is_db = false;
+		bool		is_user = false;
+
+		if (arg == NULL || *arg == '\0')
+			continue;
+
+		if (pg_strncasecmp(arg, "db=", 3) == 0)
+		{
+			target = arg + 3;
+			is_db = true;
+		}
+		else if (pg_strncasecmp(arg, "user=", 5) == 0)
+		{
+			target = arg + 5;
+			is_user = true;
+		}
+		else
+		{
+			target = arg;
+			if (pos_arg == 0)
+				is_db = true;
+			else if (pos_arg == 1)
+				is_user = true;
+			pos_arg++;
+		}
+
+		if (target != NULL && target[0] == ':' && target[1] != ':')
+		{
+			const char *vname = target + 1;
+
+			target = getVariable(&st->variables, (char *) vname);
+			if (target == NULL)
+			{
+				pg_log_error("\\session_connect: undefined variable \"%s\"", vname);
+				commandFailed(st, "session_connect", "undefined variable");
+				return CSTATE_ABORTED;
+			}
+		}
+
+		if (is_db)
+			db_val = target;
+		else if (is_user)
+			user_val = target;
+	}
+
+	if (st->con != NULL)
+	{
+		if (PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
+		{
+			commandFailed(st, "session_connect",
+						  "cannot reconnect while in pipeline mode");
+			return CSTATE_ABORTED;
+		}
+		PQfinish(st->con);
+		st->con = NULL;
+		(void) __atomic_fetch_sub(&active_sessions_count, 1, __ATOMIC_RELEASE);
+		if (max_concurrent_sessions > 0)
+			wakeWatermarkWaiters();
+	}
+	freeCStatePrepared(st);
+
+	pg_free(st->session_target_db);
+	st->session_target_db = (db_val != NULL) ? pg_strdup(db_val) : NULL;
+	pg_free(st->session_target_user);
+	st->session_target_user = (user_val != NULL) ? pg_strdup(user_val) : NULL;
+
+	return CSTATE_IDLE;
+}
+
+ConnectionStateEnum
+handle_cmd_session_disconnect(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	if (st->con != NULL && PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
+	{
+		commandFailed(st, "session_disconnect",
+					  "cannot disconnect while in pipeline mode");
+		return CSTATE_ABORTED;
+	}
+	return CSTATE_DISCONNECTING;
+}
+
+static int
+findScriptByName(const char *target)
+{
+	int			idx_match = -1;
+
+	if (target == NULL || *target == '\0')
+		return -1;
+
+	/* 1. Exact match on script descriptor */
+	for (int i = 0; i < num_scripts; i++)
+	{
+		if (strcmp(sql_script[i].desc, target) == 0)
+			return i;
+	}
+
+	/* 2. Exact match on basename or stem (without .sql / .pgbench) */
+	for (int i = 0; i < num_scripts; i++)
+	{
+		const char *desc = sql_script[i].desc;
+		const char *slash = strrchr(desc, '/');
+		const char *base = (slash != NULL) ? (slash + 1) : desc;
+		const char *dot;
+
+		if (strcmp(base, target) == 0)
+			return i;
+
+		dot = strrchr(base, '.');
+		if (dot != NULL &&
+			(pg_strcasecmp(dot, ".sql") == 0 || pg_strcasecmp(dot, ".pgbench") == 0))
+		{
+			size_t		stem_len = (size_t) (dot - base);
+
+			if (strlen(target) == stem_len && strncmp(base, target, stem_len) == 0)
+				return i;
+		}
+	}
+
+	/* 3. Builtin descriptor match "<builtin: ...>" or substring match */
+	for (int i = 0; i < num_scripts; i++)
+	{
+		if (strstr(sql_script[i].desc, target) != NULL)
+		{
+			if (idx_match >= 0)
+				return -2;		/* ambiguous */
+			idx_match = i;
+		}
+	}
+	if (idx_match >= 0)
+		return idx_match;
+
+	/* 4. Integer index (1-based or 0-based if valid) */
+	if (is_an_int(target))
+	{
+		int			val = atoi(target);
+
+		if (val >= 0 && val < num_scripts)
+			return val;
+	}
+
+	return -1;
+}
+
+ConnectionStateEnum
+handle_cmd_call(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	const char *target_name = cmd->argv[1];
+	int			target_script;
+	CallFrame  *frame;
+
+	if (target_name[0] == ':' && target_name[1] != ':')
+	{
+		target_name = getVariable(&st->variables, target_name + 1);
+		if (target_name == NULL)
+		{
+			pg_log_error("\\call: undefined variable \"%s\"", cmd->argv[1] + 1);
+			commandFailed(st, "call", "undefined script variable");
+			return CSTATE_ABORTED;
+		}
+	}
+
+	target_script = findScriptByName(target_name);
+	if (target_script < 0)
+	{
+		if (target_script == -2)
+			pg_log_error("\\call: ambiguous script name \"%s\"", target_name);
+		else
+			pg_log_error("\\call: unknown script \"%s\"", target_name);
+		commandFailed(st, "call", "target script not found");
+		return CSTATE_ABORTED;
+	}
+
+	if (st->call_depth >= MAX_CALL_DEPTH)
+	{
+		pg_log_error("\\call: maximum call nesting depth (%d) exceeded",
+					 MAX_CALL_DEPTH);
+		commandFailed(st, "call", "maximum \\call nesting depth exceeded");
+		return CSTATE_ABORTED;
+	}
+
+	/* Bind any optional inline var=val arguments (argv[2..argc-1]) */
+	for (int k = 2; k < cmd->argc; k++)
+	{
+		const char *arg = cmd->argv[k];
+		const char *eq = strchr(arg, '=');
+
+		if (eq != NULL && eq > arg)
+		{
+			char	   *vname = pg_malloc((eq - arg) + 1);
+			const char *val_str = eq + 1;
+			const char *vn;
+
+			memcpy(vname, arg, eq - arg);
+			vname[eq - arg] = '\0';
+			vn = (vname[0] == ':') ? (vname + 1) : vname;
+
+			if (val_str[0] == ':' && val_str[1] != ':')
+			{
+				Variable   *src = lookupVariable(&st->variables, (char *) (val_str + 1));
+
+				if (src == NULL)
+				{
+					pg_log_error("\\call: undefined variable \"%s\"", val_str + 1);
+					pg_free(vname);
+					commandFailed(st, "call", "undefined parameter variable");
+					return CSTATE_ABORTED;
+				}
+				if (src->value.type == PGBT_NO_VALUE)
+					(void) makeVariableValue(src);
+				if (!putVariableValue(&st->variables, "call", (char *) vn, &src->value))
+				{
+					pg_free(vname);
+					return CSTATE_ABORTED;
+				}
+			}
+			else
+			{
+				int64		ival;
+
+				if (strtoint64(val_str, true, &ival))
+				{
+					if (!putVariableInt(&st->variables, "call", (char *) vn, ival))
+					{
+						pg_free(vname);
+						return CSTATE_ABORTED;
+					}
+				}
+				else if (!putVariable(&st->variables, "call", (char *) vn, val_str))
+				{
+					pg_free(vname);
+					return CSTATE_ABORTED;
+				}
+			}
+			pg_free(vname);
+		}
+	}
+
+	pg_time_now_lazy(now);
+
+	/* Ensure per-script stats are collected when \call is used */
+	per_script_stats = true;
+
+	frame = &st->call_stack[st->call_depth++];
+	frame->script_idx = st->use_file;
+	frame->return_cmd = st->command + 1;
+	frame->cstack = st->cstack;
+	st->cstack = conditional_stack_create();
+	frame->loop_depth = st->loop_depth;
+	if (st->loop_depth > 0)
+		memcpy(frame->loop_stack, st->loop_stack,
+			   sizeof(ForLoopState) * st->loop_depth);
+	st->loop_depth = 0;
+	frame->try_depth = st->try_depth;
+	if (st->try_depth > 0)
+		memcpy(frame->try_stack, st->try_stack,
+			   sizeof(TryState) * st->try_depth);
+	st->try_depth = 0;
+	frame->call_begin = *now;
+
+	st->use_file = target_script;
+	st->command = 0;
+	st->next_command = -1;
+
+	return CSTATE_START_COMMAND;
+}
+
 /* Pluggable meta-command dispatch table */
 static const CommandDescriptor command_handlers[] = {
 	{"set", META_SET, handle_cmd_set},
@@ -882,6 +1171,13 @@ static const CommandDescriptor command_handlers[] = {
 	{"gset_meta", META_GSET_META, handle_cmd_gset_meta},
 	{"dataset_bind", META_DATASET_BIND, handle_cmd_dataset_bind},
 	{"copy_dataset", META_COPY_DATASET, handle_cmd_copy_dataset},
+	{"wait_until", META_WAIT_UNTIL, handle_cmd_wait_until},
+	{"advance_watermark", META_ADVANCE_WATERMARK, handle_cmd_advance_watermark},
+	{"reservoir_push", META_RESERVOIR_PUSH, handle_cmd_reservoir_push},
+	{"reservoir_sample", META_RESERVOIR_SAMPLE, handle_cmd_reservoir_sample},
+	{"session_connect", META_SESSION_CONNECT, handle_cmd_session_connect},
+	{"session_disconnect", META_SESSION_DISCONNECT, handle_cmd_session_disconnect},
+	{"call", META_CALL, handle_cmd_call},
 	{"startpipeline", META_STARTPIPELINE, handle_cmd_startpipeline},
 	{"syncpipeline", META_SYNCPIPELINE, handle_cmd_syncpipeline},
 	{"endpipeline", META_ENDPIPELINE, handle_cmd_endpipeline},

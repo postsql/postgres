@@ -130,6 +130,7 @@ typedef struct
 
 	StatsData	stats;
 	int64		latency_late;	/* count executed but late transactions */
+	int			wakeup_pipe[2]; /* non-blocking self-pipe for watermark wakeups */
 } TState;
 
 #define MAX_SLAS		64		/* max number of SLA rules */
@@ -153,6 +154,9 @@ extern SlaRule sla_rules[MAX_SLAS];
 extern int	num_slas;
 extern bool sla_failed;
 extern char *json_report_file;
+extern double replay_speed;
+extern int	max_concurrent_sessions;
+extern int	active_sessions_count;
 
 extern int	nxacts;
 extern int	duration;
@@ -188,7 +192,9 @@ extern bool exit_on_abort;
 extern bool continue_on_error;
 
 extern void initRandomState(pg_prng_state *state);
+extern void resolveHostAddrOnce(void);
 extern PGconn *doConnect(void);
+extern PGconn *doConnectAsync(const char *db_override, const char *user_override);
 extern void disconnect_all(CState *state, int length);
 extern void printVersion(PGconn *con);
 extern void printResults(StatsData *total, pg_time_usec_t total_time,

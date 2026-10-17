@@ -73,10 +73,44 @@ extern ConnectionStateEnum handle_cmd_dataset_bind(CState *st, Command *cmd,
 												   pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_copy_dataset(CState *st, Command *cmd,
 												   pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_wait_until(CState *st, Command *cmd,
+												 pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_advance_watermark(CState *st, Command *cmd,
+														pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_reservoir_push(CState *st, Command *cmd,
+													 pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_reservoir_sample(CState *st, Command *cmd,
+													   pg_time_usec_t *now);
 
 /* Bulk COPY helper usable from pgbench -i or \copy_dataset */
 extern bool copyDatasetSlice(PGconn *con, PgBenchDataset *ds,
 							 const char *table_spec,
 							 int client_id, int num_clients);
+
+/* Pillar 2: Global Monotonic Clock & Causal Watermark Coordination */
+extern int64 getWatermark(void);
+extern int64 setWatermark(int64 wm);
+extern int64 advanceWatermark(int64 wm);
+extern void registerThreadWakeupPipe(int tid, int write_fd);
+extern void unregisterThreadWakeupPipe(int tid);
+extern void wakeWatermarkWaiters(void);
+
+/* Pillar 3: Shared Entity Reservoirs */
+typedef struct PgBenchReservoir
+{
+	char	   *name;
+	uint64		capacity;
+	int64	   *slots;
+	uint64		write_idx __attribute__((aligned(64)));
+	uint64		valid_count __attribute__((aligned(64)));
+} PgBenchReservoir;
+
+extern void parseReservoirSpec(const char *spec);
+extern void registerReservoir(const char *name, uint64 capacity);
+extern PgBenchReservoir *findReservoir(const char *name);
+extern bool reservoirPush(const char *name, int64 val);
+extern bool reservoirSample(const char *name, pg_prng_state *rstate,
+							int64 *out_val, bool *is_empty);
+extern int64 reservoirCount(const char *name);
 
 #endif							/* PGBENCH_DATASET_H */

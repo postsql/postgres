@@ -279,6 +279,26 @@ my @options = (
 		'bad --copy-dataset format',
 		'--copy-dataset bad_spec',
 		[qr{invalid --copy-dataset specification}]
+	],
+	[
+		'bad --tcr value',
+		'--tcr 0',
+		[qr{invalid replay speed / TCR value}]
+	],
+	[
+		'bad --reservoir format',
+		'--reservoir bad_spec',
+		[qr{invalid --reservoir specification}]
+	],
+	[
+		'bad --reservoir capacity',
+		'--reservoir orders:0',
+		[qr{invalid capacity "0" in --reservoir}]
+	],
+	[
+		'duplicate --reservoir name',
+		'--reservoir orders:10 --reservoir orders:20',
+		[qr{duplicate reservoir name "orders"}]
 	],);
 
 for my $o (@options)
@@ -492,6 +512,36 @@ my @script_tests = (
 		'copy_dataset missing argument',
 		[qr{\\copy_dataset requires}],
 		{ 'copy-dataset-noarg.sql' => "\\copy_dataset ds\n" }
+	],
+	[
+		'wait_until missing argument',
+		[qr{missing argument.*wait_until}],
+		{ 'wait-until-noarg.sql' => "\\wait_until\n" }
+	],
+	[
+		'advance_watermark missing argument',
+		[qr{missing argument.*advance_watermark}],
+		{ 'advance-wm-noarg.sql' => "\\advance_watermark\n" }
+	],
+	[
+		'reservoir_push missing argument',
+		[qr{\\reservoir_push requires}],
+		{ 'reservoir-push-noarg.sql' => "\\reservoir_push orders\n" }
+	],
+	[
+		'reservoir_sample missing argument',
+		[qr{\\reservoir_sample requires}],
+		{ 'reservoir-sample-noarg.sql' => "\\reservoir_sample orders\n" }
+	],
+	[
+		'session_disconnect too many arguments',
+		[qr{too many arguments.*session_disconnect}],
+		{ 'session-disc-args.sql' => "\\session_disconnect a b\n" }
+	],
+	[
+		'call missing argument',
+		[qr{\\call requires}],
+		{ 'call-noarg.sql' => "\\call\n" }
 	],);
 
 for my $t (@script_tests)
