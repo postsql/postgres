@@ -2547,6 +2547,43 @@ SELECT 1;
 }
 	});
 
+# Test VecBench Phase 1: Named Recall Metrics (r10, r100), 10-bucket distribution, :last_recall_<name>, and SLA compliance
+my $vec_recall_json = $node->basedir . '/001_pgbench_vec_recall_report.json';
+$node->pgbench(
+	"-n -t 2 --sla=r10:recall>=0.5 --sla=r100:recall>=0.90 --json-report=$vec_recall_json",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{recall\[r10\] average = 0\.5000},
+		qr{recall\[r100\] average = 0\.9800},
+		qr{recall\[r10\] distribution: \[0\.5-0\.6\): 2},
+		qr{recall\[r100\] distribution: \[0\.9-1\.0\]: 2},
+		qr{SLA r10:r10:recall >= 0\.5000: actual = 0\.5000 \[PASS\]},
+		qr{SLA r100:r100:recall >= 0\.9000: actual = 0\.9800 \[PASS\]},
+	],
+	[
+		qr{double 0\.5\b},
+		qr{double 0\.98\b}
+	],
+	'pgbench VecBench named recall metrics and 10-bucket distribution (PASS)',
+	{
+		'001_pgbench_vecbench_recalls' => q{
+\set gt array(10, 20, 30, 40)
+\set ret array(20, 10, 99, 88)
+\record_recall r10 recall_at_k(:ret, :gt, 4)
+\set d debug(:last_recall_r10)
+\record_recall r100 0.98
+\set d debug(:last_recall_r100)
+SELECT 1;
+}
+	});
+
+my $vec_recall_json_content = slurp_file($vec_recall_json);
+like($vec_recall_json_content, qr/"named_recall":\s*\{/, 'JSON report contains named_recall object');
+like($vec_recall_json_content, qr/"r10":\s*\{/, 'JSON report contains r10 named metric');
+like($vec_recall_json_content, qr/"r100":\s*\{/, 'JSON report contains r100 named metric');
+like($vec_recall_json_content, qr/"distribution":\s*\{/, 'JSON report contains distribution object');
+
 # Test --replay=<trace.csv> mode with causal watermarks
 $node->safe_psql('postgres', 'CREATE TABLE replay_log(seq serial, step text);');
 my $replay_csv = $node->basedir . '/001_trace_replay.csv';
