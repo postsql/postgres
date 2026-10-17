@@ -3080,6 +3080,47 @@ $node->pgbench(
 	[qr{^$}],
 	'pgbench-vec insert execution without --reservoir');
 
+# VecBench Phase 2: Ground truth precomputation and multi-mode hybrid & multi-vector workloads (Modes 1, 2, 3, 5)
+$node->pgbench(
+	"-n -d wl_pgbench_vec -t 1 -f $wl_dir/pgbench-vec/pgbench_vec_gt_gen.sql",
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'pgbench-vec ground truth precomputation');
+
+is($node->safe_psql('wl_pgbench_vec', 'SELECT count(*) FROM pgbench_vec_queries;'), '20', 'pgbench-vec queries count');
+is($node->safe_psql('wl_pgbench_vec', 'SELECT count(*) FROM pgbench_vec_ground_truth;'), '200', 'pgbench-vec ground truth count');
+
+my $vecbench_phase2_json = $node->basedir . '/001_pgbench_vecbench_phase2_report.json';
+$node->pgbench(
+	"-n -d wl_pgbench_vec -c 2 -j 2 -t 4 -s 1 --reservoir=vec_ids:256 "
+	  . "-f $wl_dir/pgbench-vec/pgbench_vec_search.sql\@30 "
+	  . "-f $wl_dir/pgbench-vec/pgbench_vec_filtered.sql\@25 "
+	  . "-f $wl_dir/pgbench-vec/pgbench_vec_postfiltered.sql\@20 "
+	  . "-f $wl_dir/pgbench-vec/pgbench_vec_multivec.sql\@15 "
+	  . "-f $wl_dir/pgbench-vec/pgbench_vec_insert.sql\@10 "
+	  . "--sla=total:r_unfiltered:recall>=0.80 --sla=total:r_prefilter:recall>=0.80 "
+	  . "--sla=total:r_postfilter:recall>=0.40 --sla=total:r_multivec:recall>=0.80 "
+	  . "--sla total:p95<=60s --json-report=$vecbench_phase2_json",
+	0,
+	[
+		qr{processed: 8/8},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{SLA total:r_unfiltered:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+		qr{SLA total:r_prefilter:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+		qr{SLA total:r_postfilter:recall >= 0\.4000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+		qr{SLA total:r_multivec:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-vec full hybrid & multi-vector benchmark execution (Modes 1, 2, 3, 5)');
+
+my $vecbench_phase2_json_content = slurp_file($vecbench_phase2_json);
+like($vecbench_phase2_json_content, qr/"named_recall":\s*\{/, 'JSON report contains named_recall');
+like($vecbench_phase2_json_content, qr/"r_unfiltered":\s*\{/, 'JSON report contains r_unfiltered');
+like($vecbench_phase2_json_content, qr/"r_prefilter":\s*\{/, 'JSON report contains r_prefilter');
+like($vecbench_phase2_json_content, qr/"r_postfilter":\s*\{/, 'JSON report contains r_postfilter');
+like($vecbench_phase2_json_content, qr/"r_multivec":\s*\{/, 'JSON report contains r_multivec');
+
 # 7. pgbench-graph parallel initialization and LDBC-like graph workload execution
 $node->pgbench(
 	"-n -d wl_pgbench_graph -t 1 -f $wl_dir/pgbench-graph/pgbench_graph_schema.sql",
