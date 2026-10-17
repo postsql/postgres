@@ -3098,6 +3098,41 @@ $node->pgbench(
 	[qr{^$}],
 	'pgbench-graph workload execution without --reservoir');
 
+# Phase 2 LDBC Suite 1: LSQB (Q1-Q9 cyclic, acyclic, and anti-join pattern matching)
+$node->pgbench(
+	"-n -d wl_pgbench_graph -c 2 -j 2 -t 1 -s 1 "
+	  . "--sla validation_failures<=0 --sla validation_pct>=100.0 "
+	  . "-f $wl_dir/pgbench-graph/pgbench_ldbc_lsqb.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{validation results: passed = 18, failed = 0 \(100\.00%\)},
+		qr{SLA total:validation_failures <= 0: actual = 0 \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-graph LDBC LSQB (Q1-Q9) workload suite execution');
+
+# Phase 2 LDBC Suite 2: LDBC SNB Interactive v1/v2 (multi-group readers IC->\call IS + writers IU/ID)
+$node->pgbench(
+	"-n -d wl_pgbench_graph -t 3 -s 1 --tcr=0.1 "
+	  . "--reservoir=persons:512 --reservoir=messages:1024 "
+	  . "--group name=snb_readers,clients=1,threads=1,"
+	  . "file=$wl_dir/pgbench-graph/pgbench_ldbc_snb_ic.sql\@50,"
+	  . "file=$wl_dir/pgbench-graph/pgbench_ldbc_snb_is.sql\@50 "
+	  . "--group name=snb_writers,clients=1,threads=1,"
+	  . "file=$wl_dir/pgbench-graph/pgbench_ldbc_snb_iu.sql\@70,"
+	  . "file=$wl_dir/pgbench-graph/pgbench_ldbc_snb_id.sql\@30 "
+	  . "--sla validation_failures<=0 --sla total:p95<=60s",
+	0,
+	[
+		qr{processed: 6/6},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{SLA total:validation_failures <= 0: actual = 0 \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-graph LDBC SNB Interactive v1/v2 multi-group workload execution');
+
 for my $db (qw(wl_pgbench_b wl_pgbench_c wl_pgbench_e wl_pgbench_h wl_pgbench_ds wl_pgbench_htap wl_pgbench_vec wl_pgbench_graph))
 {
 	$node->safe_psql('postgres', "DROP DATABASE $db;");
