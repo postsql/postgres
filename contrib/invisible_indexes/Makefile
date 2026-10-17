@@ -8,7 +8,7 @@ DATA = invisible_indexes--1.0.sql
 PGFILEDESC = "invisible_indexes - support for invisible and excluded indexes"
 
 REGRESS = invisible_indexes
-REGRESS_OPTS = --temp-config invisible_indexes_regression_test_settings.conf
+REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/invisible_indexes/invisible_indexes_regression_test_settings.conf
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
