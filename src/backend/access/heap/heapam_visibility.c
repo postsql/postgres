@@ -1021,6 +1021,12 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 		if (!HeapTupleHeaderXminFrozen(tuple) &&
 			XidInMVCCSnapshot(HeapTupleHeaderGetRawXmin(tuple), snapshot))
 			return false;		/* treat as still in progress */
+		if (unlikely(immediate_insert_visibility_active) &&
+			HeapTupleHeaderXminFrozen(tuple) &&
+			TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple)) &&
+			!(tuple->t_infomask & HEAP_COMBOCID) &&
+			HeapTupleHeaderGetRawCommandId(tuple) >= snapshot->curcid)
+			return false;		/* inserted after scan started */
 	}
 
 	/* by here, the inserting transaction has committed */

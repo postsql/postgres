@@ -37,6 +37,7 @@
 #define HEAP_INSERT_FROZEN		TABLE_INSERT_FROZEN
 #define HEAP_INSERT_NO_LOGICAL	TABLE_INSERT_NO_LOGICAL
 #define HEAP_INSERT_SPECULATIVE 0x0010
+#define HEAP_INSERT_IMMEDIATE_FROZEN 0x0020
 
 /* "options" flag bits for heap_page_prune_and_freeze */
 #define HEAP_PAGE_PRUNE_MARK_UNUSED_NOW		(1 << 0)
@@ -385,6 +386,17 @@ extern TM_Result heap_delete(Relation relation, const ItemPointerData *tid,
 							 bool wait, TM_FailureData *tmfd);
 extern void heap_finish_speculative(Relation relation, const ItemPointerData *tid);
 extern void heap_abort_speculative(Relation relation, const ItemPointerData *tid);
+extern PGDLLIMPORT char *immediate_global_insert_visibility;
+extern PGDLLIMPORT bool immediate_insert_visibility_active;
+extern bool RelationHasImmediateInsertVisibility(Relation relation);
+extern bool RelationGetImmediateInsertVisibility(Relation relation, bool *sync);
+extern XLogRecPtr heap_freeze_inserted_tuple(Relation relation,
+											 const ItemPointerData *tid,
+											 bool flush);
+extern void heap_record_pending_immediate_freeze_lsn(XLogRecPtr lsn);
+extern void heap_flush_pending_immediate_freeze(void);
+extern bool heap_consume_immediate_freeze_abort_flush(bool clear);
+extern void heap_clear_immediate_freeze_abort_flush(void);
 extern TM_Result heap_update(Relation relation, const ItemPointerData *otid,
 							 HeapTuple newtup,
 							 CommandId cid, uint32 options,

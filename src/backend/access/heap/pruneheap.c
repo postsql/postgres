@@ -2670,11 +2670,23 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 	}
 
 	/*
+	 * For logical decoding of immediate_global_insert_visibility tuples,
+	 * ensure block 0's freeze plan/offset data is retained even when a
+	 * full-page image is taken, and include the replication origin.
+	 */
+	if (reason == PRUNE_ON_ACCESS && nfrozen > 0 &&
+		RelationIsLogicallyLogged(relation))
+		regbuf_flags_heap |= REGBUF_KEEP_DATA;
+
+	/*
 	 * Prepare data for the buffer.  The arrays are not actually in the
 	 * buffer, but we pretend that they are.  When XLogInsert stores a full
 	 * page image, the arrays can be omitted.
 	 */
 	XLogBeginInsert();
+	if (reason == PRUNE_ON_ACCESS && nfrozen > 0 &&
+		RelationIsLogicallyLogged(relation))
+		XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 	XLogRegisterBuffer(0, buffer, regbuf_flags_heap);
 
 	if (do_set_vm)

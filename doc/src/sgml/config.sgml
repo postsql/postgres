@@ -11107,6 +11107,52 @@ SET XML OPTION { DOCUMENT | CONTENT };
      </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-immediate-global-insert-visibility" xreflabel="immediate_global_insert_visibility">
+      <term><varname>immediate_global_insert_visibility</varname> (<type>string</type>)
+      <indexterm>
+       <primary><varname>immediate_global_insert_visibility</varname></primary>
+       <secondary>configuration parameter</secondary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Specifies a comma-separated list of tables (including partitioned
+        tables, which expand to all existing and newly created or attached
+        leaf partitions) for which newly inserted rows are frozen
+        (<literal>HEAP_XMIN_FROZEN</literal>) immediately after index
+        insertion succeeds.  Rows inserted while a table is listed in this
+        parameter become immediately visible to all concurrent transactions,
+        survive even if the inserting transaction or subtransaction
+        subsequently rolls back, and are replicated by logical decoding even
+        if the enclosing transaction aborts.  The default value is an empty
+        string (<literal>""</literal>).
+       </para>
+       <para>
+        Each table entry (or the list) may optionally specify a durability
+        mode of <literal>sync</literal> (the default) or <literal>async</literal>
+        using <literal><replaceable>table</replaceable>:sync</literal>,
+        <literal><replaceable>table</replaceable>:async</literal>,
+        <literal>sync:<replaceable>table</replaceable></literal>, or
+        <literal>async:<replaceable>table</replaceable></literal> (or a leading
+        <literal>sync</literal>/<literal>async</literal> list item).  In
+        <literal>sync</literal> mode, <function>XLogFlush</function> is called
+        at the end of each inserting statement (or multi-insert batch) for
+        immediate crash safety.  In <literal>async</literal> mode, the freeze
+        WAL record is still logged and the tuple is immediately visible and
+        rollback-safe, but <function>XLogFlush</function> is skipped.
+       </para>
+       <para>
+        This parameter can only be set within a transaction block using
+        <command>SET LOCAL</command> (or <function>set_config(..., true)</function>),
+        and the current user must have <literal>INSERT</literal> privilege on
+        each specified table (as well as <literal>USAGE</literal> privilege on
+        any explicitly specified schema).  It is useful for rollback-safe
+        audit logging and local two-phase commit (2PC) coordinator state
+        tracking.
+       </para>
+      </listitem>
+     </varlistentry>
+
      </variablelist>
     </sect2>
      <sect2 id="runtime-config-client-format">

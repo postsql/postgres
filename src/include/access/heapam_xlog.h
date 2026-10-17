@@ -77,6 +77,8 @@
 
 /* all_frozen_set always implies all_visible_set */
 #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
+/* tuple will be frozen immediately (or is an immediately-frozen TOAST chunk) */
+#define XLH_INSERT_IMMEDIATE_FROZEN				(1<<6)
 
 /*
  * xl_heap_update flag values, 8 bits are available.

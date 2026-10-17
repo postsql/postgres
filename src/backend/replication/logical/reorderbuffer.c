@@ -812,15 +812,22 @@ ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 						 ReorderBufferChange *change, bool toast_insert)
 {
 	ReorderBufferTXN *txn;
+	bool		is_pending_freeze;
 
 	txn = ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
+
+	is_pending_freeze =
+		(change->action == REORDER_BUFFER_CHANGE_INSERT ||
+		 change->action == REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT) &&
+		change->data.tp.pending_immediate_freeze;
 
 	/*
 	 * If we have detected that the transaction is aborted while streaming the
 	 * previous changes or by checking its CLOG, there is no point in
-	 * collecting further changes for it.
+	 * collecting further changes for it, unless the change is a candidate for
+	 * immediate freeze (which survives transaction abort).
 	 */
-	if (rbtxn_is_aborted(txn))
+	if (rbtxn_is_aborted(txn) && !is_pending_freeze)
 	{
 		/*
 		 * We don't need to update memory accounting for this change as we
@@ -862,7 +869,120 @@ ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 	/* process partial change */
 	ReorderBufferProcessPartialChange(rb, txn, change, toast_insert);
 
-	/* check the memory limits and evict something if needed */
+	/*
+	 * Check the memory limits and evict something if needed.  If this change
+	 * is waiting for an immediate-freeze confirmation record, defer eviction
+	 * until ReorderBufferMarkTupleFrozen() so the change remains in memory to
+	 * be matched by TID.
+	 */
+	if (!is_pending_freeze)
+		ReorderBufferCheckMemoryLimit(rb);
+}
+
+/*
+ * Mark previously queued insert change(s) at the specified (rlocator, blkno,
+ * offsets[]) as immediately frozen, along with any preceding TOAST chunk
+ * inserts belonging to the tuple or multi-insert batch.
+ */
+void
+ReorderBufferMarkTupleFrozen(ReorderBuffer *rb, TransactionId xid,
+							 XLogRecPtr lsn,
+							 RelFileLocator rlocator,
+							 BlockNumber blkno,
+							 const OffsetNumber *offsets,
+							 int noffsets)
+{
+	ReorderBufferTXN *txn;
+	ReorderBufferTXN *toptxn;
+	dlist_iter	iter;
+	bool		found_any = false;
+
+	txn = ReorderBufferTXNByXid(rb, xid, false, NULL, InvalidXLogRecPtr, false);
+	if (txn == NULL)
+		return;
+
+	dlist_reverse_foreach(iter, &txn->changes)
+	{
+		ReorderBufferChange *change;
+		OffsetNumber offnum;
+		bool		matched = false;
+
+		change = dlist_container(ReorderBufferChange, node, iter.cur);
+		if (change->action != REORDER_BUFFER_CHANGE_INSERT ||
+			change->data.tp.is_toast ||
+			change->data.tp.newtuple == NULL)
+			continue;
+
+		if (!RelFileLocatorEquals(change->data.tp.rlocator, rlocator) ||
+			ItemPointerGetBlockNumber(&change->data.tp.newtuple->t_self) != blkno)
+			continue;
+
+		offnum = ItemPointerGetOffsetNumber(&change->data.tp.newtuple->t_self);
+		for (int i = 0; i < noffsets; i++)
+		{
+			if (offsets[i] == offnum)
+			{
+				matched = true;
+				break;
+			}
+		}
+
+		if (matched)
+		{
+			dlist_node *prev_node;
+
+			change->data.tp.immediately_frozen = true;
+			change->data.tp.pending_immediate_freeze = false;
+			found_any = true;
+
+			/*
+			 * Also mark any preceding TOAST chunk inserts for this tuple (or
+			 * multi-insert batch) as immediately frozen.
+			 */
+			prev_node = &change->node;
+			while (dlist_has_prev(&txn->changes, prev_node))
+			{
+				ReorderBufferChange *prev;
+
+				prev_node = dlist_prev_node(&txn->changes, prev_node);
+				prev = dlist_container(ReorderBufferChange, node, prev_node);
+
+				if (prev->action == REORDER_BUFFER_CHANGE_INSERT)
+				{
+					if (prev->data.tp.is_toast)
+					{
+						if (prev->data.tp.immediately_frozen)
+							break;
+						prev->data.tp.immediately_frozen = true;
+						prev->data.tp.pending_immediate_freeze = false;
+					}
+					else
+					{
+						/*
+						 * If this is an earlier tuple in the same
+						 * multi-insert batch (clear_toast_afterwards ==
+						 * false), keep scanning back to reach the batch's
+						 * TOAST chunks unless it was already marked frozen.
+						 */
+						if (prev->data.tp.clear_toast_afterwards ||
+							prev->data.tp.immediately_frozen)
+							break;
+					}
+				}
+			}
+
+			if (noffsets == 1)
+				break;
+		}
+	}
+
+	if (found_any)
+	{
+		toptxn = rbtxn_get_toptxn(txn);
+		txn->txn_flags |= RBTXN_HAS_IMMEDIATE_FROZEN;
+		toptxn->txn_flags |= RBTXN_HAS_IMMEDIATE_FROZEN;
+	}
+
 	ReorderBufferCheckMemoryLimit(rb);
 }
 
@@ -1106,6 +1226,11 @@ ReorderBufferAssignChild(ReorderBuffer *rb, TransactionId xid,
 	bool		new_sub;
 
 	txn = ReorderBufferTXNByXid(rb, xid, true, &new_top, lsn, true);
+	if (rbtxn_is_known_subxact(txn))
+	{
+		txn = rbtxn_get_toptxn(txn);
+		xid = txn->xid;
+	}
 	subtxn = ReorderBufferTXNByXid(rb, subxid, true, &new_sub, lsn, false);
 
 	if (!new_sub)
@@ -1132,6 +1257,9 @@ ReorderBufferAssignChild(ReorderBuffer *rb, TransactionId xid,
 
 	/* set the reference to top-level transaction */
 	subtxn->toptxn = txn;
+
+	if (rbtxn_has_immediate_frozen(subtxn))
+		txn->txn_flags |= RBTXN_HAS_IMMEDIATE_FROZEN;
 
 	/* add to subtransaction list */
 	dlist_push_tail(&txn->subtxns, &subtxn->node);
@@ -1782,6 +1910,14 @@ ReorderBufferCheckAndTruncateAbortedTXN(ReorderBuffer *rb, ReorderBufferTXN *txn
 	 * Quick return if the transaction status is already known.
 	 */
 
+	/*
+	 * Do not truncate transactions containing immediately-frozen tuples, as
+	 * those tuples survive transaction abort and must still be replayed.
+	 */
+	if (rbtxn_has_immediate_frozen(txn) ||
+		rbtxn_has_immediate_frozen(rbtxn_get_toptxn(txn)))
+		return false;
+
 	if (rbtxn_is_committed(txn))
 		return false;
 	if (rbtxn_is_aborted(txn))
@@ -1935,20 +2071,25 @@ ReorderBufferCopySnap(ReorderBuffer *rb, Snapshot orig_snap,
 	 * transaction in there as well.
 	 */
 	snap->subxip = snap->xip + snap->xcnt;
-	snap->subxip[i++] = txn->xid;
+	snap->subxcnt = 0;
+	if (!rbtxn_is_aborted(txn))
+	{
+		snap->subxip[i++] = txn->xid;
+		snap->subxcnt++;
+	}
 
 	/*
 	 * txn->nsubtxns isn't decreased when subtransactions abort, so count
 	 * manually. Since it's an upper boundary it is safe to use it for the
 	 * allocation above.
 	 */
-	snap->subxcnt = 1;
-
 	dlist_foreach(iter, &txn->subtxns)
 	{
 		ReorderBufferTXN *sub_txn;
 
 		sub_txn = dlist_container(ReorderBufferTXN, node, iter.cur);
+		if (rbtxn_is_aborted(sub_txn))
+			continue;
 		snap->subxip[i++] = sub_txn->xid;
 		snap->subxcnt++;
 	}
@@ -2303,7 +2444,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			 * required for the cases when we decode the changes before the
 			 * COMMIT record is processed.
 			 */
-			if (streaming || rbtxn_is_prepared(change->txn))
+			if ((streaming || rbtxn_is_prepared(change->txn)) &&
+				!rbtxn_is_aborted(change->txn))
 			{
 				curtxn = change->txn;
 				SetupCheckXidLive(curtxn->xid);
@@ -2330,6 +2472,19 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				case REORDER_BUFFER_CHANGE_UPDATE:
 				case REORDER_BUFFER_CHANGE_DELETE:
 					Assert(snapshot_now);
+
+					if (rbtxn_is_aborted(change->txn))
+					{
+						if (change->action != REORDER_BUFFER_CHANGE_INSERT ||
+							!change->data.tp.immediately_frozen)
+						{
+							if (change->action == REORDER_BUFFER_CHANGE_INSERT &&
+								!change->data.tp.is_toast &&
+								change->data.tp.clear_toast_afterwards)
+								ReorderBufferToastReset(rb, txn);
+							goto change_done;
+						}
+					}
 
 					reloid = RelidByRelfilenumber(change->data.tp.rlocator.spcOid,
 												  change->data.tp.rlocator.relNumber);
@@ -2484,6 +2639,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					break;
 
 				case REORDER_BUFFER_CHANGE_TRUNCATE:
+					if (rbtxn_is_aborted(change->txn))
+						break;
 					{
 						int			i;
 						int			nrelids = change->data.truncate.nrelids;
@@ -2522,6 +2679,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					}
 
 				case REORDER_BUFFER_CHANGE_MESSAGE:
+					if (rbtxn_is_aborted(change->txn))
+						break;
 					ReorderBufferApplyMessage(rb, txn, change, streaming);
 					break;
 
@@ -3149,6 +3308,57 @@ ReorderBufferAbort(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 			ReorderBufferImmediateInvalidation(rb, txn->ninvalidations,
 											   txn->invalidations);
 	}
+	else if (rbtxn_has_immediate_frozen(txn))
+	{
+		LogicalDecodingContext *ctx = rb->private_data;
+		SnapBuild  *builder = ctx->snapshot_builder;
+		XLogRecPtr	origptr = (ctx->reader != NULL &&
+							   XLogRecPtrIsValid(ctx->reader->ReadRecPtr)) ?
+			ctx->reader->ReadRecPtr : lsn;
+		dlist_iter	subxact_i;
+
+		txn->txn_flags |= RBTXN_IS_ABORTED;
+		txn->final_lsn = origptr;
+		txn->end_lsn = lsn;
+
+		/*
+		 * If this is a known subtransaction, keep it attached to its
+		 * top-level transaction so its immediately-frozen inserts will be
+		 * replayed in LSN order when the top-level transaction finishes.
+		 */
+		if (rbtxn_is_known_subxact(txn))
+		{
+			ReorderBufferTXN *toptxn = rbtxn_get_toptxn(txn);
+
+			toptxn->txn_flags |= RBTXN_HAS_IMMEDIATE_FROZEN;
+			ReorderBufferTransferSnapToParent(toptxn, txn);
+			return;
+		}
+
+		dlist_foreach(subxact_i, &txn->subtxns)
+		{
+			ReorderBufferTXN *subtxn;
+
+			subtxn = dlist_container(ReorderBufferTXN, node, subxact_i.cur);
+			subtxn->txn_flags |= RBTXN_IS_ABORTED;
+			ReorderBufferTransferSnapToParent(txn, subtxn);
+		}
+
+		if (SnapBuildCurrentState(builder) >= SNAPBUILD_CONSISTENT &&
+			!SnapBuildXactNeedsSkip(builder, origptr))
+		{
+			if (ctx->fast_forward)
+			{
+				ctx->processing_required = true;
+			}
+			else
+			{
+				ReorderBufferReplay(txn, rb, xid, origptr, lsn, abort_time,
+									txn->origin_id, txn->origin_lsn);
+				return;
+			}
+		}
+	}
 
 	/* cosmetic... */
 	txn->final_lsn = lsn;
@@ -3189,6 +3399,14 @@ ReorderBufferAbortOld(ReorderBuffer *rb, TransactionId oldestRunningXid)
 			/* Notify the remote node about the crash/immediate restart. */
 			if (rbtxn_is_streamed(txn))
 				rb->stream_abort(rb, txn, InvalidXLogRecPtr);
+			else if (rbtxn_has_immediate_frozen(txn))
+			{
+				XLogRecPtr	abort_lsn = XLogRecPtrIsValid(txn->final_lsn) ?
+					txn->final_lsn : txn->first_lsn;
+
+				ReorderBufferAbort(rb, txn->xid, abort_lsn, 0);
+				continue;
+			}
 
 			/* remove potential on-disk data, and deallocate this tx */
 			ReorderBufferCleanupTXN(rb, txn);
@@ -3896,7 +4114,8 @@ ReorderBufferLargestStreamableTopTXN(ReorderBuffer *rb)
 		/* Don't consider these kinds of transactions for eviction. */
 		if (rbtxn_has_partial_change(txn) ||
 			!rbtxn_has_streamable_change(txn) ||
-			rbtxn_is_aborted(txn))
+			rbtxn_is_aborted(txn) ||
+			rbtxn_has_immediate_frozen(txn))
 			continue;
 
 		/* Find the largest of the eviction candidates. */

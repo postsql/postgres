@@ -48,6 +48,7 @@ static void DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeSpecConfirm(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
+static void DecodePruneFreeze(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 
 static void DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 						 xl_xact_parsed_commit *parsed, TransactionId xid,
@@ -469,6 +470,18 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 * interested in.
 			 */
 		case XLOG_HEAP2_PRUNE_ON_ACCESS:
+			if (TransactionIdIsValid(xid))
+			{
+				xl_heap_prune *xlrec = (xl_heap_prune *) XLogRecGetData(buf->record);
+
+				if ((xlrec->flags & XLHP_HAS_FREEZE_PLANS) &&
+					!(xlrec->flags & XLHP_IS_CATALOG_REL) &&
+					SnapBuildProcessChange(builder, xid, buf->origptr) &&
+					!ctx->fast_forward &&
+					!change_useless_for_repack(buf))
+					DecodePruneFreeze(ctx, buf);
+			}
+			break;
 		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
 		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
 		case XLOG_HEAP2_LOCK_UPDATED:
@@ -894,6 +907,9 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	{
 		for (i = 0; i < parsed->nsubxacts; i++)
 		{
+			if (!skip_xact)
+				ReorderBufferCommitChild(ctx->reorder, xid, parsed->subxacts[i],
+										 buf->origptr, buf->endptr);
 			ReorderBufferAbort(ctx->reorder, parsed->subxacts[i],
 							   buf->record->EndRecPtr, abort_time);
 		}
@@ -921,6 +937,7 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	xl_heap_insert *xlrec;
 	ReorderBufferChange *change;
 	RelFileLocator target_locator;
+	BlockNumber blkno = InvalidBlockNumber;
 
 	xlrec = (xl_heap_insert *) XLogRecGetData(r);
 
@@ -932,7 +949,7 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &blkno);
 	if (target_locator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -956,8 +973,13 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		ReorderBufferAllocTupleBuf(ctx->reorder, tuplelen);
 
 	DecodeXLogTuple(tupledata, datalen, change->data.tp.newtuple);
+	ItemPointerSet(&change->data.tp.newtuple->t_self, blkno, xlrec->offnum);
 
 	change->data.tp.clear_toast_afterwards = true;
+	change->data.tp.is_toast =
+		(xlrec->flags & XLH_INSERT_ON_TOAST_RELATION) != 0;
+	change->data.tp.pending_immediate_freeze =
+		(xlrec->flags & XLH_INSERT_IMMEDIATE_FROZEN) != 0;
 
 	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr,
 							 change,
@@ -1157,6 +1179,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	char	   *tupledata;
 	Size		tuplelen;
 	RelFileLocator rlocator;
+	BlockNumber blkno = InvalidBlockNumber;
 
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(r);
 
@@ -1168,7 +1191,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &rlocator, NULL, NULL);
+	XLogRecGetBlockTag(r, 0, &rlocator, NULL, &blkno);
 	if (rlocator.dbOid != ctx->slot->data.database)
 		return;
 
@@ -1191,6 +1214,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		int			datalen;
 		HeapTuple	tuple;
 		HeapTupleHeader header;
+		OffsetNumber offnum;
 
 		change = ReorderBufferAllocChange(ctx->reorder);
 		change->action = REORDER_BUFFER_CHANGE_INSERT;
@@ -1208,8 +1232,11 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		tuple = change->data.tp.newtuple;
 		header = tuple->t_data;
 
-		/* not a disk based tuple */
-		ItemPointerSetInvalid(&tuple->t_self);
+		if (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE)
+			offnum = FirstOffsetNumber + i;
+		else
+			offnum = xlrec->offsets[i];
+		ItemPointerSet(&tuple->t_self, blkno, offnum);
 
 		/*
 		 * We can only figure this out after reassembling the transactions.
@@ -1236,6 +1263,9 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		else
 			change->data.tp.clear_toast_afterwards = false;
 
+		change->data.tp.pending_immediate_freeze =
+			(xlrec->flags & XLH_INSERT_IMMEDIATE_FROZEN) != 0;
+
 		ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
 								 buf->origptr, change, false);
 
@@ -1243,6 +1273,60 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		data += datalen;
 	}
 	Assert(data == tupledata + tuplelen);
+}
+
+/*
+ * Parse XLOG_HEAP2_PRUNE_ON_ACCESS with XLHP_HAS_FREEZE_PLANS emitted by
+ * heap_freeze_inserted_tuple() to mark the corresponding inserted tuple (and
+ * its preceding TOAST chunks) as immediately frozen so they are decoded even
+ * if the enclosing transaction or subtransaction later aborts.
+ */
+static void
+DecodePruneFreeze(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	XLogReaderState *r = buf->record;
+	xl_heap_prune *xlrec = (xl_heap_prune *) XLogRecGetData(r);
+	RelFileLocator target_locator;
+	BlockNumber blkno = InvalidBlockNumber;
+	Size		datalen;
+	char	   *dataptr;
+	int			nredirected;
+	int			ndead;
+	int			nunused;
+	int			nplans;
+	OffsetNumber *redirected;
+	OffsetNumber *dead;
+	OffsetNumber *unused;
+	xlhp_freeze_plan *plans;
+	OffsetNumber *frz_offsets;
+	int			total_frozen = 0;
+
+	/* only interested in our database */
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, &blkno);
+	if (target_locator.dbOid != ctx->slot->data.database)
+		return;
+
+	/* output plugin doesn't look for this origin, no need to process */
+	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
+		return;
+
+	dataptr = XLogRecGetBlockData(r, 0, &datalen);
+	if (dataptr == NULL || datalen == 0)
+		return;
+
+	heap_xlog_deserialize_prune_and_freeze(dataptr, xlrec->flags,
+										   &nplans, &plans, &frz_offsets,
+										   &nredirected, &redirected,
+										   &ndead, &dead,
+										   &nunused, &unused);
+
+	for (int p = 0; p < nplans; p++)
+		total_frozen += plans[p].ntuples;
+
+	if (total_frozen > 0)
+		ReorderBufferMarkTupleFrozen(ctx->reorder, XLogRecGetXid(r),
+									 buf->origptr, target_locator, blkno,
+									 frz_offsets, total_frozen);
 }
 
 /*

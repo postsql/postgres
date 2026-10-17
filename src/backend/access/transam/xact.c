@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/subtrans.h"
@@ -1614,6 +1615,7 @@ RecordTransactionCommit(void)
 	/* Reset XactLastRecEnd until the next transaction writes something */
 	XactLastRecEnd = 0;
 cleanup:
+	heap_clear_immediate_freeze_abort_flush();
 	/* Clean up local data */
 	if (rels)
 		pfree(rels);
@@ -1902,6 +1904,17 @@ RecordTransactionAbort(bool isSubXact)
 	TransactionIdAbortTree(xid, nchildren, children);
 
 	END_CRIT_SECTION();
+
+	/*
+	 * If any tuples were frozen in 'sync' immediate-visibility mode or with
+	 * logical WAL active before this (sub)transaction aborted, flush WAL up
+	 * to XactLastRecEnd so both the freeze records and the abort record are
+	 * on disk.
+	 */
+	heap_flush_pending_immediate_freeze();
+	if (heap_consume_immediate_freeze_abort_flush(!isSubXact) &&
+		XLogRecPtrIsValid(XactLastRecEnd))
+		XLogFlush(XactLastRecEnd);
 
 	/* Compute latestXid while we have the child XIDs handy */
 	latestXid = TransactionIdLatest(xid, nchildren, children);

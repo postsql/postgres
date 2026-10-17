@@ -65,6 +65,7 @@ tests += {
       'stats',
       'twophase',
       'twophase_stream',
+      'immediate_insert_visibility',
     ],
     'regress_args': [
       '--temp-config', files('logical.conf'),

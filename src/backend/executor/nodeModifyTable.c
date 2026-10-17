@@ -53,6 +53,7 @@
 
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
@@ -1259,9 +1260,26 @@ ExecInsert(ModifyTableContext *context,
 			}
 
 			/* Since there was no insertion conflict, we're done */
+			{
+				bool		immediate_vis_sync;
+
+				if (RelationGetImmediateInsertVisibility(resultRelationDesc,
+														 &immediate_vis_sync))
+				{
+					XLogRecPtr	lsn;
+
+					lsn = heap_freeze_inserted_tuple(resultRelationDesc,
+													 &slot->tts_tid,
+													 false);
+					if (immediate_vis_sync)
+						heap_record_pending_immediate_freeze_lsn(lsn);
+				}
+			}
 		}
 		else
 		{
+			bool		immediate_vis_sync;
+
 			/* insert the tuple normally */
 			table_tuple_insert(resultRelationDesc, slot,
 							   estate->es_output_cid,
@@ -1272,6 +1290,18 @@ ExecInsert(ModifyTableContext *context,
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo, estate,
 													   0, slot, NIL,
 													   NULL);
+
+			if (RelationGetImmediateInsertVisibility(resultRelationDesc,
+													 &immediate_vis_sync))
+			{
+				XLogRecPtr	lsn;
+
+				lsn = heap_freeze_inserted_tuple(resultRelationDesc,
+												 &slot->tts_tid,
+												 false);
+				if (immediate_vis_sync)
+					heap_record_pending_immediate_freeze_lsn(lsn);
+			}
 		}
 	}
 
@@ -4488,7 +4518,10 @@ ExecModifyTable(PlanState *pstate)
 			 * continue the work on next call.
 			 */
 			if (slot)
+			{
+				heap_flush_pending_immediate_freeze();
 				return slot;
+			}
 
 			continue;			/* continue with the next tuple */
 		}
@@ -4536,7 +4569,10 @@ ExecModifyTable(PlanState *pstate)
 					 * We'll continue the work on next call.
 					 */
 					if (slot)
+					{
+						heap_flush_pending_immediate_freeze();
 						return slot;
+					}
 
 					continue;	/* continue with the next tuple */
 				}
@@ -4792,7 +4828,10 @@ ExecModifyTable(PlanState *pstate)
 		 * the work on next call.
 		 */
 		if (slot)
+		{
+			heap_flush_pending_immediate_freeze();
 			return slot;
+		}
 	}
 
 	/*
@@ -4802,9 +4841,21 @@ ExecModifyTable(PlanState *pstate)
 		ExecPendingInserts(estate);
 
 	/*
+	 * Flush any pending synchronous immediate-visibility freeze records once
+	 * for the entire statement.
+	 */
+	heap_flush_pending_immediate_freeze();
+
+	/*
 	 * We're done, but fire AFTER STATEMENT triggers before exiting.
 	 */
 	fireASTriggers(node);
+
+	/*
+	 * Also flush in case AFTER STATEMENT triggers inserted into a synchronous
+	 * immediate-visibility table.
+	 */
+	heap_flush_pending_immediate_freeze();
 
 	node->mt_done = true;
 

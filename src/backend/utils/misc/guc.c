@@ -3599,6 +3599,18 @@ set_config_with_handle(const char *name, config_handle *handle,
 		}
 	}
 
+	/* Disallow non-LOCAL changes to GUC_LOCAL_ONLY values */
+	if ((record->flags & GUC_LOCAL_ONLY) &&
+		source != PGC_S_DEFAULT &&
+		action != GUC_ACTION_LOCAL)
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("parameter \"%s\" can only be set with SET LOCAL",
+						record->name)));
+		return 0;
+	}
+
 	/*
 	 * Should we set reset/stacked values?	(If so, the behavior is not
 	 * transactional.)	This is done either when we get a default value from

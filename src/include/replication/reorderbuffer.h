@@ -100,6 +100,15 @@ typedef struct ReorderBufferChange
 			/* no previously reassembled toast chunks are necessary anymore */
 			bool		clear_toast_afterwards;
 
+			/* tuple is immediately frozen and survives transaction abort */
+			bool		immediately_frozen;
+
+			/* tuple is a candidate for immediate freeze (or toast chunk) */
+			bool		pending_immediate_freeze;
+
+			/* change is an insert into a TOAST relation */
+			bool		is_toast;
+
 			/* valid for DELETE || UPDATE */
 			HeapTuple	oldtuple;
 			/* valid for INSERT || UPDATE */
@@ -177,6 +186,7 @@ typedef struct ReorderBufferChange
 #define RBTXN_IS_COMMITTED			0x0400
 #define RBTXN_IS_ABORTED			0x0800
 #define RBTXN_DISTR_INVAL_OVERFLOWED	0x1000
+#define RBTXN_HAS_IMMEDIATE_FROZEN	0x2000
 
 #define RBTXN_PREPARE_STATUS_MASK	(RBTXN_IS_PREPARED | RBTXN_SKIPPED_PREPARE | RBTXN_SENT_PREPARE)
 
@@ -270,6 +280,12 @@ typedef struct ReorderBufferChange
 #define rbtxn_distr_inval_overflowed(txn) \
 ( \
 	((txn)->txn_flags & RBTXN_DISTR_INVAL_OVERFLOWED) != 0 \
+)
+
+/* Does this transaction contain immediately-frozen tuples? */
+#define rbtxn_has_immediate_frozen(txn) \
+( \
+	((txn)->txn_flags & RBTXN_HAS_IMMEDIATE_FROZEN) != 0 \
 )
 
 /* Is this a top-level transaction? */
@@ -718,6 +734,12 @@ extern void ReorderBufferFreeRelids(ReorderBuffer *rb, Oid *relids);
 extern void ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid,
 									 XLogRecPtr lsn, ReorderBufferChange *change,
 									 bool toast_insert);
+extern void ReorderBufferMarkTupleFrozen(ReorderBuffer *rb, TransactionId xid,
+										 XLogRecPtr lsn,
+										 RelFileLocator rlocator,
+										 BlockNumber blkno,
+										 const OffsetNumber *offsets,
+										 int noffsets);
 extern void ReorderBufferQueueMessage(ReorderBuffer *rb, TransactionId xid,
 									  Snapshot snap, XLogRecPtr lsn,
 									  bool transactional, const char *prefix,
