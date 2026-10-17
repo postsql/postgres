@@ -14,10 +14,14 @@
 #include <ctype.h>
 
 #include "access/htup_details.h"
+#if PG_VERSION_NUM >= 120000
 #include "access/relation.h"
+#endif
 #include "access/reloptions.h"
 #include "catalog/namespace.h"
+#if PG_VERSION_NUM >= 110000
 #include "catalog/partition.h"
+#endif
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "commands/comment.h"
@@ -25,7 +29,11 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#if PG_VERSION_NUM >= 120000
 #include "nodes/pathnodes.h"
+#else
+#include "nodes/relation.h"
+#endif
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
 #include "utils/array.h"
@@ -35,7 +43,9 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#if PG_VERSION_NUM >= 100000
 #include "utils/varlena.h"
+#endif
 
 #include "invisible_indexes.h"
 
@@ -402,6 +412,7 @@ is_index_invisible(Oid indexoid)
 		if (is_single_index_invisible(curroid))
 			return true;
 
+#if PG_VERSION_NUM >= 110000
 		/* If curroid is a partition of a parent index, check parent index */
 		if (get_rel_relispartition(curroid))
 		{
@@ -415,6 +426,9 @@ is_index_invisible(Oid indexoid)
 		{
 			break;
 		}
+#else
+		break;
+#endif
 	}
 
 	return false;
@@ -544,8 +558,11 @@ invisible_indexes_set_invisible_internal(Oid indexoid, bool make_invisible)
 	char *comment;
 
 	rel = relation_open(indexoid, ShareUpdateExclusiveLock);
-	if (rel->rd_rel->relkind != RELKIND_INDEX &&
-	    rel->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
+	if (rel->rd_rel->relkind != RELKIND_INDEX
+#ifdef RELKIND_PARTITIONED_INDEX
+	    && rel->rd_rel->relkind != RELKIND_PARTITIONED_INDEX
+#endif
+	   )
 	{
 		relation_close(rel, ShareUpdateExclusiveLock);
 		ereport(ERROR,
@@ -701,7 +718,11 @@ invisible_indexes_is_invisible(PG_FUNCTION_ARGS)
 
 	{
 		char relkind = get_rel_relkind(indexoid);
-		if (relkind != RELKIND_INDEX && relkind != RELKIND_PARTITIONED_INDEX)
+		if (relkind != RELKIND_INDEX
+#ifdef RELKIND_PARTITIONED_INDEX
+		    && relkind != RELKIND_PARTITIONED_INDEX
+#endif
+		   )
 			PG_RETURN_NULL();
 	}
 
@@ -725,7 +746,11 @@ invisible_indexes_is_invisible_oid(PG_FUNCTION_ARGS)
 
 	{
 		char relkind = get_rel_relkind(indexoid);
-		if (relkind != RELKIND_INDEX && relkind != RELKIND_PARTITIONED_INDEX)
+		if (relkind != RELKIND_INDEX
+#ifdef RELKIND_PARTITIONED_INDEX
+		    && relkind != RELKIND_PARTITIONED_INDEX
+#endif
+		   )
 			PG_RETURN_NULL();
 	}
 

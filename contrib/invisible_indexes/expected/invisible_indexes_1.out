@@ -405,24 +405,24 @@ EXPLAIN (COSTS OFF) SELECT * FROM part_parent WHERE id = 50;
 
 DROP TABLE part_parent CASCADE;
 -- 12. Security testing: Unprivileged user permissions
-CREATE ROLE unpriv_test_user;
-GRANT USAGE ON SCHEMA invisible_indexes TO unpriv_test_user;
+CREATE ROLE regress_invisible_indexes_user;
+GRANT USAGE ON SCHEMA invisible_indexes TO regress_invisible_indexes_user;
 -- Test public execute revocation
-SET ROLE unpriv_test_user;
+SET ROLE regress_invisible_indexes_user;
 SELECT invisible_indexes.set_invisible('idx_test_id', true);
 ERROR:  permission denied for function set_invisible
 SELECT invisible_indexes.alter_index_invisible('idx_test_id');
 ERROR:  permission denied for function alter_index_invisible
 -- Test superuser verification inside C function
 RESET ROLE;
-GRANT EXECUTE ON FUNCTION invisible_indexes.set_invisible(text, boolean) TO unpriv_test_user;
-SET ROLE unpriv_test_user;
+GRANT EXECUTE ON FUNCTION invisible_indexes.set_invisible(text, boolean) TO regress_invisible_indexes_user;
+SET ROLE regress_invisible_indexes_user;
 SELECT invisible_indexes.set_invisible('idx_test_id', true);
 ERROR:  must be superuser to modify index visibility
 RESET ROLE;
-REVOKE EXECUTE ON FUNCTION invisible_indexes.set_invisible(text, boolean) FROM unpriv_test_user;
-REVOKE USAGE ON SCHEMA invisible_indexes FROM unpriv_test_user;
-DROP ROLE unpriv_test_user;
+REVOKE EXECUTE ON FUNCTION invisible_indexes.set_invisible(text, boolean) FROM regress_invisible_indexes_user;
+REVOKE USAGE ON SCHEMA invisible_indexes FROM regress_invisible_indexes_user;
+DROP ROLE regress_invisible_indexes_user;
 -- 13. Negative & boundary tests
 SELECT invisible_indexes.is_invisible(NULL);
  is_invisible 
