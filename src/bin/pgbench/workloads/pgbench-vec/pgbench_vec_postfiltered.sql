@@ -7,7 +7,7 @@
 
 \set dim 8
 \set k 5
-\set k_oversample 25
+\set k_oversample 60
 \set cat random(0, 9)
 \set qvec random_unit_vector(:dim)
 

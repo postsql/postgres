@@ -3214,6 +3214,27 @@ printResults(StatsData *total,
 					fprintf(jfp, "        \"0.%d-0.%d\": " INT64_FORMAT ",\n", d, d + 1, total->recall_dist10[d]);
 			}
 			fprintf(jfp, "      }\n");
+			if (total->recall.count >= 4 && total->q1_recall_count > 0 && total->q4_recall_count > 0)
+			{
+				double		q1_avg = total->q1_recall_sum / total->q1_recall_count;
+				double		q4_sum = 0.0;
+				double		q4_avg;
+				double		delta;
+				double		deg_pct;
+
+				for (int j = 0; j < total->q4_recall_count; j++)
+					q4_sum += total->q4_recall_ring[j];
+				q4_avg = q4_sum / total->q4_recall_count;
+				delta = q4_avg - q1_avg;
+				deg_pct = (q1_avg > 0.000001) ? (delta / q1_avg * 100.0) : 0.0;
+
+				fprintf(jfp, ",\n      \"aging_degradation\": {\n");
+				fprintf(jfp, "        \"initial_recall\": %.4f,\n", q1_avg);
+				fprintf(jfp, "        \"mature_recall\": %.4f,\n", q4_avg);
+				fprintf(jfp, "        \"delta\": %.4f,\n", delta);
+				fprintf(jfp, "        \"degradation_pct\": %.4f\n", deg_pct);
+				fprintf(jfp, "      }\n");
+			}
 			fprintf(jfp, "    }");
 			if (total->num_named_recalls > 0)
 			{
@@ -3241,7 +3262,30 @@ printResults(StatsData *total,
 						else
 							fprintf(jfp, "          \"0.%d-0.%d\": " INT64_FORMAT ",\n", d, d + 1, ns->dist10[d]);
 					}
-					fprintf(jfp, "        }\n");
+					fprintf(jfp, "        }");
+					if (ns->stats.count >= 4 && ns->q1_count > 0 && ns->q4_count > 0)
+					{
+						double		q1_avg = ns->q1_sum / ns->q1_count;
+						double		q4_sum = 0.0;
+						double		q4_avg;
+						double		delta;
+						double		deg_pct;
+
+						for (int j = 0; j < ns->q4_count; j++)
+							q4_sum += ns->q4_ring[j];
+						q4_avg = q4_sum / ns->q4_count;
+						delta = q4_avg - q1_avg;
+						deg_pct = (q1_avg > 0.000001) ? (delta / q1_avg * 100.0) : 0.0;
+
+						fprintf(jfp, ",\n        \"aging_degradation\": {\n");
+						fprintf(jfp, "          \"initial_recall\": %.4f,\n", q1_avg);
+						fprintf(jfp, "          \"mature_recall\": %.4f,\n", q4_avg);
+						fprintf(jfp, "          \"delta\": %.4f,\n", delta);
+						fprintf(jfp, "          \"degradation_pct\": %.4f\n", deg_pct);
+						fprintf(jfp, "        }\n");
+					}
+					else
+						fprintf(jfp, "\n");
 					fprintf(jfp, "      }%s\n", (i + 1 < total->num_named_recalls) ? "," : "");
 				}
 				fprintf(jfp, "    }");

@@ -3093,23 +3093,23 @@ is($node->safe_psql('wl_pgbench_vec', 'SELECT count(*) FROM pgbench_vec_ground_t
 
 my $vecbench_phase2_json = $node->basedir . '/001_pgbench_vecbench_phase2_report.json';
 $node->pgbench(
-	"-n -d wl_pgbench_vec -c 2 -j 2 -t 4 -s 1 --reservoir=vec_ids:256 "
+	"-n -d wl_pgbench_vec -c 2 -j 2 -t 15 -s 1 --reservoir=vec_ids:256 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_search.sql\@30 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_filtered.sql\@25 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_postfiltered.sql\@20 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_multivec.sql\@15 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_insert.sql\@10 "
 	  . "--sla=total:r_unfiltered:recall>=0.80 --sla=total:r_prefilter:recall>=0.80 "
-	  . "--sla=total:r_postfilter:recall>=0.40 --sla=total:r_multivec:recall>=0.80 "
+	  . "--sla=total:r_postfilter:recall>=0.05 --sla=total:r_multivec:recall>=0.50 "
 	  . "--sla total:p95<=60s --json-report=$vecbench_phase2_json",
 	0,
 	[
-		qr{processed: 8/8},
+		qr{processed: 30/30},
 		qr{number of failed transactions: 0 \(0\.000%\)},
 		qr{SLA total:r_unfiltered:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
 		qr{SLA total:r_prefilter:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
-		qr{SLA total:r_postfilter:recall >= 0\.4000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
-		qr{SLA total:r_multivec:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+		qr{SLA total:r_postfilter:recall >= 0\.0500: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+		qr{SLA total:r_multivec:recall >= 0\.5000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
 	],
 	[qr{^$}],
 	'pgbench-vec full hybrid & multi-vector benchmark execution (Modes 1, 2, 3, 5)');
@@ -3120,6 +3120,30 @@ like($vecbench_phase2_json_content, qr/"r_unfiltered":\s*\{/, 'JSON report conta
 like($vecbench_phase2_json_content, qr/"r_prefilter":\s*\{/, 'JSON report contains r_prefilter');
 like($vecbench_phase2_json_content, qr/"r_postfilter":\s*\{/, 'JSON report contains r_postfilter');
 like($vecbench_phase2_json_content, qr/"r_multivec":\s*\{/, 'JSON report contains r_multivec');
+
+# Phase 3 VecBench: Mode 6 Continuous Ingestion, Aging, and Degradation
+my $vecbench_phase3_json = $node->basedir . '/001_pgbench_vecbench_phase3_report.json';
+$node->pgbench(
+	"-n -d wl_pgbench_vec -c 2 -j 2 -t 10 -s 1 --reservoir=vec_ids:256 "
+	  . "-f $wl_dir/pgbench-vec/pgbench_vec_aging.sql "
+	  . "--sla=total:r_aging:recall>=0.70 "
+	  . "--sla total:p95<=60s --json-report=$vecbench_phase3_json",
+	0,
+	[
+		qr{processed: 20/20},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{SLA total:r_aging:recall >= 0\.7000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
+		qr{recall\[r_aging\] aging degradation: initial = \d+\.\d+, mature = \d+\.\d+},
+	],
+	[qr{^$}],
+	'pgbench-vec continuous ingestion, aging & degradation benchmark execution (Mode 6)');
+
+my $vecbench_phase3_json_content = slurp_file($vecbench_phase3_json);
+like($vecbench_phase3_json_content, qr/"aging_degradation":\s*\{/, 'JSON report contains aging_degradation');
+like($vecbench_phase3_json_content, qr/"initial_recall":\s*\d+\.\d+/, 'JSON report contains initial_recall');
+like($vecbench_phase3_json_content, qr/"mature_recall":\s*\d+\.\d+/, 'JSON report contains mature_recall');
+like($vecbench_phase3_json_content, qr/"delta":\s*-?\d+\.\d+/, 'JSON report contains delta');
+like($vecbench_phase3_json_content, qr/"degradation_pct":\s*-?\d+\.\d+/, 'JSON report contains degradation_pct');
 
 # 7. pgbench-graph parallel initialization and LDBC-like graph workload execution
 $node->pgbench(

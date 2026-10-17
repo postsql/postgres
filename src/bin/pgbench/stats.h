@@ -40,11 +40,17 @@ typedef int64 pg_time_usec_t;
 #define RECALL_HIST_BUCKETS 101
 #define RECALL_DIST10_BUCKETS 10
 #define MAX_NAMED_RECALL_METRICS 8
+#define AGING_WINDOW_SAMPLES 32
 
 typedef struct NamedRecallStats
 {
 	char		name[32];
 	SimpleStats stats;
+	int			q1_count;
+	double		q1_sum;
+	int			q4_count;
+	int			q4_head;
+	double		q4_ring[AGING_WINDOW_SAMPLES];
 	int64		buckets[RECALL_HIST_BUCKETS];
 	int64		dist10[RECALL_DIST10_BUCKETS];
 } NamedRecallStats;
@@ -143,6 +149,11 @@ typedef struct StatsData
 	int64		ontime_count;
 	int64		recall_buckets[RECALL_HIST_BUCKETS];
 	int64		recall_dist10[RECALL_DIST10_BUCKETS];
+	int			q1_recall_count;
+	double		q1_recall_sum;
+	int			q4_recall_count;
+	int			q4_recall_head;
+	double		q4_recall_ring[AGING_WINDOW_SAMPLES];
 	int			num_named_recalls;
 	NamedRecallStats named_recalls[MAX_NAMED_RECALL_METRICS];
 	int64		validation_passed;

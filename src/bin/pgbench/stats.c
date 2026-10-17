@@ -116,6 +116,11 @@ initStats(StatsData *sd, pg_time_usec_t start)
 	sd->ontime_count = 0;
 	memset(sd->recall_buckets, 0, sizeof(sd->recall_buckets));
 	memset(sd->recall_dist10, 0, sizeof(sd->recall_dist10));
+	sd->q1_recall_count = 0;
+	sd->q1_recall_sum = 0.0;
+	sd->q4_recall_count = 0;
+	sd->q4_recall_head = 0;
+	memset(sd->q4_recall_ring, 0, sizeof(sd->q4_recall_ring));
 	sd->num_named_recalls = 0;
 	memset(sd->named_recalls, 0, sizeof(sd->named_recalls));
 	sd->validation_passed = 0;
@@ -208,6 +213,15 @@ mergeStats(StatsData *acc, const StatsData *src)
 		acc->recall_buckets[b] += src->recall_buckets[b];
 	for (int d = 0; d < RECALL_DIST10_BUCKETS; d++)
 		acc->recall_dist10[d] += src->recall_dist10[d];
+	acc->q1_recall_sum += src->q1_recall_sum;
+	acc->q1_recall_count += src->q1_recall_count;
+	for (int k = 0; k < src->q4_recall_count; k++)
+	{
+		acc->q4_recall_ring[acc->q4_recall_head] = src->q4_recall_ring[k];
+		acc->q4_recall_head = (acc->q4_recall_head + 1) % AGING_WINDOW_SAMPLES;
+		if (acc->q4_recall_count < AGING_WINDOW_SAMPLES)
+			acc->q4_recall_count++;
+	}
 	for (int i = 0; i < src->num_named_recalls; i++)
 	{
 		const NamedRecallStats *s = &src->named_recalls[i];
@@ -231,6 +245,15 @@ mergeStats(StatsData *acc, const StatsData *src)
 		if (dst != NULL)
 		{
 			mergeSimpleStats(&dst->stats, &s->stats);
+			dst->q1_sum += s->q1_sum;
+			dst->q1_count += s->q1_count;
+			for (int k = 0; k < s->q4_count; k++)
+			{
+				dst->q4_ring[dst->q4_head] = s->q4_ring[k];
+				dst->q4_head = (dst->q4_head + 1) % AGING_WINDOW_SAMPLES;
+				if (dst->q4_count < AGING_WINDOW_SAMPLES)
+					dst->q4_count++;
+			}
 			for (int b = 0; b < RECALL_HIST_BUCKETS; b++)
 				dst->buckets[b] += s->buckets[b];
 			for (int d = 0; d < RECALL_DIST10_BUCKETS; d++)
@@ -458,6 +481,16 @@ addToRecallStats(StatsData *sd, double recall_val)
 	if (d < 0)
 		d = 0;
 	sd->recall_dist10[d]++;
+
+	if (sd->q1_recall_count < AGING_WINDOW_SAMPLES)
+	{
+		sd->q1_recall_sum += clamped;
+		sd->q1_recall_count++;
+	}
+	sd->q4_recall_ring[sd->q4_recall_head] = clamped;
+	sd->q4_recall_head = (sd->q4_recall_head + 1) % AGING_WINDOW_SAMPLES;
+	if (sd->q4_recall_count < AGING_WINDOW_SAMPLES)
+		sd->q4_recall_count++;
 }
 
 void
@@ -512,6 +545,16 @@ addToNamedRecallStats(StatsData *sd, const char *name, double recall_val)
 		if (d < 0)
 			d = 0;
 		slot->dist10[d]++;
+
+		if (slot->q1_count < AGING_WINDOW_SAMPLES)
+		{
+			slot->q1_sum += clamped;
+			slot->q1_count++;
+		}
+		slot->q4_ring[slot->q4_head] = clamped;
+		slot->q4_head = (slot->q4_head + 1) % AGING_WINDOW_SAMPLES;
+		if (slot->q4_count < AGING_WINDOW_SAMPLES)
+			slot->q4_count++;
 	}
 }
 
@@ -635,6 +678,22 @@ printRecallStats(const char *prefix, const StatsData *stats)
 			   getRecallPercentile(stats, 50.0),
 			   getRecallPercentile(stats, 95.0));
 		print10BucketDist(prefix, stats->recall_dist10);
+		if (stats->recall.count >= 4 && stats->q1_recall_count > 0 && stats->q4_recall_count > 0)
+		{
+			double		q1_avg = stats->q1_recall_sum / stats->q1_recall_count;
+			double		q4_sum = 0.0;
+			double		q4_avg;
+			double		delta;
+			double		deg_pct;
+
+			for (int j = 0; j < stats->q4_recall_count; j++)
+				q4_sum += stats->q4_recall_ring[j];
+			q4_avg = q4_sum / stats->q4_recall_count;
+			delta = q4_avg - q1_avg;
+			deg_pct = (q1_avg > 0.000001) ? (delta / q1_avg * 100.0) : 0.0;
+			printf("%s aging degradation: initial = %.4f, mature = %.4f, delta = %+.4f (%+.2f%%)\n",
+				   prefix, q1_avg, q4_avg, delta, deg_pct);
+		}
 	}
 
 	for (int i = 0; i < stats->num_named_recalls; i++)
@@ -658,6 +717,22 @@ printRecallStats(const char *prefix, const StatsData *stats)
 				   getNamedRecallPercentile(stats, s->name, 50.0),
 				   getNamedRecallPercentile(stats, s->name, 95.0));
 			print10BucketDist(named_prefix, s->dist10);
+			if (s->stats.count >= 4 && s->q1_count > 0 && s->q4_count > 0)
+			{
+				double		q1_avg = s->q1_sum / s->q1_count;
+				double		q4_sum = 0.0;
+				double		q4_avg;
+				double		delta;
+				double		deg_pct;
+
+				for (int j = 0; j < s->q4_count; j++)
+					q4_sum += s->q4_ring[j];
+				q4_avg = q4_sum / s->q4_count;
+				delta = q4_avg - q1_avg;
+				deg_pct = (q1_avg > 0.000001) ? (delta / q1_avg * 100.0) : 0.0;
+				printf("%s aging degradation: initial = %.4f, mature = %.4f, delta = %+.4f (%+.2f%%)\n",
+					   named_prefix, q1_avg, q4_avg, delta, deg_pct);
+			}
 		}
 	}
 }
