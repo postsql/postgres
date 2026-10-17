@@ -3133,6 +3133,51 @@ $node->pgbench(
 	[qr{^$}],
 	'pgbench-graph LDBC SNB Interactive v1/v2 multi-group workload execution');
 
+# Phase 3 LDBC Suite 3: LDBC SNB Business Intelligence (Power -> \phase_barrier -> Batch Update -> \phase_barrier -> Throughput)
+$node->pgbench(
+	"-n -d wl_pgbench_graph -c 2 -j 2 -t 1 -s 1 "
+	  . "--sla validation_failures<=0 --sla validation_pct>=100.0 "
+	  . "-f $wl_dir/pgbench-graph/pgbench_ldbc_snb_bi.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{validation results: passed = 14, failed = 0 \(100\.00%\)},
+		qr{SLA total:validation_failures <= 0: actual = 0 \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-graph LDBC SNB BI phased workload execution with phase_barrier');
+
+# Phase 3 LDBC Suite 4a: LDBC FinBench (TSR, TCR temporal cycles, TW, and TRW conditional ROLLBACK)
+$node->pgbench(
+	"-n -d wl_pgbench_graph -c 2 -j 2 -t 4 -s 1 "
+	  . "--sla validation_failures<=0 "
+	  . "-f $wl_dir/pgbench-graph/pgbench_ldbc_finbench.sql",
+	0,
+	[
+		qr{processed: 8/8},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{validation results: passed = 32, failed = 0 \(100\.00%\)},
+		qr{SLA total:validation_failures <= 0: actual = 0 \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-graph LDBC FinBench workload execution (TSR, TCR, TW, TRW)');
+
+# Phase 3 LDBC Suite 4b: LDBC Graphalytics (BFS, WCC, SSSP, PageRank, LCC with \validate_result)
+$node->pgbench(
+	"-n -d wl_pgbench_graph -c 2 -j 2 -t 1 -s 1 "
+	  . "--sla validation_failures<=0 --sla validation_pct>=100.0 "
+	  . "-f $wl_dir/pgbench-graph/pgbench_ldbc_graphalytics.sql",
+	0,
+	[
+		qr{processed: 2/2},
+		qr{number of failed transactions: 0 \(0\.000%\)},
+		qr{validation results: passed = 16, failed = 0 \(100\.00%\)},
+		qr{SLA total:validation_failures <= 0: actual = 0 \[PASS\]},
+	],
+	[qr{^$}],
+	'pgbench-graph LDBC Graphalytics (BFS, WCC, SSSP, PageRank, LCC) execution');
+
 for my $db (qw(wl_pgbench_b wl_pgbench_c wl_pgbench_e wl_pgbench_h wl_pgbench_ds wl_pgbench_htap wl_pgbench_vec wl_pgbench_graph))
 {
 	$node->safe_psql('postgres', "DROP DATABASE $db;");
