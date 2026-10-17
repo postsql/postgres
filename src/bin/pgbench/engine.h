@@ -135,17 +135,39 @@ typedef struct
 
 #define MAX_SLAS		64		/* max number of SLA rules */
 
+typedef enum SlaMetricType
+{
+	SLA_METRIC_LATENCY_PCT = 0, /* p<pct> <= <val>[us|ms|s] */
+	SLA_METRIC_LATENCY_AVG,		/* avg <= <val>[us|ms|s] */
+	SLA_METRIC_LAG_PCT,			/* schedule_lag:p<pct> <= <val>[us|ms|s] */
+	SLA_METRIC_ONTIME_PCT,		/* ontime_pct >= <pct> */
+	SLA_METRIC_RECALL_AVG,		/* recall >= <val> */
+	SLA_METRIC_RECALL_PCT,		/* recall_p<pct> >= <val> */
+	SLA_METRIC_TPS,				/* tps >= <val> or qps >= <val> */
+	SLA_METRIC_ERROR_RATE		/* error_rate <= <pct> */
+} SlaMetricType;
+
+typedef enum SlaOpType
+{
+	SLA_OP_LE = 0,				/* <= */
+	SLA_OP_GE					/* >= */
+} SlaOpType;
+
 /*
- * SLA compliance rule (--sla <target>:p<pct><=<val>[us|ms|s]).
+ * SLA compliance rule (--sla [scope:]<metric>(<=|>=)<val>[unit]).
  */
 typedef struct SlaRule
 {
-	char	   *target;			/* script name/substring, group name, or "total" */
-	double		percentile;		/* e.g. 50.0, 90.0, 95.0, 99.0, 99.9 */
-	double		threshold_usec; /* max allowed latency in microseconds */
-	double		actual_usec;	/* measured latency in microseconds */
-	bool		evaluated;		/* true if target matched at least 1 xact */
-	bool		passed;			/* true if evaluated and actual <= threshold */
+	char		   *target;			/* script name/substring, group name, or "total" */
+	SlaMetricType	metric;			/* metric type */
+	SlaOpType		op;				/* comparison operator */
+	double			percentile;		/* e.g. 50.0, 90.0, 95.0, 99.0, 99.9 */
+	double			threshold_usec; /* max allowed latency/lag in microseconds */
+	double			actual_usec;	/* measured latency/lag in microseconds */
+	double			threshold_val;	/* generic threshold (recall, pct, tps) */
+	double			actual_val;		/* generic measured value */
+	bool			evaluated;		/* true if target matched at least 1 sample */
+	bool			passed;			/* true if evaluated and condition satisfied */
 } SlaRule;
 
 extern ClientGroup client_groups[MAX_GROUPS];
@@ -155,6 +177,8 @@ extern int	num_slas;
 extern bool sla_failed;
 extern char *json_report_file;
 extern double replay_speed;
+extern double ontime_threshold_ms;
+extern char *replay_trace_file;
 extern int	max_concurrent_sessions;
 extern int	active_sessions_count;
 

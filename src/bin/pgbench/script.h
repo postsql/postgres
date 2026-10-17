@@ -77,6 +77,7 @@ typedef enum MetaCommand
 	META_SESSION_CONNECT,		/* \session_connect */
 	META_SESSION_DISCONNECT,	/* \session_disconnect */
 	META_CALL,					/* \call */
+	META_RECORD_RECALL,			/* \record_recall */
 	META_IF,					/* \if */
 	META_ELIF,					/* \elif */
 	META_ELSE,					/* \else */
@@ -173,11 +174,16 @@ typedef struct BuiltinScript
 } BuiltinScript;
 
 extern bool evaluateExpr(CState *st, PgBenchExpr *expr, PgBenchValue *retval);
+extern bool computeRecallOrNdcgAtK(const PgBenchValue *ret_val,
+								   const PgBenchValue *gt_val,
+								   int64 k, bool is_ndcg,
+								   double *out_score);
 extern int	chooseScript(pg_prng_state *random_state);
 
 extern void postprocess_sql_command(Command *my_command);
 extern void process_file(const char *filename, int weight);
 extern void process_builtin(const BuiltinScript *bi, int weight);
+extern void process_replay_builtin(int weight);
 extern void listAvailableScripts(void);
 extern const BuiltinScript *findBuiltin(const char *tb);
 extern int	parseScriptWeight(const char *option, char **script);

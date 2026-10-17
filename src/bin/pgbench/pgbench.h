@@ -87,6 +87,7 @@ typedef enum PgBenchFunction
 	PGBENCH_C_LAST,
 	PGBENCH_RANDOM_ASTRING,
 	PGBENCH_RANDOM_NSTRING,
+	PGBENCH_RANDOM_BYTEA,
 	PGBENCH_FORMAT_STRING,
 	PGBENCH_TO_TIMESTAMP,
 	PGBENCH_DATE_ADD,
@@ -108,9 +109,12 @@ typedef enum PgBenchFunction
 	PGBENCH_DATASET_NEXT_ID,
 	PGBENCH_GET_WATERMARK,
 	PGBENCH_SET_WATERMARK,
+	PGBENCH_ADVANCE_WATERMARK,
 	PGBENCH_RESERVOIR_PUSH,
 	PGBENCH_RESERVOIR_SAMPLE,
 	PGBENCH_RESERVOIR_COUNT,
+	PGBENCH_RECALL_AT_K,
+	PGBENCH_NDCG_AT_K,
 } PgBenchFunction;
 
 typedef struct PgBenchExpr PgBenchExpr;
@@ -362,6 +366,7 @@ typedef struct
 	pg_time_usec_t bench_start_us;	/* thread benchmark start timestamp */
 	pg_time_usec_t sync_scheduled_us;	/* target wall-clock time for \wait_until */
 	int64		sync_dep_watermark; /* required causal watermark */
+	int			sync_dep_channel;	/* causal watermark channel (0..63) */
 	bool		has_sync_dep;	/* true if waiting on sync_dep_watermark */
 	bool		has_scheduled_time; /* true if scheduled via \wait_until or replay */
 
@@ -370,6 +375,10 @@ typedef struct
 	pg_time_usec_t session_conn_start;
 	char	   *session_target_db;
 	char	   *session_target_user;
+
+	/* Pillar 7: Per-transaction quality / recall samples */
+	double		txn_recalls[16];
+	int			txn_recall_count;
 
 	/* whether client prepared each command of each script */
 	bool	  **prepared;

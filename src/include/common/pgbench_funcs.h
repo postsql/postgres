@@ -49,9 +49,10 @@ extern int64 pgbench_permute(int64 val, int64 isize, int64 seed);
 extern int64 pgbench_nurand(pg_prng_state *state, int64 A, int64 min, int64 max, int64 C);
 extern bool pgbench_c_last(int64 num, char *buf, size_t buflen);
 
-/* Random Alphanumeric and Numeric String Generation */
+/* Random Alphanumeric, Numeric, and Binary Payload Generation */
 extern void pgbench_random_astring(pg_prng_state *state, int64 min_len, int64 max_len, char *buf);
 extern void pgbench_random_nstring(pg_prng_state *state, int64 min_len, int64 max_len, char *buf);
+extern int64 pgbench_random_bytea(pg_prng_state *state, int64 min_len, int64 max_len, uint8 *buf);
 
 /* Timestamp / Date Parsing, Formatting, and Arithmetic (microseconds since 2000-01-01) */
 extern bool pgbench_parse_timestamp(const char *str, int64 *usec_out);

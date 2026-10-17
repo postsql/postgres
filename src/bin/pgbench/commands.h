@@ -75,6 +75,7 @@ extern ConnectionStateEnum handle_cmd_endpipeline(CState *st, Command *cmd, pg_t
 extern ConnectionStateEnum handle_cmd_session_connect(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_session_disconnect(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_call(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_record_recall(CState *st, Command *cmd, pg_time_usec_t *now);
 
 /* Preparation helpers used across commands and SQL preparation */
 extern void allocCStatePrepared(CState *st);

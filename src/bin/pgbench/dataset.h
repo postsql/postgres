@@ -88,9 +88,14 @@ extern bool copyDatasetSlice(PGconn *con, PgBenchDataset *ds,
 							 int client_id, int num_clients);
 
 /* Pillar 2: Global Monotonic Clock & Causal Watermark Coordination */
+#define PGBENCH_MAX_WATERMARK_CHANNELS 64
+
 extern int64 getWatermark(void);
+extern int64 getWatermarkChan(int chan);
 extern int64 setWatermark(int64 wm);
+extern int64 setWatermarkChan(int chan, int64 wm);
 extern int64 advanceWatermark(int64 wm);
+extern int64 advanceWatermarkChan(int chan, int64 wm);
 extern void registerThreadWakeupPipe(int tid, int write_fd);
 extern void unregisterThreadWakeupPipe(int tid);
 extern void wakeWatermarkWaiters(void);

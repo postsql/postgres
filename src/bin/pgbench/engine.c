@@ -40,8 +40,11 @@ int	num_slas = 0;
 bool sla_failed = false;
 char *json_report_file = NULL;
 double replay_speed = 1.0;
+double ontime_threshold_ms = 50.0;
+char *replay_trace_file = NULL;
 int	max_concurrent_sessions = 0;
 int	active_sessions_count = 0;
+static int	aborted_clients_count = 0;
 static char *resolved_hostaddr = NULL;
 static char *saved_password = NULL;
 
@@ -1027,6 +1030,53 @@ chooseGroupScript(const ClientGroup *grp, CState *st, pg_prng_state *random_stat
 }
 
 /*
+ * Check whether a client waiting on an unsatisfied causal watermark in
+ * CSTATE_WAIT_SYNC is deadlocked because all unfinished clients across all
+ * threads are either finished/aborted or also blocked on unsatisfied causal
+ * watermarks.
+ */
+static bool
+isCausalWatermarkDeadlocked(TState *thread, CState *st)
+{
+	TState	   *all_threads = thread - thread->tid;
+
+	for (int pass = 0; pass < 2; pass++)
+	{
+		if (getWatermarkChan(st->sync_dep_channel) >= st->sync_dep_watermark)
+			return false;
+
+		for (int t = 0; t < nthreads; t++)
+		{
+			TState	   *th = &all_threads[t];
+
+			for (int i = 0; i < th->nstate; i++)
+			{
+				CState	   *c = &th->state[i];
+				ConnectionStateEnum cstate = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+
+				if (cstate == CSTATE_FINISHED || cstate == CSTATE_ABORTED)
+					continue;
+
+				if (cstate == CSTATE_WAIT_SYNC)
+				{
+					bool		has_dep = __atomic_load_n(&c->has_sync_dep, __ATOMIC_ACQUIRE);
+					int			chan = __atomic_load_n(&c->sync_dep_channel, __ATOMIC_ACQUIRE);
+					int64		dep_wm = __atomic_load_n(&c->sync_dep_watermark, __ATOMIC_ACQUIRE);
+
+					if (has_dep && getWatermarkChan(chan) < dep_wm)
+						continue;
+				}
+
+				/* Found at least one client that can still make progress */
+				return false;
+			}
+		}
+	}
+
+	return (getWatermarkChan(st->sync_dep_channel) < st->sync_dep_watermark);
+}
+
+/*
  * Advance the state machine of a connection.
  */
 static void
@@ -1149,6 +1199,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				st->has_sync_dep = false;
 				st->sync_dep_watermark = 0;
 				st->sync_scheduled_us = 0;
+				st->has_scheduled_time = false;
+				st->txn_recall_count = 0;
 				break;
 
 				/*
@@ -1501,18 +1553,35 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * reached (\wait_until).
 				 */
 			case CSTATE_WAIT_SYNC:
-				if (st->has_sync_dep && getWatermark() < st->sync_dep_watermark)
-					return;
-				if (st->sync_scheduled_us > 0)
+				if (st->has_sync_dep &&
+					getWatermarkChan(st->sync_dep_channel) < st->sync_dep_watermark)
 				{
-					pg_time_now_lazy(&now);
-					if (now < st->sync_scheduled_us)
-						return;
+					if (__atomic_load_n(&aborted_clients_count, __ATOMIC_ACQUIRE) > 0)
+					{
+						pg_log_error("client %d aborted while waiting for causal watermark because another client aborted",
+									 st->id);
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+					if (isCausalWatermarkDeadlocked(thread, st))
+					{
+						pg_log_error("client %d aborted while waiting for causal watermark " INT64_FORMAT " on channel %d: no active client can advance the watermark",
+									 st->id, st->sync_dep_watermark, st->sync_dep_channel);
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+					return;
 				}
+				pg_time_now_lazy(&now);
+				if (st->sync_scheduled_us > 0 && now < st->sync_scheduled_us)
+					return;
+				if (st->has_scheduled_time)
+					st->txn_begin = now;
+				st->state = CSTATE_END_COMMAND;
 				st->has_sync_dep = false;
 				st->sync_dep_watermark = 0;
+				st->sync_dep_channel = 0;
 				st->sync_scheduled_us = 0;
-				st->state = CSTATE_END_COMMAND;
 				break;
 
 			case CSTATE_IDLE:
@@ -1929,6 +1998,9 @@ session_slot_acquired:
 				 */
 			case CSTATE_ABORTED:
 			case CSTATE_FINISHED:
+				if (st->state == CSTATE_ABORTED)
+					(void) __atomic_fetch_add(&aborted_clients_count, 1, __ATOMIC_RELEASE);
+				wakeWatermarkWaiters();
 
 				/*
 				 * Don't measure the disconnection delays here even if in
@@ -2090,10 +2162,11 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 	double		latency = 0.0,
 				lag = 0.0;
 	double		eff_throttle_delay = getThreadThrottleDelay(thread);
+	bool		has_schedule = (eff_throttle_delay > 0 || st->has_scheduled_time);
 	bool		has_pacing = (st->has_keying_time || st->has_think_time);
-	bool		detailed = progress || eff_throttle_delay > 0 || latency_limit ||
+	bool		detailed = progress || has_schedule || latency_limit ||
 		use_log || per_script_stats || num_groups > 0 || num_slas > 0 ||
-		json_report_file != NULL || has_pacing;
+		json_report_file != NULL || has_pacing || st->txn_recall_count > 0;
 
 	if (detailed && !tx_skipped && st->estatus == ESTATUS_NO_ERROR)
 	{
@@ -2108,12 +2181,18 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 		if (latency < 0.0)
 			latency = 0.0;
 		lag = st->txn_begin - st->txn_scheduled;
+		if (lag < 0.0)
+			lag = 0.0;
 	}
 
 	/* keep detailed thread stats */
-	accumStats(&thread->stats, tx_skipped, latency, lag, st->estatus, st->tries, eff_throttle_delay > 0);
+	accumStats(&thread->stats, tx_skipped, latency, lag, st->estatus, st->tries, has_schedule);
 	if (!tx_skipped && st->estatus == ESTATUS_NO_ERROR)
 	{
+		if (has_schedule)
+			addToLagStats(&thread->stats, lag, ontime_threshold_ms * 1000.0);
+		for (int r = 0; r < st->txn_recall_count; r++)
+			addToRecallStats(&thread->stats, st->txn_recalls[r]);
 		if (st->has_keying_time)
 			addToSimpleStats(&thread->stats.keying_time, (double) st->txn_keying_time);
 		if (st->has_think_time)
@@ -2134,9 +2213,15 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 	if (per_script_stats)
 	{
 		accumStats(&sql_script[st->use_file].stats, tx_skipped, latency, lag,
-				   st->estatus, st->tries, eff_throttle_delay > 0);
+				   st->estatus, st->tries, has_schedule);
 		if (!tx_skipped && st->estatus == ESTATUS_NO_ERROR)
 		{
+			if (has_schedule)
+				addToLagStats(&sql_script[st->use_file].stats, lag,
+							  ontime_threshold_ms * 1000.0);
+			for (int r = 0; r < st->txn_recall_count; r++)
+				addToRecallStats(&sql_script[st->use_file].stats,
+								 st->txn_recalls[r]);
 			if (st->has_keying_time)
 				addToSimpleStats(&sql_script[st->use_file].stats.keying_time,
 								 (double) st->txn_keying_time);
@@ -2415,7 +2500,8 @@ printResults(StatsData *total,
 
 	if (throttle_delay || progress || latency_limit || num_groups > 0 ||
 		num_slas > 0 || json_report_file != NULL ||
-		total->keying_time.count > 0 || total->think_time.count > 0)
+		total->keying_time.count > 0 || total->think_time.count > 0 ||
+		total->lag_hist_count > 0 || total->recall.count > 0)
 	{
 		printSimpleStats("latency", &total->latency);
 		printLatencyPercentiles("latency percentiles", total);
@@ -2432,6 +2518,8 @@ printResults(StatsData *total,
 		printSimpleStats("keying time", &total->keying_time);
 	if (total->think_time.count > 0)
 		printSimpleStats("think time", &total->think_time);
+	if (total->recall.count > 0)
+		printRecallStats("recall", total);
 
 	if (throttle_delay)
 	{
@@ -2443,6 +2531,19 @@ printResults(StatsData *total,
 		 */
 		printf("rate limit schedule lag: avg %.3f (max %.3f) ms\n",
 			   0.001 * total->lag.sum / total->cnt, 0.001 * total->lag.max);
+	}
+	else if (total->lag.count > 0)
+	{
+		printf("schedule lag: avg %.3f (max %.3f) ms\n",
+			   0.001 * total->lag.sum / total->lag.count, 0.001 * total->lag.max);
+	}
+	if (total->lag_hist_count > 0)
+	{
+		printLagPercentiles("schedule lag percentiles", total);
+		if (total->scheduled_count > 0)
+			printf("schedule on-time (<= %.1f ms): " INT64_FORMAT "/" INT64_FORMAT " (%.3f%%)\n",
+				   ontime_threshold_ms, total->ontime_count, total->scheduled_count,
+				   100.0 * total->ontime_count / total->scheduled_count);
 	}
 
 	/*
@@ -2496,6 +2597,10 @@ printResults(StatsData *total,
 					printSimpleStats(" - keying time", &gstats->keying_time);
 				if (gstats->think_time.count > 0)
 					printSimpleStats(" - think time", &gstats->think_time);
+				if (gstats->recall.count > 0)
+					printRecallStats(" - recall", gstats);
+				if (gstats->lag_hist_count > 0)
+					printLagPercentiles(" - schedule lag percentiles", gstats);
 			}
 		}
 	}
@@ -2578,6 +2683,10 @@ printResults(StatsData *total,
 					printSimpleStats(" - keying time", &sstats->keying_time);
 				if (sstats->think_time.count > 0)
 					printSimpleStats(" - think time", &sstats->think_time);
+				if (sstats->recall.count > 0)
+					printRecallStats(" - recall", sstats);
+				if (sstats->lag_hist_count > 0)
+					printLagPercentiles(" - schedule lag percentiles", sstats);
 			}
 
 			/*
@@ -2688,12 +2797,19 @@ printResults(StatsData *total,
 				SlaRule    *rule = &sla_rules[k];
 				StatsData	matched;
 				bool		found = false;
+				const char *target_name = rule->target;
+				const char *op_str = (rule->op == SLA_OP_GE) ? ">=" : "<=";
+
+				if (pg_strncasecmp(target_name, "group:", 6) == 0)
+					target_name += 6;
+				else if (pg_strncasecmp(target_name, "script:", 7) == 0)
+					target_name += 7;
 
 				initStats(&matched, 0);
 
-				if (pg_strcasecmp(rule->target, "total") == 0 ||
-					pg_strcasecmp(rule->target, "all") == 0 ||
-					strcmp(rule->target, "*") == 0)
+				if (pg_strcasecmp(target_name, "total") == 0 ||
+					pg_strcasecmp(target_name, "all") == 0 ||
+					strcmp(target_name, "*") == 0)
 				{
 					mergeStats(&matched, total);
 					found = true;
@@ -2702,7 +2818,7 @@ printResults(StatsData *total,
 				{
 					for (int g = 0; g < num_groups; g++)
 					{
-						if (strcmp(client_groups[g].name, rule->target) == 0)
+						if (strcmp(client_groups[g].name, target_name) == 0)
 						{
 							mergeStats(&matched, &client_groups[g].stats);
 							found = true;
@@ -2712,8 +2828,8 @@ printResults(StatsData *total,
 					{
 						for (int i = 0; i < num_scripts; i++)
 						{
-							if (strcmp(sql_script[i].desc, rule->target) == 0 ||
-								strstr(sql_script[i].desc, rule->target) != NULL)
+							if (strcmp(sql_script[i].desc, target_name) == 0 ||
+								strstr(sql_script[i].desc, target_name) != NULL)
 							{
 								mergeStats(&matched,
 										   per_script_stats ? &sql_script[i].stats : total);
@@ -2723,20 +2839,150 @@ printResults(StatsData *total,
 					}
 				}
 
-				rule->evaluated = (found && matched.hist_count > 0);
-				rule->actual_usec = rule->evaluated ?
-					getLatencyPercentile(&matched, rule->percentile) : 0.0;
-				rule->passed = (rule->evaluated &&
-								rule->actual_usec <= rule->threshold_usec);
+				switch (rule->metric)
+				{
+					case SLA_METRIC_LATENCY_PCT:
+						rule->evaluated = (found && matched.hist_count > 0);
+						rule->actual_usec = rule->evaluated ?
+							getLatencyPercentile(&matched, rule->percentile) : 0.0;
+						rule->actual_val = 0.001 * rule->actual_usec;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_LE) ?
+							 (rule->actual_usec <= rule->threshold_usec) :
+							 (rule->actual_usec >= rule->threshold_usec));
+						printf(" - SLA %s:p%g %s %.3f ms: actual = %.3f ms [%s]\n",
+							   rule->target,
+							   rule->percentile,
+							   op_str,
+							   0.001 * rule->threshold_usec,
+							   0.001 * rule->actual_usec,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_LATENCY_AVG:
+						rule->evaluated = (found && matched.latency.count > 0);
+						rule->actual_usec = rule->evaluated ?
+							(matched.latency.sum / matched.latency.count) : 0.0;
+						rule->actual_val = 0.001 * rule->actual_usec;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_LE) ?
+							 (rule->actual_usec <= rule->threshold_usec) :
+							 (rule->actual_usec >= rule->threshold_usec));
+						printf(" - SLA %s:avg %s %.3f ms: actual = %.3f ms [%s]\n",
+							   rule->target,
+							   op_str,
+							   0.001 * rule->threshold_usec,
+							   0.001 * rule->actual_usec,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_LAG_PCT:
+						rule->evaluated = (found && matched.lag_hist_count > 0);
+						rule->actual_usec = rule->evaluated ?
+							getLagPercentile(&matched, rule->percentile) : 0.0;
+						rule->actual_val = 0.001 * rule->actual_usec;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_LE) ?
+							 (rule->actual_usec <= rule->threshold_usec) :
+							 (rule->actual_usec >= rule->threshold_usec));
+						printf(" - SLA %s:schedule_lag:p%g %s %.3f ms: actual = %.3f ms [%s]\n",
+							   rule->target,
+							   rule->percentile,
+							   op_str,
+							   0.001 * rule->threshold_usec,
+							   0.001 * rule->actual_usec,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_ONTIME_PCT:
+						rule->evaluated = (found && matched.scheduled_count > 0);
+						rule->actual_val = rule->evaluated ?
+							(100.0 * matched.ontime_count / matched.scheduled_count) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:ontime_pct %s %.2f%%: actual = %.2f%% [%s]\n",
+							   rule->target,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_RECALL_AVG:
+						rule->evaluated = (found && matched.recall.count > 0);
+						rule->actual_val = rule->evaluated ?
+							(matched.recall.sum / matched.recall.count) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:recall %s %.4f: actual = %.4f [%s]\n",
+							   rule->target,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_RECALL_PCT:
+						rule->evaluated = (found && matched.recall.count > 0);
+						rule->actual_val = rule->evaluated ?
+							getRecallPercentile(&matched, rule->percentile) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:recall_p%g %s %.4f: actual = %.4f [%s]\n",
+							   rule->target,
+							   rule->percentile,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_TPS:
+						rule->evaluated = (found && bench_duration > 0.0);
+						rule->actual_val = rule->evaluated ?
+							(matched.cnt / bench_duration) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:tps %s %.2f: actual = %.2f [%s]\n",
+							   rule->target,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_ERROR_RATE:
+						{
+							int64		m_fail = getFailures(&matched);
+							int64		m_tot = matched.cnt + matched.cnt_skipped + m_fail;
+
+							rule->evaluated = (found && m_tot > 0);
+							rule->actual_val = rule->evaluated ?
+								(100.0 * m_fail / m_tot) : 0.0;
+							rule->passed = rule->evaluated &&
+								((rule->op == SLA_OP_LE) ?
+								 (rule->actual_val <= rule->threshold_val) :
+								 (rule->actual_val >= rule->threshold_val));
+							printf(" - SLA %s:error_rate %s %.3f%%: actual = %.3f%% [%s]\n",
+								   rule->target,
+								   op_str,
+								   rule->threshold_val,
+								   rule->actual_val,
+								   rule->passed ? "PASS" : "FAIL");
+							break;
+						}
+				}
+
 				if (!rule->passed)
 					sla_failed = true;
-
-				printf(" - SLA %s:p%g <= %.3f ms: actual = %.3f ms [%s]\n",
-					   rule->target,
-					   rule->percentile,
-					   0.001 * rule->threshold_usec,
-					   0.001 * rule->actual_usec,
-					   rule->passed ? "PASS" : "FAIL");
 			}
 		}
 
@@ -2776,6 +3022,27 @@ printResults(StatsData *total,
 			fprintf(jfp, "      \"p95\": %.3f,\n", 0.001 * getLatencyPercentile(total, 95.0));
 			fprintf(jfp, "      \"p99\": %.3f,\n", 0.001 * getLatencyPercentile(total, 99.0));
 			fprintf(jfp, "      \"p99_9\": %.3f\n", 0.001 * getLatencyPercentile(total, 99.9));
+			fprintf(jfp, "    },\n");
+			fprintf(jfp, "    \"recall\": {\n");
+			fprintf(jfp, "      \"samples\": " INT64_FORMAT ",\n", total->recall.count);
+			fprintf(jfp, "      \"avg\": %.4f,\n",
+					total->recall.count > 0 ? total->recall.sum / total->recall.count : 0.0);
+			fprintf(jfp, "      \"min\": %.4f,\n",
+					total->recall.count > 0 ? total->recall.min : 0.0);
+			fprintf(jfp, "      \"max\": %.4f,\n",
+					total->recall.count > 0 ? total->recall.max : 0.0);
+			fprintf(jfp, "      \"p5\": %.4f,\n", getRecallPercentile(total, 5.0));
+			fprintf(jfp, "      \"p50\": %.4f\n", getRecallPercentile(total, 50.0));
+			fprintf(jfp, "    },\n");
+			fprintf(jfp, "    \"schedule_lag_ms\": {\n");
+			fprintf(jfp, "      \"avg\": %.3f,\n",
+					total->lag.count > 0 ? 0.001 * total->lag.sum / total->lag.count : 0.0);
+			fprintf(jfp, "      \"p50\": %.3f,\n", 0.001 * getLagPercentile(total, 50.0));
+			fprintf(jfp, "      \"p90\": %.3f,\n", 0.001 * getLagPercentile(total, 90.0));
+			fprintf(jfp, "      \"p95\": %.3f,\n", 0.001 * getLagPercentile(total, 95.0));
+			fprintf(jfp, "      \"p99\": %.3f,\n", 0.001 * getLagPercentile(total, 99.0));
+			fprintf(jfp, "      \"ontime_pct\": %.3f\n",
+					total->scheduled_count > 0 ? 100.0 * total->ontime_count / total->scheduled_count : 100.0);
 			fprintf(jfp, "    }\n");
 			fprintf(jfp, "  },\n");
 
@@ -2809,6 +3076,13 @@ printResults(StatsData *total,
 				fprintf(jfp, "        \"p95\": %.3f,\n", 0.001 * getLatencyPercentile(gs, 95.0));
 				fprintf(jfp, "        \"p99\": %.3f,\n", 0.001 * getLatencyPercentile(gs, 99.0));
 				fprintf(jfp, "        \"p99_9\": %.3f\n", 0.001 * getLatencyPercentile(gs, 99.9));
+				fprintf(jfp, "      },\n");
+				fprintf(jfp, "      \"recall\": {\n");
+				fprintf(jfp, "        \"samples\": " INT64_FORMAT ",\n", gs->recall.count);
+				fprintf(jfp, "        \"avg\": %.4f,\n",
+						gs->recall.count > 0 ? gs->recall.sum / gs->recall.count : 0.0);
+				fprintf(jfp, "        \"p5\": %.4f,\n", getRecallPercentile(gs, 5.0));
+				fprintf(jfp, "        \"p50\": %.4f\n", getRecallPercentile(gs, 50.0));
 				fprintf(jfp, "      }\n");
 				fprintf(jfp, "    }%s\n", (g + 1 < num_groups) ? "," : "");
 			}
@@ -2837,6 +3111,13 @@ printResults(StatsData *total,
 				fprintf(jfp, "        \"p95\": %.3f,\n", 0.001 * getLatencyPercentile(ss, 95.0));
 				fprintf(jfp, "        \"p99\": %.3f,\n", 0.001 * getLatencyPercentile(ss, 99.0));
 				fprintf(jfp, "        \"p99_9\": %.3f\n", 0.001 * getLatencyPercentile(ss, 99.9));
+				fprintf(jfp, "      },\n");
+				fprintf(jfp, "      \"recall\": {\n");
+				fprintf(jfp, "        \"samples\": " INT64_FORMAT ",\n", ss->recall.count);
+				fprintf(jfp, "        \"avg\": %.4f,\n",
+						ss->recall.count > 0 ? ss->recall.sum / ss->recall.count : 0.0);
+				fprintf(jfp, "        \"p5\": %.4f,\n", getRecallPercentile(ss, 5.0));
+				fprintf(jfp, "        \"p50\": %.4f\n", getRecallPercentile(ss, 50.0));
 				fprintf(jfp, "      }\n");
 				fprintf(jfp, "    }%s\n", (i + 1 < num_scripts) ? "," : "");
 			}
@@ -2854,6 +3135,12 @@ printResults(StatsData *total,
 				fprintf(jfp, "      \"percentile\": %g,\n", rule->percentile);
 				fprintf(jfp, "      \"threshold_ms\": %.3f,\n", 0.001 * rule->threshold_usec);
 				fprintf(jfp, "      \"actual_ms\": %.3f,\n", 0.001 * rule->actual_usec);
+				fprintf(jfp, "      \"threshold\": %.4f,\n",
+						(rule->metric == SLA_METRIC_LATENCY_PCT ||
+						 rule->metric == SLA_METRIC_LATENCY_AVG ||
+						 rule->metric == SLA_METRIC_LAG_PCT) ?
+						0.001 * rule->threshold_usec : rule->threshold_val);
+				fprintf(jfp, "      \"actual\": %.4f,\n", rule->actual_val);
 				fprintf(jfp, "      \"passed\": %s\n", rule->passed ? "true" : "false");
 				fprintf(jfp, "    }%s\n", (k + 1 < num_slas) ? "," : "");
 			}
@@ -2993,8 +3280,16 @@ threadRun(void *arg)
 			else if (st->state == CSTATE_WAIT_SYNC)
 			{
 				bool		dep_unsatisfied =
-					(st->has_sync_dep && getWatermark() < st->sync_dep_watermark);
+					(st->has_sync_dep &&
+					 getWatermarkChan(st->sync_dep_channel) < st->sync_dep_watermark);
 				pg_time_usec_t sched_wait = 0;
+
+				if (__atomic_load_n(&aborted_clients_count, __ATOMIC_ACQUIRE) > 0 ||
+					(dep_unsatisfied && isCausalWatermarkDeadlocked(thread, st)))
+				{
+					min_usec = 0;
+					break;
+				}
 
 				if (st->sync_scheduled_us > 0)
 				{

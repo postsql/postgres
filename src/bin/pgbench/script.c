@@ -370,7 +370,59 @@ evalLazyFunc(CState *st,
 					return false;
 				}
 
-				if (len > 0)
+				if (args->next != NULL)
+				{
+					/* 3-argument form: array_generate(len, min, max) */
+					PgBenchValue vmin,
+								vmax;
+					int64		imin,
+								imax,
+								delta;
+
+					if (!evaluateExpr(st, args->expr, &vmin))
+						return false;
+					if (!evaluateExpr(st, args->next->expr, &vmax))
+					{
+						freeValue(&vmin);
+						return false;
+					}
+					if (vmin.type == PGBT_NULL || vmax.type == PGBT_NULL)
+					{
+						freeValue(&vmin);
+						freeValue(&vmax);
+						setNullValue(retval);
+						return true;
+					}
+					if (!coerceToInt(&vmin, &imin) || !coerceToInt(&vmax, &imax))
+					{
+						freeValue(&vmin);
+						freeValue(&vmax);
+						return false;
+					}
+					freeValue(&vmin);
+					freeValue(&vmax);
+
+					if (unlikely(imin > imax))
+					{
+						pg_log_error("empty range given to array_generate");
+						return false;
+					}
+					else if (unlikely(pg_sub_s64_overflow(imax, imin, &delta) ||
+									  pg_add_s64_overflow(delta, 1, &delta)))
+					{
+						pg_log_error("random range is too large in array_generate");
+						return false;
+					}
+
+					if (len > 0)
+					{
+						elems = pg_malloc0_array(PgBenchValue, (int) len);
+						for (int64 i = 0; i < len; i++)
+							setIntValue(&elems[i],
+										pgbench_random(&st->cs_func_rs, imin, imax));
+					}
+				}
+				else if (len > 0)
 				{
 					elems = pg_malloc0_array(PgBenchValue, (int) len);
 					for (int64 i = 0; i < len; i++)
@@ -1312,6 +1364,37 @@ evalStandardFunc(CState *st,
 				goto cleanup;
 			}
 
+		case PGBENCH_RANDOM_BYTEA:
+			{
+				int64		min_len,
+							max_len,
+							blen;
+				uint8	   *buf;
+
+				Assert(nargs == 2);
+
+				if (!coerceToInt(&vargs[0], &min_len) ||
+					!coerceToInt(&vargs[1], &max_len))
+					goto cleanup;
+
+				if (min_len < 0 || min_len > max_len || max_len > 1048576)
+				{
+					pg_log_error("invalid bytea length range [" INT64_FORMAT ", " INT64_FORMAT "]",
+								 min_len, max_len);
+					goto cleanup;
+				}
+
+				buf = pg_malloc((size_t) Max(max_len, 1));
+				blen = pgbench_random_bytea(&st->cs_func_rs, min_len, max_len, buf);
+
+				retval->type = PGBT_BYTEA;
+				retval->u.byval.len = (int) blen;
+				retval->u.byval.is_borrowed = false;
+				retval->u.byval.data = buf;
+				ok = true;
+				goto cleanup;
+			}
+
 		case PGBENCH_FORMAT_STRING:
 			{
 				char	   *fmt = NULL;
@@ -1668,6 +1751,48 @@ evalStandardFunc(CState *st,
 				{
 					pg_log_error("random_vector dimension " INT64_FORMAT " out of range [1, %d]",
 								 dim, PGBENCH_MAX_VECTOR_DIM);
+					goto cleanup;
+				}
+
+				if (nargs >= 2 && vargs[1].type == PGBT_TEXT)
+				{
+					const char *dist = vargs[1].u.sval != NULL ? vargs[1].u.sval : "";
+					bool		is_gaussian = false;
+
+					if (pg_strcasecmp(dist, "gaussian") == 0 ||
+						pg_strcasecmp(dist, "normal") == 0 ||
+						pg_strcasecmp(dist, "sphere") == 0)
+					{
+						is_gaussian = true;
+						normalize = true;
+					}
+					else if (pg_strcasecmp(dist, "uniform") == 0)
+					{
+						is_gaussian = false;
+						normalize = false;
+					}
+					else
+					{
+						pg_log_error("invalid distribution \"%s\" in random_vector (expected \"uniform\", \"gaussian\", or \"sphere\")",
+									 dist);
+						goto cleanup;
+					}
+
+					if (nargs >= 3 && !coerceToBool(&vargs[2], &normalize))
+						goto cleanup;
+
+					elems = pg_malloc_array(float, (int) dim);
+					if (is_gaussian)
+						pgbench_random_vector_gaussian(&st->cs_func_rs, (int) dim,
+													   1.0, normalize, elems);
+					else
+						pgbench_random_vector(&st->cs_func_rs, (int) dim,
+											  -1.0, 1.0, normalize, elems);
+					retval->type = PGBT_VECTOR;
+					retval->u.vval.dim = (int) dim;
+					retval->u.vval.is_borrowed = false;
+					retval->u.vval.elems = elems;
+					ok = true;
 					goto cleanup;
 				}
 
@@ -2092,20 +2217,28 @@ evalStandardFunc(CState *st,
 
 		case PGBENCH_GET_WATERMARK:
 			{
-				Assert(nargs == 0);
-				setIntValue(retval, getWatermark());
+				int64		chan = 0;
+
+				Assert(nargs == 0 || nargs == 1);
+				if (nargs == 1 && !coerceToInt(&vargs[0], &chan))
+					goto cleanup;
+				setIntValue(retval, getWatermarkChan((int) chan));
 				ok = true;
 				goto cleanup;
 			}
 
 		case PGBENCH_SET_WATERMARK:
+		case PGBENCH_ADVANCE_WATERMARK:
 			{
 				int64		wm = 0;
+				int64		chan = 0;
 
-				Assert(nargs == 1);
+				Assert(nargs == 1 || nargs == 2);
 				if (!coerceToInt(&vargs[0], &wm))
 					goto cleanup;
-				setIntValue(retval, advanceWatermark(wm));
+				if (nargs == 2 && !coerceToInt(&vargs[1], &chan))
+					goto cleanup;
+				setIntValue(retval, advanceWatermarkChan((int) chan, wm));
 				ok = true;
 				goto cleanup;
 			}
@@ -2173,14 +2306,28 @@ evalStandardFunc(CState *st,
 				if (!coerceToText(&vargs[0], &res_name))
 					goto cleanup;
 				cnt = reservoirCount(res_name);
-				if (cnt < 0)
-				{
-					pg_log_error("unknown reservoir \"%s\" in reservoir_count", res_name);
-					pg_free(res_name);
-					goto cleanup;
-				}
 				pg_free(res_name);
 				setIntValue(retval, cnt);
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RECALL_AT_K:
+		case PGBENCH_NDCG_AT_K:
+			{
+				int64		k = -1;
+				double		score = 0.0;
+
+				Assert(nargs == 2 || nargs == 3);
+				if (nargs == 3 && !coerceToInt(&vargs[2], &k))
+					goto cleanup;
+
+				if (!computeRecallOrNdcgAtK(&vargs[0], &vargs[1], k,
+											func == PGBENCH_NDCG_AT_K,
+											&score))
+					goto cleanup;
+
+				setDoubleValue(retval, score);
 				ok = true;
 				goto cleanup;
 			}
@@ -2195,6 +2342,123 @@ evalStandardFunc(CState *st,
 cleanup:
 	freeValues(vargs, nargs);
 	return ok;
+}
+
+/*
+ * Compute Recall@K or nDCG@K between retrieved_val and gt_val arrays.
+ * If k < 0, defaults k to the length of gt_val.
+ */
+bool
+computeRecallOrNdcgAtK(const PgBenchValue *ret_val, const PgBenchValue *gt_val,
+					   int64 k, bool is_ndcg, double *out_score)
+{
+	int			ret_len = 0;
+	int			gt_len = 0;
+	int			k_ret;
+	int			k_gt;
+	double		dcg = 0.0;
+	double		idcg = 0.0;
+	int			hits = 0;
+
+	if (gt_val->type == PGBT_NULL)
+	{
+		*out_score = 1.0;
+		return true;
+	}
+	if (gt_val->type != PGBT_ARRAY)
+	{
+		pg_log_error("%s ground_truth argument must be an array",
+					 is_ndcg ? "ndcg_at_k" : "recall_at_k");
+		return false;
+	}
+	gt_len = gt_val->u.aval.nelems;
+	if (gt_len <= 0)
+	{
+		*out_score = 1.0;
+		return true;
+	}
+
+	if (ret_val->type == PGBT_NULL)
+	{
+		*out_score = 0.0;
+		return true;
+	}
+	if (ret_val->type != PGBT_ARRAY)
+	{
+		pg_log_error("%s retrieved argument must be an array",
+					 is_ndcg ? "ndcg_at_k" : "recall_at_k");
+		return false;
+	}
+	ret_len = ret_val->u.aval.nelems;
+
+	if (k < 0)
+		k = gt_len;
+	if (k == 0 || ret_len <= 0)
+	{
+		*out_score = 0.0;
+		return true;
+	}
+
+	k_ret = (k < ret_len) ? (int) k : ret_len;
+	k_gt = (k < gt_len) ? (int) k : gt_len;
+
+	for (int i = 0; i < k_ret; i++)
+	{
+		int64		r_id = 0;
+		bool		duplicate = false;
+		bool		matched = false;
+
+		if (!coerceToInt(&ret_val->u.aval.elems[i], &r_id))
+			continue;
+
+		for (int p = 0; p < i; p++)
+		{
+			int64		prev_id = 0;
+
+			if (coerceToInt(&ret_val->u.aval.elems[p], &prev_id) && prev_id == r_id)
+			{
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+
+		for (int j = 0; j < k_gt; j++)
+		{
+			int64		g_id = 0;
+
+			if (coerceToInt(&gt_val->u.aval.elems[j], &g_id) && g_id == r_id)
+			{
+				matched = true;
+				break;
+			}
+		}
+
+		if (matched)
+		{
+			hits++;
+			if (is_ndcg)
+				dcg += 1.0 / (log((double) (i + 2)) / log(2.0));
+		}
+	}
+
+	if (is_ndcg)
+	{
+		for (int j = 0; j < k_gt; j++)
+			idcg += 1.0 / (log((double) (j + 2)) / log(2.0));
+		*out_score = (idcg > 0.0) ? (dcg / idcg) : 1.0;
+	}
+	else
+	{
+		*out_score = (double) hits / (double) k_gt;
+	}
+
+	if (*out_score > 1.0)
+		*out_score = 1.0;
+	if (*out_score < 0.0)
+		*out_score = 0.0;
+	return true;
 }
 
 /* evaluate some function */
@@ -2326,6 +2590,8 @@ getMetaCommand(const char *cmd)
 		mc = META_SESSION_DISCONNECT;
 	else if (pg_strcasecmp(cmd, "call") == 0)
 		mc = META_CALL;
+	else if (pg_strcasecmp(cmd, "record_recall") == 0)
+		mc = META_RECORD_RECALL;
 	else if (pg_strcasecmp(cmd, "startpipeline") == 0)
 		mc = META_STARTPIPELINE;
 	else if (pg_strcasecmp(cmd, "syncpipeline") == 0)
@@ -3085,10 +3351,14 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 	}
 	else if (my_command->meta == META_DATASET_BIND)
 	{
-		if (my_command->argc < 4)
+		if (my_command->argc < 4 ||
+			(pg_strcasecmp(my_command->argv[2], "at") == 0 && my_command->argc < 5))
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
 						 "\\dataset_bind requires <dataset> <cursor_mode> <var1> [<var2> ...]",
 						 NULL, -1);
+		if (pg_strcasecmp(my_command->argv[2], "at") == 0)
+			my_command->expr = parse_sub_expr(my_command->argv[3], source, lineno,
+											  my_command->argv[0]);
 	}
 	else if (my_command->meta == META_COPY_DATASET)
 	{
@@ -3100,6 +3370,8 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 	else if (my_command->meta == META_WAIT_UNTIL)
 	{
 		int			dep_arg_idx = -1;
+		int			wm_kw_idx = -1;
+		int			chan_kw_idx = -1;
 
 		if (my_command->argc < 2)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
@@ -3107,14 +3379,60 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 
 		for (int k = 2; k < my_command->argc; k++)
 		{
-			if (pg_strncasecmp(my_command->argv[k], "dep=", 4) == 0)
-			{
+			if (dep_arg_idx == -1 &&
+				pg_strncasecmp(my_command->argv[k], "dep=", 4) == 0)
 				dep_arg_idx = k;
-				break;
-			}
+			else if (wm_kw_idx == -1 &&
+					 pg_strcasecmp(my_command->argv[k], "watermark") == 0)
+				wm_kw_idx = k;
+			else if (chan_kw_idx == -1 &&
+					 pg_strcasecmp(my_command->argv[k], "channel") == 0)
+				chan_kw_idx = k;
 		}
 
-		if (dep_arg_idx != -1)
+		if (wm_kw_idx != -1)
+		{
+			int			off_start = offsets[1] - start_offset;
+			int			off_end = offsets[wm_kw_idx] - start_offset;
+			char	   *off_str = pnstrdup(my_command->first_line + off_start,
+										   off_end - off_start);
+			char	   *dep_str;
+
+			my_command->expr = parse_sub_expr(off_str, source, lineno,
+											  my_command->argv[0]);
+			pg_free(off_str);
+
+			if (wm_kw_idx + 1 >= my_command->argc || wm_kw_idx + 1 == chan_kw_idx)
+				syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+							 "missing dependency expression after WATERMARK", NULL, -1);
+
+			if (chan_kw_idx != -1 && chan_kw_idx > wm_kw_idx)
+			{
+				int			dep_start = offsets[wm_kw_idx + 1] - start_offset;
+				int			dep_end = offsets[chan_kw_idx] - start_offset;
+
+				dep_str = pnstrdup(my_command->first_line + dep_start,
+								   dep_end - dep_start);
+				my_command->end_expr = parse_sub_expr(dep_str, source, lineno,
+													  my_command->argv[0]);
+				pg_free(dep_str);
+
+				if (chan_kw_idx + 1 >= my_command->argc)
+					syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+								 "missing channel expression after CHANNEL", NULL, -1);
+
+				my_command->step_expr = parse_sub_expr(
+					my_command->first_line + (offsets[chan_kw_idx + 1] - start_offset),
+					source, lineno, my_command->argv[0]);
+			}
+			else
+			{
+				my_command->end_expr = parse_sub_expr(
+					my_command->first_line + (offsets[wm_kw_idx + 1] - start_offset),
+					source, lineno, my_command->argv[0]);
+			}
+		}
+		else if (dep_arg_idx != -1)
 		{
 			int			off_start = offsets[1] - start_offset;
 			int			off_end = offsets[dep_arg_idx] - start_offset;
@@ -3151,12 +3469,46 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 	}
 	else if (my_command->meta == META_ADVANCE_WATERMARK)
 	{
+		int			chan_kw_idx = -1;
+
 		if (my_command->argc < 2)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
 						 "missing argument", NULL, -1);
-		my_command->expr = parse_sub_expr(
-			my_command->first_line + (offsets[1] - start_offset),
-			source, lineno, my_command->argv[0]);
+
+		for (int k = 2; k < my_command->argc; k++)
+		{
+			if (pg_strcasecmp(my_command->argv[k], "channel") == 0)
+			{
+				chan_kw_idx = k;
+				break;
+			}
+		}
+
+		if (chan_kw_idx != -1)
+		{
+			int			wm_start = offsets[1] - start_offset;
+			int			wm_end = offsets[chan_kw_idx] - start_offset;
+			char	   *wm_str = pnstrdup(my_command->first_line + wm_start,
+										  wm_end - wm_start);
+
+			my_command->expr = parse_sub_expr(wm_str, source, lineno,
+											  my_command->argv[0]);
+			pg_free(wm_str);
+
+			if (chan_kw_idx + 1 >= my_command->argc)
+				syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+							 "missing channel expression after CHANNEL", NULL, -1);
+
+			my_command->end_expr = parse_sub_expr(
+				my_command->first_line + (offsets[chan_kw_idx + 1] - start_offset),
+				source, lineno, my_command->argv[0]);
+		}
+		else
+		{
+			my_command->expr = parse_sub_expr(
+				my_command->first_line + (offsets[1] - start_offset),
+				source, lineno, my_command->argv[0]);
+		}
 	}
 	else if (my_command->meta == META_RESERVOIR_PUSH)
 	{
@@ -3197,6 +3549,39 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
 						 "\\call requires <script_name> [var=val ...]",
 						 NULL, -1);
+	}
+	else if (my_command->meta == META_RECORD_RECALL)
+	{
+		const char *v1;
+		const char *v2;
+
+		if (my_command->argc < 2)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "\\record_recall requires <expr> or <retrieved_var> <truth_var> [<k_expr>]",
+						 NULL, -1);
+
+		v1 = (my_command->argc >= 3 && my_command->argv[1][0] == ':') ?
+			my_command->argv[1] + 1 : (my_command->argc >= 3 ? my_command->argv[1] : "");
+		v2 = (my_command->argc >= 3 && my_command->argv[2][0] == ':') ?
+			my_command->argv[2] + 1 : (my_command->argc >= 3 ? my_command->argv[2] : "");
+
+		if (my_command->argc >= 3 && *v1 != '\0' && *v2 != '\0' &&
+			valid_variable_name(v1) && valid_variable_name(v2))
+		{
+			my_command->col_target = pg_strdup("VARS");
+			if (my_command->argc >= 4)
+			{
+				my_command->expr = parse_sub_expr(
+					my_command->first_line + (offsets[3] - start_offset),
+					source, lineno, my_command->argv[0]);
+			}
+		}
+		else
+		{
+			my_command->expr = parse_sub_expr(
+				my_command->first_line + (offsets[1] - start_offset),
+				source, lineno, my_command->argv[0]);
+		}
 	}
 	else
 	{
@@ -3642,6 +4027,28 @@ void
 process_builtin(const BuiltinScript *bi, int weight)
 {
 	ParseScript(bi->script, bi->desc, weight);
+}
+
+/* Parse the built-in trace replay script and add it to the list. */
+void
+process_replay_builtin(int weight)
+{
+	static const char *replay_script =
+		"\\set _r_id dataset_next_id('replay', 'once')\n"
+		"\\if :_r_id notnull\n"
+		"\\dataset_bind replay :_r_id _r_off _r_dep _r_wm _r_sql\n"
+		"\\if :_r_dep > 0\n"
+		"\\wait_until :_r_off dep=:_r_dep\n"
+		"\\else\n"
+		"\\wait_until :_r_off\n"
+		"\\endif\n"
+		":_r_sql;\n"
+		"\\if :_r_wm > 0\n"
+		"\\advance_watermark :_r_wm\n"
+		"\\endif\n"
+		"\\endif\n";
+
+	ParseScript(replay_script, "<builtin: trace-replay>", weight);
 }
 
 /* show available builtin scripts */

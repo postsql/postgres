@@ -31,6 +31,7 @@
 #define PGBENCH_NARGS_2_TO_4		(-13)
 #define PGBENCH_NARGS_3_TO_4		(-14)
 #define PGBENCH_NARGS_3_TO_5		(-15)
+#define PGBENCH_NARGS_0_TO_1		(-16)
 
 static PgBenchExprList *make_elist(PgBenchExpr *expr, PgBenchExprList *list);
 static PgBenchExpr *make_null_constant(void);
@@ -419,6 +420,9 @@ static const struct
 		"random_nstring", 2, PGBENCH_RANDOM_NSTRING
 	},
 	{
+		"random_bytea", 2, PGBENCH_RANDOM_BYTEA
+	},
+	{
 		"format_string", PGBENCH_NARGS_VARIABLE, PGBENCH_FORMAT_STRING
 	},
 	{
@@ -434,7 +438,7 @@ static const struct
 		"array", PGBENCH_NARGS_VARIADIC_ANY, PGBENCH_ARRAY
 	},
 	{
-		"array_generate", 2, PGBENCH_ARRAY_GENERATE
+		"array_generate", PGBENCH_NARGS_2_TO_3, PGBENCH_ARRAY_GENERATE
 	},
 	{
 		"vector", PGBENCH_NARGS_VARIABLE, PGBENCH_VECTOR
@@ -485,10 +489,13 @@ static const struct
 		"dataset_next_id", PGBENCH_NARGS_1_TO_2, PGBENCH_DATASET_NEXT_ID
 	},
 	{
-		"get_watermark", 0, PGBENCH_GET_WATERMARK
+		"get_watermark", PGBENCH_NARGS_0_TO_1, PGBENCH_GET_WATERMARK
 	},
 	{
-		"set_watermark", 1, PGBENCH_SET_WATERMARK
+		"set_watermark", PGBENCH_NARGS_1_TO_2, PGBENCH_SET_WATERMARK
+	},
+	{
+		"advance_watermark", PGBENCH_NARGS_1_TO_2, PGBENCH_ADVANCE_WATERMARK
 	},
 	{
 		"reservoir_push", 2, PGBENCH_RESERVOIR_PUSH
@@ -498,6 +505,12 @@ static const struct
 	},
 	{
 		"reservoir_count", 1, PGBENCH_RESERVOIR_COUNT
+	},
+	{
+		"recall_at_k", PGBENCH_NARGS_2_TO_3, PGBENCH_RECALL_AT_K
+	},
+	{
+		"ndcg_at_k", PGBENCH_NARGS_2_TO_3, PGBENCH_NDCG_AT_K
 	},
 	/* keep as last array element */
 	{
@@ -631,6 +644,12 @@ make_func(yyscan_t yyscanner, int fnumber, PgBenchExprList *args)
 		case PGBENCH_NARGS_INT_TO_DATE:
 		case PGBENCH_NARGS_3_TO_4:
 			if (len < 3 || len > 4)
+				expr_yyerror_more(yyscanner, "unexpected number of arguments",
+								  PGBENCH_FUNCTIONS[fnumber].fname);
+			break;
+
+		case PGBENCH_NARGS_0_TO_1:
+			if (len < 0 || len > 1)
 				expr_yyerror_more(yyscanner, "unexpected number of arguments",
 								  PGBENCH_FUNCTIONS[fnumber].fname);
 			break;

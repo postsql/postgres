@@ -398,6 +398,33 @@ pgbench_random_nstring(pg_prng_state *state, int64 min_len, int64 max_len, char 
 	buf[len] = '\0';
 }
 
+/*
+ * Generate a random binary payload of length in [min_len, max_len].
+ * Caller must provide a buffer of at least max_len bytes (when max_len > 0).
+ * Returns the generated length in bytes.
+ */
+int64
+pgbench_random_bytea(pg_prng_state *state, int64 min_len, int64 max_len, uint8 *buf)
+{
+	int64		len = pgbench_random(state, min_len, max_len);
+	int64		i = 0;
+
+	while (i + 8 <= len)
+	{
+		uint64		r = pg_prng_uint64(state);
+
+		memcpy(buf + i, &r, 8);
+		i += 8;
+	}
+	if (i < len)
+	{
+		uint64		r = pg_prng_uint64(state);
+
+		memcpy(buf + i, &r, (size_t) (len - i));
+	}
+	return len;
+}
+
 /*-------------------------------------------------------------------------
  * Date / Timestamp Helpers (microseconds since 2000-01-01 00:00:00)
  *-------------------------------------------------------------------------
@@ -1037,6 +1064,15 @@ pgbench_planted_vector(pg_prng_state *state, int dim,
 	}
 }
 
+static int
+pgbench_sparse_idx_cmp(const void *a, const void *b)
+{
+	int			ia = *(const int *) a;
+	int			ib = *(const int *) b;
+
+	return (ia > ib) - (ia < ib);
+}
+
 /*
  * Generate a sparse vector string in pgvector sparsevec format:
  *   "{i1:v1,i2:v2,...}/dim"
@@ -1060,8 +1096,9 @@ pgbench_random_sparse_vector(pg_prng_state *state, int dim,
 	if (nnz > 0)
 	{
 		/*
-		 * Use Knuth's Algorithm S when dim <= 4 * nnz, or Floyd's sampling +
-		 * insertion sort into a stack/heap buffer when nnz is small.
+		 * Use Knuth's Algorithm S when dim <= 4 * nnz, Floyd's sampling +
+		 * stack insertion sort when nnz <= 256, or Floyd's sampling with an
+		 * open-addressing hash table + qsort in O(nnz log nnz) when nnz > 256.
 		 */
 		int			stack_indices[256];
 		int		   *indices = stack_indices;
@@ -1092,9 +1129,9 @@ pgbench_random_sparse_vector(pg_prng_state *state, int dim,
 				}
 			}
 		}
-		else
+		else if (nnz <= 256)
 		{
-			/* Floyd's algorithm for k-subset in [1..dim], maintained sorted */
+			/* Floyd's algorithm for small k-subset in [1..dim], maintained sorted */
 			int			count = 0;
 
 			for (int j = dim - nnz + 1; j <= dim; j++)
@@ -1103,7 +1140,6 @@ pgbench_random_sparse_vector(pg_prng_state *state, int dim,
 				int			ins_val = t;
 				int			k;
 
-				/* Check if t is already in sorted indices[0..count-1] */
 				for (k = 0; k < count; k++)
 				{
 					if (indices[k] == t)
@@ -1115,7 +1151,6 @@ pgbench_random_sparse_vector(pg_prng_state *state, int dim,
 						break;
 				}
 
-				/* Insert ins_val into sorted position */
 				k = count;
 				while (k > 0 && indices[k - 1] > ins_val)
 				{
@@ -1125,6 +1160,49 @@ pgbench_random_sparse_vector(pg_prng_state *state, int dim,
 				indices[k] = ins_val;
 				count++;
 			}
+		}
+		else
+		{
+			/* Floyd's algorithm with open-addressing hash set + qsort: O(nnz log nnz) */
+			size_t		ht_cap = 512;
+			size_t		mask;
+			int		   *ht;
+			int			out_idx = 0;
+
+			while (ht_cap < (size_t) nnz * 2)
+				ht_cap <<= 1;
+
+			ht = (int *) calloc(ht_cap, sizeof(int));
+			if (ht == NULL)
+			{
+				free(indices);
+				return false;
+			}
+			mask = ht_cap - 1;
+
+			for (int j = dim - nnz + 1; j <= dim; j++)
+			{
+				int			t = (int) pgbench_random(state, 1, j);
+				int			ins_val = t;
+				size_t		slot = ((uint64) t * UINT64CONST(0x9e3779b97f4a7c15)) & mask;
+
+				while (ht[slot] != 0 && ht[slot] != t)
+					slot = (slot + 1) & mask;
+
+				if (ht[slot] == t)
+				{
+					ins_val = j;
+					slot = ((uint64) j * UINT64CONST(0x9e3779b97f4a7c15)) & mask;
+					while (ht[slot] != 0)
+						slot = (slot + 1) & mask;
+				}
+
+				ht[slot] = ins_val;
+				indices[out_idx++] = ins_val;
+			}
+
+			free(ht);
+			qsort(indices, (size_t) nnz, sizeof(int), pgbench_sparse_idx_cmp);
 		}
 
 		for (int i = 0; i < nnz; i++)

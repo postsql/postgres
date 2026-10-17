@@ -55,12 +55,12 @@ static int	num_reservoirs = 0;
 
 typedef struct PgBenchCausalClock
 {
-	int64		safe_watermark_us __attribute__((aligned(64)));
+	int64		channel_watermarks[PGBENCH_MAX_WATERMARK_CHANNELS] __attribute__((aligned(64)));
 	int64		global_virtual_time_us __attribute__((aligned(64)));
 	char		pad[64];
 } PgBenchCausalClock;
 
-static PgBenchCausalClock causal_clock = {0, 0, {0}};
+static PgBenchCausalClock causal_clock = {{0}, 0, {0}};
 static int	thread_wakeup_fds[MAX_WAKEUP_THREADS];
 static bool wakeup_fds_initialized = false;
 
@@ -906,6 +906,7 @@ handle_cmd_dataset_bind(CState *st, Command *cmd, pg_time_usec_t *now)
 	DatasetCursorMode mode;
 	PgBenchValue idx_val;
 	int64		row_idx;
+	int			var_start = 3;
 	int			nvars = cmd->argc - 3;
 
 	ds = findDataset(ds_name);
@@ -916,10 +917,61 @@ handle_cmd_dataset_bind(CState *st, Command *cmd, pg_time_usec_t *now)
 		return CSTATE_ABORTED;
 	}
 
-	if (pg_strcasecmp(mode_str, "wrap") == 0 ||
-		pg_strcasecmp(mode_str, "next") == 0 ||
-		pg_strcasecmp(mode_str, "round_robin") == 0 ||
-		pg_strcasecmp(mode_str, "wrap_round_robin") == 0)
+	if (pg_strcasecmp(mode_str, "at") == 0)
+	{
+		var_start = 4;
+		nvars = cmd->argc - 4;
+		if (cmd->expr != NULL)
+		{
+			PgBenchValue ev;
+			int64		rval = 0;
+
+			if (!evaluateExpr(st, cmd->expr, &ev) || !coerceToInt(&ev, &rval))
+			{
+				freeValue(&ev);
+				pg_log_error("client %d: invalid row index expression in \\dataset_bind",
+							 st->id);
+				return CSTATE_ABORTED;
+			}
+			freeValue(&ev);
+			setIntValue(&idx_val, rval);
+		}
+		else
+		{
+			mode_str = cmd->argv[3];
+			if (mode_str[0] == ':')
+			{
+				Variable   *var = lookupVariable(&st->variables, (char *) (mode_str + 1));
+				int64		rval;
+
+				if (var == NULL || !coerceToInt(&var->value, &rval))
+				{
+					pg_log_error("client %d: invalid row index variable \"%s\" in \\dataset_bind",
+								 st->id, mode_str);
+					return CSTATE_ABORTED;
+				}
+				setIntValue(&idx_val, rval);
+			}
+			else if (is_an_int(mode_str))
+			{
+				int64		rval = 0;
+
+				if (!strtoint64(mode_str, true, &rval))
+					return CSTATE_ABORTED;
+				setIntValue(&idx_val, rval);
+			}
+			else
+			{
+				pg_log_error("client %d: invalid row index \"%s\" after AT in \\dataset_bind",
+							 st->id, mode_str);
+				return CSTATE_ABORTED;
+			}
+		}
+	}
+	else if (pg_strcasecmp(mode_str, "wrap") == 0 ||
+			 pg_strcasecmp(mode_str, "next") == 0 ||
+			 pg_strcasecmp(mode_str, "round_robin") == 0 ||
+			 pg_strcasecmp(mode_str, "wrap_round_robin") == 0)
 	{
 		mode = CURSOR_WRAP_ROUND_ROBIN;
 		if (!datasetNextId(ds, mode, &idx_val))
@@ -968,7 +1020,7 @@ handle_cmd_dataset_bind(CState *st, Command *cmd, pg_time_usec_t *now)
 		setNullValue(&null_v);
 		for (int i = 0; i < nvars; i++)
 		{
-			const char *vname = normalizeVarArg(cmd->argv[3 + i]);
+			const char *vname = normalizeVarArg(cmd->argv[var_start + i]);
 
 			if (!putVariableValue(&st->variables, "dataset_bind", (char *) vname, &null_v))
 				return CSTATE_ABORTED;
@@ -988,7 +1040,7 @@ handle_cmd_dataset_bind(CState *st, Command *cmd, pg_time_usec_t *now)
 
 		if (nvars == 1)
 		{
-			const char *vname = normalizeVarArg(cmd->argv[3]);
+			const char *vname = normalizeVarArg(cmd->argv[var_start]);
 			bool		ok = putVariableValue(&st->variables, "dataset_bind",
 											  (char *) vname, &row_val);
 
@@ -998,8 +1050,8 @@ handle_cmd_dataset_bind(CState *st, Command *cmd, pg_time_usec_t *now)
 		}
 		else
 		{
-			const char *id_var = normalizeVarArg(cmd->argv[3]);
-			const char *vec_var = normalizeVarArg(cmd->argv[4]);
+			const char *id_var = normalizeVarArg(cmd->argv[var_start]);
+			const char *vec_var = normalizeVarArg(cmd->argv[var_start + 1]);
 			bool		ok;
 
 			if (!putVariableInt(&st->variables, "dataset_bind", (char *) id_var, row_idx))
@@ -1018,14 +1070,19 @@ handle_cmd_dataset_bind(CState *st, Command *cmd, pg_time_usec_t *now)
 	{
 		for (int i = 0; i < nvars; i++)
 		{
-			const char *vname = normalizeVarArg(cmd->argv[3 + i]);
+			const char *vname = normalizeVarArg(cmd->argv[var_start + i]);
 			PgBenchValue col_val;
 			bool		ok;
 
 			if (!datasetGetRow(ds, row_idx, i, &col_val))
 				return CSTATE_ABORTED;
-			ok = putVariableValue(&st->variables, "dataset_bind",
-								  (char *) vname, &col_val);
+			if (strcmp(vname, "_r_sql") == 0 && col_val.type == PGBT_TEXT)
+				ok = putVariable(&st->variables, "dataset_bind",
+								 (char *) vname,
+								 col_val.u.sval != NULL ? col_val.u.sval : "");
+			else
+				ok = putVariableValue(&st->variables, "dataset_bind",
+									  (char *) vname, &col_val);
 			freeValue(&col_val);
 			if (!ok)
 				return CSTATE_ABORTED;
@@ -1439,27 +1496,47 @@ wakeWatermarkWaiters(void)
 }
 
 int64
-getWatermark(void)
+getWatermarkChan(int chan)
 {
-	return __atomic_load_n(&causal_clock.safe_watermark_us, __ATOMIC_ACQUIRE);
+	if (chan < 0 || chan >= PGBENCH_MAX_WATERMARK_CHANNELS)
+		chan = 0;
+	return __atomic_load_n(&causal_clock.channel_watermarks[chan], __ATOMIC_ACQUIRE);
 }
 
 int64
-setWatermark(int64 wm)
+getWatermark(void)
 {
-	__atomic_store_n(&causal_clock.safe_watermark_us, wm, __ATOMIC_RELEASE);
+	return getWatermarkChan(0);
+}
+
+int64
+setWatermarkChan(int chan, int64 wm)
+{
+	if (chan < 0 || chan >= PGBENCH_MAX_WATERMARK_CHANNELS)
+		chan = 0;
+	__atomic_store_n(&causal_clock.channel_watermarks[chan], wm, __ATOMIC_RELEASE);
 	wakeWatermarkWaiters();
 	return wm;
 }
 
 int64
-advanceWatermark(int64 wm)
+setWatermark(int64 wm)
 {
-	int64		cur = __atomic_load_n(&causal_clock.safe_watermark_us, __ATOMIC_RELAXED);
+	return setWatermarkChan(0, wm);
+}
 
+int64
+advanceWatermarkChan(int chan, int64 wm)
+{
+	int64		cur;
+
+	if (chan < 0 || chan >= PGBENCH_MAX_WATERMARK_CHANNELS)
+		chan = 0;
+
+	cur = __atomic_load_n(&causal_clock.channel_watermarks[chan], __ATOMIC_RELAXED);
 	while (wm > cur)
 	{
-		if (__atomic_compare_exchange_n(&causal_clock.safe_watermark_us,
+		if (__atomic_compare_exchange_n(&causal_clock.channel_watermarks[chan],
 										&cur, wm, true,
 										__ATOMIC_RELEASE, __ATOMIC_RELAXED))
 		{
@@ -1468,6 +1545,12 @@ advanceWatermark(int64 wm)
 		}
 	}
 	return cur;
+}
+
+int64
+advanceWatermark(int64 wm)
+{
+	return advanceWatermarkChan(0, wm);
 }
 
 /*
@@ -1493,7 +1576,7 @@ handle_cmd_wait_until(CState *st, Command *cmd, pg_time_usec_t *now)
 	}
 	freeValue(&offset_val);
 
-	if (offset_us > 0)
+	if (offset_us >= 0)
 	{
 		pg_time_usec_t base_us = (st->bench_start_us > 0) ? st->bench_start_us : st->txn_begin;
 		pg_time_usec_t scaled_us = (pg_time_usec_t) ((double) offset_us / speed + 0.5);
@@ -1527,11 +1610,29 @@ handle_cmd_wait_until(CState *st, Command *cmd, pg_time_usec_t *now)
 
 		st->has_sync_dep = true;
 		st->sync_dep_watermark = dep_wm;
+		st->sync_dep_channel = 0;
+
+		if (cmd->step_expr != NULL)
+		{
+			PgBenchValue chan_val;
+			int64		chan = 0;
+
+			if (!evaluateExpr(st, cmd->step_expr, &chan_val) ||
+				!coerceToInt(&chan_val, &chan))
+			{
+				freeValue(&chan_val);
+				commandFailed(st, cmd->argv[0], "watermark channel expression is not an integer");
+				return CSTATE_ABORTED;
+			}
+			freeValue(&chan_val);
+			st->sync_dep_channel = (int) chan;
+		}
 	}
 	else
 	{
 		st->has_sync_dep = false;
 		st->sync_dep_watermark = 0;
+		st->sync_dep_channel = 0;
 	}
 
 	return CSTATE_WAIT_SYNC;
@@ -1545,6 +1646,7 @@ handle_cmd_advance_watermark(CState *st, Command *cmd, pg_time_usec_t *now)
 {
 	PgBenchValue wm_val;
 	int64		wm = 0;
+	int64		chan = 0;
 
 	if (!evaluateExpr(st, cmd->expr, &wm_val))
 	{
@@ -1559,7 +1661,21 @@ handle_cmd_advance_watermark(CState *st, Command *cmd, pg_time_usec_t *now)
 	}
 	freeValue(&wm_val);
 
-	(void) advanceWatermark(wm);
+	if (cmd->end_expr != NULL)
+	{
+		PgBenchValue chan_val;
+
+		if (!evaluateExpr(st, cmd->end_expr, &chan_val) ||
+			!coerceToInt(&chan_val, &chan))
+		{
+			freeValue(&chan_val);
+			commandFailed(st, cmd->argv[0], "watermark channel expression is not an integer");
+			return CSTATE_ABORTED;
+		}
+		freeValue(&chan_val);
+	}
+
+	(void) advanceWatermarkChan((int) chan, wm);
 	return CSTATE_END_COMMAND;
 }
 
@@ -1657,7 +1773,6 @@ reservoirPush(const char *name, int64 val)
 {
 	PgBenchReservoir *res = findReservoir(name);
 	uint64		idx;
-	uint64		cur_valid;
 
 	if (res == NULL)
 	{
@@ -1668,14 +1783,13 @@ reservoirPush(const char *name, int64 val)
 	idx = __atomic_fetch_add(&res->write_idx, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&res->slots[idx % res->capacity], val, __ATOMIC_RELEASE);
 
-	cur_valid = __atomic_load_n(&res->valid_count, __ATOMIC_RELAXED);
-	while (cur_valid < res->capacity && (idx + 1) > cur_valid)
+	if (idx < res->capacity)
 	{
-		uint64		next_valid = ((idx + 1) < res->capacity) ? (idx + 1) : res->capacity;
-
-		if (__atomic_compare_exchange_n(&res->valid_count, &cur_valid, next_valid,
-										true, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
-			break;
+		while (__atomic_load_n(&res->valid_count, __ATOMIC_ACQUIRE) < idx)
+		{
+			/* Wait for preceding initial slot writes so slots[0..idx] are valid */
+		}
+		__atomic_store_n(&res->valid_count, idx + 1, __ATOMIC_RELEASE);
 	}
 
 	return true;
@@ -1705,7 +1819,7 @@ reservoirSample(const char *name, pg_prng_state *rstate,
 
 	*is_empty = false;
 	pos = pgbench_random(rstate, 0, (int64) cnt - 1);
-	*out_val = __atomic_load_n(&res->slots[pos], __ATOMIC_RELAXED);
+	*out_val = __atomic_load_n(&res->slots[pos], __ATOMIC_ACQUIRE);
 	return true;
 }
 

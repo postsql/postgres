@@ -595,7 +595,11 @@ pgbench_array_generate_const(PG_FUNCTION_ARGS)
 
 	elems = (Datum *) palloc(sizeof(Datum) * (Size) len);
 	for (int64 i = 0; i < len; i++)
+	{
+		if ((i & 0xfff) == 0)
+			CHECK_FOR_INTERRUPTS();
 		elems[i] = Int64GetDatum(val);
+	}
 
 	result = construct_array_builtin(elems, (int) len, INT8OID);
 	pfree(elems);
@@ -626,12 +630,40 @@ pgbench_array_generate_random(PG_FUNCTION_ARGS)
 	initialize_prng();
 	elems = (Datum *) palloc(sizeof(Datum) * (Size) len);
 	for (int64 i = 0; i < len; i++)
+	{
+		if ((i & 0xfff) == 0)
+			CHECK_FOR_INTERRUPTS();
 		elems[i] = Int64GetDatum(pgbench_random(&pgbench_prng_state, min_val, max_val));
+	}
 
 	result = construct_array_builtin(elems, (int) len, INT8OID);
 	pfree(elems);
 
 	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_random_bytea_bytea);
+Datum
+pgbench_random_bytea_bytea(PG_FUNCTION_ARGS)
+{
+	int64		min_len = PG_GETARG_INT64(0);
+	int64		max_len = PG_GETARG_INT64(1);
+	int64		actual_len;
+	bytea	   *result;
+
+	if (min_len < 0 || min_len > max_len || max_len > 16777216)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid bytea length range [" INT64_FORMAT ", " INT64_FORMAT "]",
+						min_len, max_len)));
+
+	initialize_prng();
+	result = (bytea *) palloc(VARHDRSZ + (Size) max_len);
+	actual_len = pgbench_random_bytea(&pgbench_prng_state, min_len, max_len,
+									  (uint8 *) VARDATA(result));
+	SET_VARSIZE(result, VARHDRSZ + (Size) actual_len);
+
+	PG_RETURN_BYTEA_P(result);
 }
 
 static inline void
@@ -679,6 +711,48 @@ pgbench_random_vector_text(PG_FUNCTION_ARGS)
 	pgbench_random_vector(&pgbench_prng_state, dim, min_val, max_val, normalize, vec);
 	result = format_float_vector_to_text(vec, dim);
 	pfree(vec);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_random_vector_dist_text);
+Datum
+pgbench_random_vector_dist_text(PG_FUNCTION_ARGS)
+{
+	int32		dim = PG_GETARG_INT32(0);
+	char	   *dist_str = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	bool		normalize = PG_GETARG_BOOL(2);
+	float	   *vec;
+	text	   *result;
+
+	check_vector_dim(dim);
+	initialize_prng();
+	vec = (float *) palloc(sizeof(float) * (Size) dim);
+
+	if (pg_strcasecmp(dist_str, "gaussian") == 0 ||
+		pg_strcasecmp(dist_str, "normal") == 0)
+	{
+		pgbench_random_vector_gaussian(&pgbench_prng_state, dim, 1.0, normalize, vec);
+	}
+	else if (pg_strcasecmp(dist_str, "sphere") == 0)
+	{
+		pgbench_random_vector_gaussian(&pgbench_prng_state, dim, 1.0, true, vec);
+	}
+	else if (pg_strcasecmp(dist_str, "uniform") == 0)
+	{
+		pgbench_random_vector(&pgbench_prng_state, dim, -1.0, 1.0, normalize, vec);
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid vector distribution \"%s\" (expected \"gaussian\", \"uniform\", or \"sphere\")",
+						dist_str)));
+	}
+
+	result = format_float_vector_to_text(vec, dim);
+	pfree(vec);
+	pfree(dist_str);
 
 	PG_RETURN_TEXT_P(result);
 }

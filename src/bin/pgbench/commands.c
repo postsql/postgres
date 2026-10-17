@@ -1148,6 +1148,90 @@ handle_cmd_call(CState *st, Command *cmd, pg_time_usec_t *now)
 	return CSTATE_START_COMMAND;
 }
 
+ConnectionStateEnum
+handle_cmd_record_recall(CState *st, Command *cmd, pg_time_usec_t *now)
+{
+	double		recall_val = 0.0;
+	PgBenchValue v_rec;
+
+	if (cmd->col_target != NULL && strcmp(cmd->col_target, "VARS") == 0)
+	{
+		const char *v1_name = (cmd->argv[1][0] == ':') ? (cmd->argv[1] + 1) : cmd->argv[1];
+		const char *v2_name = (cmd->argv[2][0] == ':') ? (cmd->argv[2] + 1) : cmd->argv[2];
+		Variable   *var1 = lookupVariable(&st->variables, v1_name);
+		Variable   *var2 = lookupVariable(&st->variables, v2_name);
+		int64		k_val = 0;
+
+		if (var1 == NULL)
+		{
+			pg_log_error("\\record_recall: undefined variable \"%s\"", v1_name);
+			commandFailed(st, "record_recall", "undefined retrieved variable");
+			return CSTATE_ABORTED;
+		}
+		if (var2 == NULL)
+		{
+			pg_log_error("\\record_recall: undefined variable \"%s\"", v2_name);
+			commandFailed(st, "record_recall", "undefined ground truth variable");
+			return CSTATE_ABORTED;
+		}
+		if (var1->value.type == PGBT_NO_VALUE && !makeVariableValue(var1))
+		{
+			commandFailed(st, "record_recall", "invalid retrieved variable value");
+			return CSTATE_ABORTED;
+		}
+		if (var2->value.type == PGBT_NO_VALUE && !makeVariableValue(var2))
+		{
+			commandFailed(st, "record_recall", "invalid ground truth variable value");
+			return CSTATE_ABORTED;
+		}
+
+		if (cmd->expr != NULL)
+		{
+			PgBenchValue kv;
+
+			if (! evaluateExpr(st, cmd->expr, &kv) || !coerceToInt(&kv, &k_val))
+			{
+				commandFailed(st, "record_recall", "evaluation of k parameter failed");
+				return CSTATE_ABORTED;
+			}
+		}
+
+		if (!computeRecallOrNdcgAtK(&var1->value, &var2->value, k_val, false, &recall_val))
+		{
+			commandFailed(st, "record_recall", "could not compute recall_at_k");
+			return CSTATE_ABORTED;
+		}
+	}
+	else
+	{
+		PgBenchValue val;
+
+		if (!evaluateExpr(st, cmd->expr, &val) || !coerceToDouble(&val, &recall_val))
+		{
+			commandFailed(st, "record_recall", "evaluation of recall expression failed");
+			return CSTATE_ABORTED;
+		}
+	}
+
+	if (recall_val < 0.0)
+		recall_val = 0.0;
+	else if (recall_val > 1.0)
+		recall_val = 1.0;
+
+	memset(&v_rec, 0, sizeof(v_rec));
+	setDoubleValue(&v_rec, recall_val);
+	if (!putVariableValue(&st->variables, "record_recall", "last_recall", &v_rec))
+	{
+		commandFailed(st, "record_recall", "assignment of last_recall failed");
+		return CSTATE_ABORTED;
+	}
+
+	if (st->txn_recall_count < (int) lengthof(st->txn_recalls))
+		st->txn_recalls[st->txn_recall_count++] = recall_val;
+
+	return CSTATE_END_COMMAND;
+}
+
 /* Pluggable meta-command dispatch table */
 static const CommandDescriptor command_handlers[] = {
 	{"set", META_SET, handle_cmd_set},
@@ -1178,6 +1262,7 @@ static const CommandDescriptor command_handlers[] = {
 	{"session_connect", META_SESSION_CONNECT, handle_cmd_session_connect},
 	{"session_disconnect", META_SESSION_DISCONNECT, handle_cmd_session_disconnect},
 	{"call", META_CALL, handle_cmd_call},
+	{"record_recall", META_RECORD_RECALL, handle_cmd_record_recall},
 	{"startpipeline", META_STARTPIPELINE, handle_cmd_startpipeline},
 	{"syncpipeline", META_SYNCPIPELINE, handle_cmd_syncpipeline},
 	{"endpipeline", META_ENDPIPELINE, handle_cmd_endpipeline},

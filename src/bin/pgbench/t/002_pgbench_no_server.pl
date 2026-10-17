@@ -299,6 +299,26 @@ my @options = (
 		'duplicate --reservoir name',
 		'--reservoir orders:10 --reservoir orders:20',
 		[qr{duplicate reservoir name "orders"}]
+	],
+	[
+		'bad --sla recall threshold',
+		'--sla recall>=1.5',
+		[qr{invalid recall threshold in --sla specification}]
+	],
+	[
+		'bad --sla ontime_pct threshold',
+		'--sla ontime_pct>=120',
+		[qr{invalid ontime_pct threshold in --sla specification}]
+	],
+	[
+		'bad --ontime-threshold value',
+		'--ontime-threshold -5',
+		[qr{invalid on-time threshold value}]
+	],
+	[
+		'nonexistent --replay file',
+		'--replay /no/such/trace.csv',
+		[qr{could not open dataset "replay" file}]
 	],);
 
 for my $o (@options)
@@ -542,6 +562,11 @@ my @script_tests = (
 		'call missing argument',
 		[qr{\\call requires}],
 		{ 'call-noarg.sql' => "\\call\n" }
+	],
+	[
+		'record_recall missing argument',
+		[qr{\\record_recall requires}],
+		{ 'record-recall-noarg.sql' => "\\record_recall\n" }
 	],);
 
 for my $t (@script_tests)

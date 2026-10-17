@@ -101,6 +101,16 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'pgbench_random_nstring_text'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
+CREATE FUNCTION random_bytea(min_len bigint, max_len bigint)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'pgbench_random_bytea_bytea'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+CREATE FUNCTION pgbench_random_bytea(min_len bigint, max_len bigint)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'pgbench_random_bytea_bytea'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
 -- Date / Timestamp Arithmetic and Window Scaling
 CREATE FUNCTION date_add(base_date text, offset_val bigint, unit text)
 RETURNS text
@@ -155,6 +165,15 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'pgbench_random_vector_text'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
+CREATE FUNCTION random_vector(
+    dim integer,
+    dist text,
+    do_normalize boolean DEFAULT true
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'pgbench_random_vector_dist_text'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
 CREATE FUNCTION pgbench_random_vector(
     dim integer,
     min_val double precision DEFAULT -1.0,
@@ -163,6 +182,15 @@ CREATE FUNCTION pgbench_random_vector(
 )
 RETURNS text
 AS 'MODULE_PATHNAME', 'pgbench_random_vector_text'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+CREATE FUNCTION pgbench_random_vector(
+    dim integer,
+    dist text,
+    do_normalize boolean DEFAULT true
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'pgbench_random_vector_dist_text'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 CREATE FUNCTION random_vector_gaussian(
