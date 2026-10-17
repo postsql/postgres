@@ -66,7 +66,10 @@ typedef enum MetaCommand
 	META_THINK_TIME,			/* \think_time */
 	META_GSET,					/* \gset */
 	META_ASET,					/* \aset */
+	META_GSET_COL,				/* \gset_col */
 	META_GSET_META,				/* \gset_meta */
+	META_DATASET_BIND,			/* \dataset_bind */
+	META_COPY_DATASET,			/* \copy_dataset */
 	META_IF,					/* \if */
 	META_ELIF,					/* \elif */
 	META_ELSE,					/* \else */
@@ -129,6 +132,7 @@ typedef struct Command
 	char	   *argv[MAX_ARGS];
 	char	   *prepname;
 	char	   *varprefix;
+	char	   *col_target;
 	char	   *meta_varprefix;
 	PgBenchExpr *expr;
 	PgBenchExpr *index_expr;

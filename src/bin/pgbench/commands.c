@@ -19,6 +19,7 @@
 #include "commands.h"
 #include "common/int.h"
 #include "common/logging.h"
+#include "dataset.h"
 #include "engine.h"
 #include "fe_utils/conditional.h"
 #include "script.h"
@@ -26,6 +27,7 @@
 #include "variable.h"
 
 #define SHELL_COMMAND_SIZE	256 /* maximum size allowed for shell command */
+#define PGBENCH_MAX_GSET_COL_ROWS 100000	/* max rows captured by \gset_col / \aset */
 
 /*
  * Run a shell command. The result is assigned to the variable if not NULL.
@@ -878,6 +880,8 @@ static const CommandDescriptor command_handlers[] = {
 	{"endtry", META_ENDTRY, handle_cmd_endtry},
 	{"expect_error", META_EXPECT_ERROR, handle_cmd_expect_error},
 	{"gset_meta", META_GSET_META, handle_cmd_gset_meta},
+	{"dataset_bind", META_DATASET_BIND, handle_cmd_dataset_bind},
+	{"copy_dataset", META_COPY_DATASET, handle_cmd_copy_dataset},
 	{"startpipeline", META_STARTPIPELINE, handle_cmd_startpipeline},
 	{"syncpipeline", META_SYNCPIPELINE, handle_cmd_syncpipeline},
 	{"endpipeline", META_ENDPIPELINE, handle_cmd_endpipeline},
@@ -1031,9 +1035,58 @@ skipConditionalCommands(CState *st)
 }
 
 /*
+ * Parse a non-NULL PGresult cell string into a typed PgBenchValue
+ * (for \gset_col and multi-row \aset <prefix>).
+ */
+static void
+parseResultCellValue(const char *valstr, PgBenchValue *elem)
+{
+	size_t		vlen = strlen(valstr);
+	int64		ival;
+	double		dval;
+
+	if (vlen >= 2 && valstr[0] == '{' && valstr[vlen - 1] == '}' &&
+		parseArrayLiteral(valstr, elem))
+		return;
+
+	if (vlen >= 3 && valstr[0] == '[' && valstr[vlen - 1] == ']' &&
+		parseVectorLiteral(valstr, elem))
+		return;
+
+	if (vlen >= 2 && valstr[0] == '\\' &&
+		(valstr[1] == 'x' || valstr[1] == 'X') &&
+		parseByteaLiteral(valstr, elem))
+		return;
+
+	if (pg_strcasecmp(valstr, "true") == 0 || pg_strcasecmp(valstr, "t") == 0)
+	{
+		setBoolValue(elem, true);
+		return;
+	}
+	if (pg_strcasecmp(valstr, "false") == 0 || pg_strcasecmp(valstr, "f") == 0)
+	{
+		setBoolValue(elem, false);
+		return;
+	}
+	if (is_an_int(valstr) && strtoint64(valstr, true, &ival))
+	{
+		setIntValue(elem, ival);
+		return;
+	}
+	if (strtodouble(valstr, true, &dval))
+	{
+		setDoubleValue(elem, dval);
+		return;
+	}
+
+	setTextValue(elem, valstr);
+}
+
+/*
  * Store a non-NULL column value from \gset, \aset, or \gset_meta into a
- * variable, converting PostgreSQL array literals "{...}" directly into
- * PGBT_ARRAY values and non-numeric/non-boolean text values into PGBT_TEXT.
+ * variable, converting PostgreSQL array literals "{...}", pgvector literals
+ * "[...]", and hex bytea literals "\x..." directly into typed values and
+ * non-numeric/non-boolean text values into PGBT_TEXT.
  */
 static bool
 storeGSetColumnValue(Variables *variables, const char *context,
@@ -1042,8 +1095,13 @@ storeGSetColumnValue(Variables *variables, const char *context,
 	size_t		vlen = strlen(valstr);
 	PgBenchValue val;
 
-	if (vlen >= 2 && valstr[0] == '{' && valstr[vlen - 1] == '}' &&
-		parseArrayLiteral(valstr, &val))
+	if ((vlen >= 2 && valstr[0] == '{' && valstr[vlen - 1] == '}' &&
+		 parseArrayLiteral(valstr, &val)) ||
+		(vlen >= 3 && valstr[0] == '[' && valstr[vlen - 1] == ']' &&
+		 parseVectorLiteral(valstr, &val)) ||
+		(vlen >= 2 && valstr[0] == '\\' &&
+		 (valstr[1] == 'x' || valstr[1] == 'X') &&
+		 parseByteaLiteral(valstr, &val)))
 	{
 		bool		ok = putVariableValue(variables, context, varname, &val);
 
@@ -1085,7 +1143,7 @@ storeGSetColumnValue(Variables *variables, const char *context,
 }
 
 /*
- * Process \gset and \aset variable storage from query result.
+ * Process \gset, \aset, and \gset_col variable storage from query result.
  * Returns true if successful, false on error.
  */
 bool
@@ -1094,8 +1152,94 @@ processGSetResult(CState *st, Command *command, PGresult *res, bool is_last, int
 	MetaCommand meta = command->meta;
 	char	   *varprefix = command->varprefix;
 	int			ntuples = PQntuples(res);
-	const char *context = (meta == META_ASET) ? "aset" : "gset";
+	int			nfields = PQnfields(res);
+	const char *context = (meta == META_ASET) ? "aset" :
+		(meta == META_GSET_COL) ? "gset_col" : "gset";
 	int			fld;
+
+	if (meta == META_GSET_COL)
+	{
+		int			col_idx = 0;
+		PgBenchValue *elems = NULL;
+		PgBenchValue arr_val;
+		bool		ok;
+
+		if (ntuples > PGBENCH_MAX_GSET_COL_ROWS)
+		{
+			pg_log_error("client %d script %d command %d query %d: \\gset_col result row count %d exceeds maximum %d",
+						 st->id, st->use_file, st->command, qrynum,
+						 ntuples, PGBENCH_MAX_GSET_COL_ROWS);
+			st->estatus = ESTATUS_META_COMMAND_ERROR;
+			return false;
+		}
+
+		if (nfields <= 0)
+		{
+			pg_log_error("client %d script %d command %d query %d: \\gset_col query returned no columns",
+						 st->id, st->use_file, st->command, qrynum);
+			st->estatus = ESTATUS_META_COMMAND_ERROR;
+			return false;
+		}
+
+		if (command->col_target != NULL)
+		{
+			int			fnum = PQfnumber(res, command->col_target);
+
+			if (fnum >= 0)
+			{
+				col_idx = fnum;
+			}
+			else if (is_an_int(command->col_target))
+			{
+				int			idx = atoi(command->col_target);
+
+				if (idx < 0 || idx >= nfields)
+				{
+					pg_log_error("client %d script %d command %d query %d: \\gset_col column index %d out of range (0 .. %d)",
+								 st->id, st->use_file, st->command, qrynum,
+								 idx, nfields - 1);
+					st->estatus = ESTATUS_META_COMMAND_ERROR;
+					return false;
+				}
+				col_idx = idx;
+			}
+			else
+			{
+				pg_log_error("client %d script %d command %d query %d: \\gset_col unknown column \"%s\"",
+							 st->id, st->use_file, st->command, qrynum,
+							 command->col_target);
+				st->estatus = ESTATUS_META_COMMAND_ERROR;
+				return false;
+			}
+		}
+
+		if (ntuples > 0)
+		{
+			elems = pg_malloc_array(PgBenchValue, ntuples);
+			for (int r = 0; r < ntuples; r++)
+			{
+				if (PQgetisnull(res, r, col_idx))
+					setNullValue(&elems[r]);
+				else
+					parseResultCellValue(PQgetvalue(res, r, col_idx), &elems[r]);
+			}
+		}
+
+		arr_val.type = PGBT_ARRAY;
+		arr_val.u.aval.nelems = ntuples;
+		arr_val.u.aval.elems = elems;
+
+		ok = putVariableValue(&st->variables, context, varprefix, &arr_val);
+		freeValue(&arr_val);
+		if (!ok)
+		{
+			pg_log_error("client %d script %d command %d query %d: error storing into variable %s",
+						 st->id, st->use_file, st->command, qrynum, varprefix);
+			st->estatus = ESTATUS_META_COMMAND_ERROR;
+			return false;
+		}
+		return true;
+	}
 
 	if (meta == META_GSET && ntuples != 1)
 	{
@@ -1104,14 +1248,78 @@ processGSetResult(CState *st, Command *command, PGresult *res, bool is_last, int
 		st->estatus = ESTATUS_META_COMMAND_ERROR;
 		return false;
 	}
-	else if (meta == META_ASET && ntuples <= 0)
+	else if (meta == META_ASET && *varprefix == '\0' && ntuples <= 0)
 	{
-		/* skip empty result under \aset */
+		/* skip empty result under bare \aset */
+		return true;
+	}
+
+	/*
+	 * When \aset <prefix> is given a non-empty prefix, capture all returned
+	 * rows for each column into parallel PGBT_ARRAY variables
+	 * (<prefix><col> and <prefix>_<col>).
+	 */
+	if (meta == META_ASET && *varprefix != '\0')
+	{
+		if (ntuples > PGBENCH_MAX_GSET_COL_ROWS)
+		{
+			pg_log_error("client %d script %d command %d query %d: \\aset result row count %d exceeds maximum %d",
+						 st->id, st->use_file, st->command, qrynum,
+						 ntuples, PGBENCH_MAX_GSET_COL_ROWS);
+			st->estatus = ESTATUS_META_COMMAND_ERROR;
+			return false;
+		}
+
+		for (fld = 0; fld < nfields; fld++)
+		{
+			char	   *colname = PQfname(res, fld);
+			char	   *varname = psprintf("%s%s", varprefix, colname);
+			PgBenchValue *elems = NULL;
+			PgBenchValue arr_val;
+			bool		ok;
+
+			if (ntuples > 0)
+			{
+				elems = pg_malloc_array(PgBenchValue, ntuples);
+				for (int r = 0; r < ntuples; r++)
+				{
+					if (PQgetisnull(res, r, fld))
+						setNullValue(&elems[r]);
+					else
+						parseResultCellValue(PQgetvalue(res, r, fld), &elems[r]);
+				}
+			}
+
+			arr_val.type = PGBT_ARRAY;
+			arr_val.u.aval.nelems = ntuples;
+			arr_val.u.aval.elems = elems;
+
+			ok = putVariableValue(&st->variables, context, varname, &arr_val);
+			if (ok && varprefix[strlen(varprefix) - 1] != '_' &&
+				valid_variable_name(colname))
+			{
+				char	   *alt_varname = psprintf("%s_%s", varprefix, colname);
+
+				(void) putVariableValue(&st->variables, context, alt_varname, &arr_val);
+				pfree(alt_varname);
+			}
+			freeValue(&arr_val);
+
+			if (!ok)
+			{
+				pg_log_error("client %d script %d command %d query %d: error storing into variable %s",
+							 st->id, st->use_file, st->command, qrynum, varname);
+				st->estatus = ESTATUS_META_COMMAND_ERROR;
+				pfree(varname);
+				return false;
+			}
+			pfree(varname);
+		}
 		return true;
 	}
 
 	/* store results into variables */
-	for (fld = 0; fld < PQnfields(res); fld++)
+	for (fld = 0; fld < nfields; fld++)
 	{
 		char	   *colname = PQfname(res, fld);
 		char	   *varname = colname;

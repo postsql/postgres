@@ -16,11 +16,13 @@
 
 #include <math.h>
 
+#include "access/htup_details.h"
 #include "catalog/pg_type.h"
 #include "common/int.h"
 #include "common/pgbench_funcs.h"
 #include "common/pg_prng.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/array.h"
@@ -631,4 +633,251 @@ pgbench_array_generate_random(PG_FUNCTION_ARGS)
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
+
+static inline void
+check_vector_dim(int32 dim)
+{
+	if (dim < 1 || dim > PGBENCH_MAX_VECTOR_DIM)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("vector dimension %d out of range [1, %d]",
+						dim, PGBENCH_MAX_VECTOR_DIM)));
+}
+
+static text *
+format_float_vector_to_text(const float *vec, int32 dim)
+{
+	Size		buflen = (Size) dim * 16 + 8;
+	char	   *buf = (char *) palloc(buflen);
+	size_t		len = pgbench_format_vector(vec, dim, buf, buflen);
+	text	   *res = cstring_to_text_with_len(buf, (int) len);
+
+	pfree(buf);
+	return res;
+}
+
+PG_FUNCTION_INFO_V1(pgbench_random_vector_text);
+Datum
+pgbench_random_vector_text(PG_FUNCTION_ARGS)
+{
+	int32		dim = PG_GETARG_INT32(0);
+	float8		min_val = PG_GETARG_FLOAT8(1);
+	float8		max_val = PG_GETARG_FLOAT8(2);
+	bool		normalize = PG_GETARG_BOOL(3);
+	float	   *vec;
+	text	   *result;
+
+	check_vector_dim(dim);
+	if (isnan(min_val) || isnan(max_val) || min_val > max_val)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid range [%g, %g] for random_vector",
+						min_val, max_val)));
+
+	initialize_prng();
+	vec = (float *) palloc(sizeof(float) * (Size) dim);
+	pgbench_random_vector(&pgbench_prng_state, dim, min_val, max_val, normalize, vec);
+	result = format_float_vector_to_text(vec, dim);
+	pfree(vec);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_random_vector_gaussian_text);
+Datum
+pgbench_random_vector_gaussian_text(PG_FUNCTION_ARGS)
+{
+	int32		dim = PG_GETARG_INT32(0);
+	float8		sigma = PG_GETARG_FLOAT8(1);
+	bool		normalize = PG_GETARG_BOOL(2);
+	float	   *vec;
+	text	   *result;
+
+	check_vector_dim(dim);
+	if (isnan(sigma) || sigma <= 0.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sigma must be greater than zero (not %g)", sigma)));
+
+	initialize_prng();
+	vec = (float *) palloc(sizeof(float) * (Size) dim);
+	pgbench_random_vector_gaussian(&pgbench_prng_state, dim, sigma, normalize, vec);
+	result = format_float_vector_to_text(vec, dim);
+	pfree(vec);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_clustered_vector_text);
+Datum
+pgbench_clustered_vector_text(PG_FUNCTION_ARGS)
+{
+	int32		dim = PG_GETARG_INT32(0);
+	int32		num_clusters = PG_GETARG_INT32(1);
+	float8		sigma = PG_GETARG_FLOAT8(2);
+	int64		seed = PG_GETARG_INT64(3);
+	int32		cluster_id = PG_GETARG_INT32(4);
+	float	   *vec;
+	text	   *result;
+
+	check_vector_dim(dim);
+	if (num_clusters < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("num_clusters must be at least 1 (not %d)", num_clusters)));
+	if (isnan(sigma) || sigma < 0.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sigma must be non-negative (not %g)", sigma)));
+
+	initialize_prng();
+	vec = (float *) palloc(sizeof(float) * (Size) dim);
+	pgbench_clustered_vector(&pgbench_prng_state, dim, num_clusters,
+							 sigma, seed, cluster_id, vec);
+	result = format_float_vector_to_text(vec, dim);
+	pfree(vec);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_planted_vector_text);
+Datum
+pgbench_planted_vector_text(PG_FUNCTION_ARGS)
+{
+	int32		dim = PG_GETARG_INT32(0);
+	int64		target_id = PG_GETARG_INT64(1);
+	float8		delta = PG_GETARG_FLOAT8(2);
+	int64		seed = PG_GETARG_INT64(3);
+	float	   *vec;
+	text	   *result;
+
+	check_vector_dim(dim);
+	if (isnan(delta) || delta < 0.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("delta must be non-negative (not %g)", delta)));
+
+	initialize_prng();
+	vec = (float *) palloc(sizeof(float) * (Size) dim);
+	pgbench_planted_vector(&pgbench_prng_state, dim, target_id, delta, seed, vec);
+	result = format_float_vector_to_text(vec, dim);
+	pfree(vec);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_random_sparse_vector_text);
+Datum
+pgbench_random_sparse_vector_text(PG_FUNCTION_ARGS)
+{
+	int32		dim = PG_GETARG_INT32(0);
+	int32		nnz = PG_GETARG_INT32(1);
+	float8		min_val = PG_GETARG_FLOAT8(2);
+	float8		max_val = PG_GETARG_FLOAT8(3);
+	Size		buflen;
+	char	   *buf;
+	text	   *result;
+
+	if (dim < 1 || dim > 100000000 || nnz < 0 || nnz > dim || nnz > 100000)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid sparse vector parameters (dim=%d, nnz=%d)",
+						dim, nnz)));
+	if (isnan(min_val) || isnan(max_val) || min_val > max_val)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid range [%g, %g] for random_sparse_vector",
+						min_val, max_val)));
+
+	initialize_prng();
+	buflen = (Size) nnz * 28 + 32;
+	buf = (char *) palloc(buflen);
+	if (!pgbench_random_sparse_vector(&pgbench_prng_state, dim, nnz,
+									  min_val, max_val, buf, buflen))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("failed to format sparse vector")));
+
+	result = cstring_to_text(buf);
+	pfree(buf);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_rmat_edge_record);
+Datum
+pgbench_rmat_edge_record(PG_FUNCTION_ARGS)
+{
+	int32		scale_log2 = PG_GETARG_INT32(0);
+	float8		a = PG_GETARG_FLOAT8(1);
+	float8		b = PG_GETARG_FLOAT8(2);
+	float8		c = PG_GETARG_FLOAT8(3);
+	int64		seed = PG_GETARG_INT64(4);
+	int64		src,
+				dst;
+	Datum		elems[2];
+	ArrayType  *result;
+
+	initialize_prng();
+	if (!pgbench_rmat_edge(&pgbench_prng_state, scale_log2, a, b, c, seed,
+						   &src, &dst))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid rmat_edge parameters (scale_log2=%d, a=%g, b=%g, c=%g)",
+						scale_log2, a, b, c)));
+
+	elems[0] = Int64GetDatum(src);
+	elems[1] = Int64GetDatum(dst);
+	result = construct_array_builtin(elems, 2, INT8OID);
+
+	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pgbench_vector_distance_text);
+Datum
+pgbench_vector_distance_text(PG_FUNCTION_ARGS)
+{
+	char	   *s1 = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *s2 = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *metric_str = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	PgBenchVecDistMetric metric;
+	int			dim1 = 0,
+				dim2 = 0;
+	float	   *v1,
+			   *v2;
+	double		dist;
+
+	if (!pgbench_parse_vec_dist_metric(metric_str, &metric))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid vector distance metric \"%s\" (expected \"l2\", \"cosine\", or \"ip\")",
+						metric_str)));
+
+	if (!pgbench_parse_vector_count(s1, &dim1))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid vector literal \"%s\"", s1)));
+
+	if (!pgbench_parse_vector_count(s2, &dim2))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid vector literal \"%s\"", s2)));
+
+	if (dim1 != dim2)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("different vector dimensions %d and %d", dim1, dim2)));
+
+	v1 = (float *) palloc(sizeof(float) * (Size) dim1);
+	v2 = (float *) palloc(sizeof(float) * (Size) dim2);
+	(void) pgbench_parse_vector_into(s1, v1, dim1);
+	(void) pgbench_parse_vector_into(s2, v2, dim2);
+
+	dist = pgbench_vector_distance(v1, v2, dim1, metric);
+	pfree(v1);
+	pfree(v2);
+
+	PG_RETURN_FLOAT8(dist);
+}
+
 

@@ -14,6 +14,7 @@ OBJS = \
 	exprparse.o \
 	exprscan.o \
 	commands.o \
+	dataset.o \
 	engine.o \
 	init.o \
 	poller.o \

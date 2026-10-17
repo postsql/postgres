@@ -436,7 +436,7 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 	 */
 	Assert((meta == META_NONE && varprefix == NULL) ||
 		   ((meta == META_ENDPIPELINE) && varprefix == NULL) ||
-		   ((meta == META_GSET || meta == META_ASET) && varprefix != NULL));
+		   ((meta == META_GSET || meta == META_ASET || meta == META_GSET_COL) && varprefix != NULL));
 
 	st->last_sqlstate[0] = '\0';
 
@@ -481,6 +481,13 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 					st->estatus = ESTATUS_META_COMMAND_ERROR;
 					goto error;
 				}
+				if (is_last && meta == META_GSET_COL)
+				{
+					pg_log_error("client %d script %d command %d query %d: expected tuples, got command status",
+								 st->id, st->use_file, st->command, qrynum);
+					st->estatus = ESTATUS_META_COMMAND_ERROR;
+					goto error;
+				}
 				if (is_last &&
 					sql_script[st->use_file].commands[st->command]->meta_varprefix != NULL)
 				{
@@ -495,7 +502,8 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 				st->last_status = "OK";
 				strlcpy(st->last_sqlstate, "00000", sizeof(st->last_sqlstate));
 
-				if ((is_last && meta == META_GSET) || meta == META_ASET)
+				if ((is_last && (meta == META_GSET || meta == META_GSET_COL)) ||
+					meta == META_ASET)
 				{
 					if (!processGSetResult(st, sql_script[st->use_file].commands[st->command],
 										   res, is_last, qrynum))

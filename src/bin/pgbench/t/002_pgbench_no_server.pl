@@ -264,6 +264,21 @@ my @options = (
 		'bad --sla unit',
 		'--sla total:p90<=5minutes',
 		[qr{invalid unit "minutes" in --sla specification}]
+	],
+	[
+		'bad --dataset format',
+		'--dataset bad_spec',
+		[qr{invalid --dataset specification}]
+	],
+	[
+		'nonexistent --dataset file',
+		'--dataset ds:/no/such/file.fvecs',
+		[qr{could not open dataset "ds" file}]
+	],
+	[
+		'bad --copy-dataset format',
+		'--copy-dataset bad_spec',
+		[qr{invalid --copy-dataset specification}]
 	],);
 
 for my $o (@options)
@@ -457,6 +472,26 @@ my @script_tests = (
 		'think_time invalid unit',
 		[qr{unrecognized time unit}],
 		{ 'think-bad-unit.sql' => "\\think_time 10 hours\n" }
+	],
+	[
+		'gset_col alone',
+		[qr{\\gset_col must follow an SQL command}],
+		{ 'gset-col-alone.sql' => "\\gset_col v\n" }
+	],
+	[
+		'gset_col missing argument',
+		[qr{missing variable name argument in command "gset_col"}],
+		{ 'gset-col-noarg.sql' => "SELECT 1 \\gset_col\n" }
+	],
+	[
+		'dataset_bind missing argument',
+		[qr{\\dataset_bind requires}],
+		{ 'dataset-bind-noarg.sql' => "\\dataset_bind ds\n" }
+	],
+	[
+		'copy_dataset missing argument',
+		[qr{\\copy_dataset requires}],
+		{ 'copy-dataset-noarg.sql' => "\\copy_dataset ds\n" }
 	],);
 
 for my $t (@script_tests)

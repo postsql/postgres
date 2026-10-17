@@ -2158,6 +2158,173 @@ SELECT pg_sleep(0.005);
 }
 	});
 
+# Test Tier 1: PGBT_VECTOR, PGBT_BYTEA, vector/sparse/graph generators, and copy-on-write mutation
+$node->pgbench(
+	'-n -t 1 -Dcli_vec=[3,4,0] -Dcli_bin=\\xdeadbeef',
+	0,
+	[qr{processed: 1/1}],
+	[
+		qr{command=1.: vector \[3,4,0\]},
+		qr{command=2.: bytea \\xdeadbeef},
+		qr{command=4.: int 3\b},
+		qr{command=6.: double 5\b},
+		qr{command=9.: vector \[3,12,0\]},
+		qr{command=10.: double 12\.369},
+		qr{command=12.: double 5\b},
+		qr{command=14.: double 1\b},
+		qr{command=16.: double -32\b},
+		qr{command=24.: boolean true\b},
+		qr{command=28.: boolean true\b}
+	],
+	'pgbench PGBT_VECTOR, PGBT_BYTEA, vector/graph generators, and distance metrics',
+	{
+		'001_pgbench_tier1_types_and_generators' => q{
+\set d debug(:cli_vec)
+\set d debug(:cli_bin)
+\set vdim vector_dims(:cli_vec)
+\set d debug(:vdim)
+\set vnorm vector_norm(:cli_vec)
+\set d debug(:vnorm)
+\set v2 :cli_vec
+\set v2[1] 12.0
+\set d debug(:v2)
+\set d debug(vector_norm(:v2))
+\set dl2 vector_distance(vector(3, 4, 0), vector(0, 0, 0), 'l2')
+\set d debug(:dl2)
+\set dcos vector_distance(vector(1, 0, 0), vector(0, 1, 0), 'cosine')
+\set d debug(:dcos)
+\set dip vector_distance(vector(1, 2, 3), vector(4, 5, 6), 'ip')
+\set d debug(:dip)
+\set rv random_vector(8, -1.0, 1.0, true)
+\set gv random_vector_gaussian(8, 1.0, true)
+\set cv1 clustered_vector(8, 4, 0.0, 42, 2)
+\set cv2 clustered_vector(8, 4, 0.0, 42, 2)
+\set pv0 planted_vector(8, 100, 0.0, 42)
+\set pv1 planted_vector(8, 100, 0.25, 42)
+\set pv_ok (abs(vector_distance(:pv0, :pv1, 'l2') - 0.25) < 0.0001 and vector_distance(:cv1, :cv2, 'l2') < 0.0001)
+\set d debug(:pv_ok)
+\set sv random_sparse_vector(50, 3, 0.5, 0.5)
+\set edge rmat_edge(10, 0.57, 0.19, 0.19, 42)
+\set edge_ok (:edge[0] >= 0 and :edge[0] < 1024 and :edge[1] >= 0 and :edge[1] < 1024)
+\set d debug(:edge_ok)
+SELECT ':cli_vec'::text, ':cli_bin'::bytea, ':sv'::text;
+}
+	});
+
+# Test Tier 1: \gset_col and multi-row \aset
+$node->pgbench(
+	'-n -t 1',
+	0,
+	[qr{processed: 1/1}],
+	[
+		qr{command=2.: array \{10,20,30\}},
+		qr{command=4.: array \{a,b,c\}},
+		qr{command=6.: array \{100,200\}},
+		qr{command=7.: array \{x,y\}},
+		qr{command=9.: int 20\b}
+	],
+	'pgbench \gset_col and multi-row \aset',
+	{
+		'001_pgbench_gset_col_and_aset' => q{
+SELECT g * 10 AS id, chr(96 + g) AS lbl FROM generate_series(1, 3) g \gset_col col_ids 0
+\set d debug(:col_ids)
+SELECT g * 10 AS id, chr(96 + g) AS lbl FROM generate_series(1, 3) g \gset_col col_lbls lbl
+\set d debug(:col_lbls)
+SELECT 100 AS k, 'x'::text AS v UNION ALL SELECT 200 AS k, 'y'::text AS v \aset mr_
+\set d debug(:mr_k)
+\set d debug(:mr_v)
+\set mid :col_ids[1]
+\set d debug(:mid)
+}
+	});
+
+# Test Tier 1: Shared Read-Only Memory-Mapped Dataset Pool (.fvecs, .ivecs, .csv, .tsv) and Parallel COPY Ingestion
+my $fvecs_file = $node->basedir . '/test_vecs.fvecs';
+my $ivecs_file = $node->basedir . '/test_gt.ivecs';
+my $csv_file = $node->basedir . '/test_items.csv';
+my $tsv_file = $node->basedir . '/test_edges.tsv';
+
+{
+	open my $fh, '>:raw', $fvecs_file or die "open $fvecs_file: $!";
+	# 4 vectors of dim 3: [1,2,3], [4,5,6], [7,8,9], [10,11,12]
+	for my $r (0 .. 3)
+	{
+		my $base = $r * 3;
+		print $fh pack('l<f<3', 3, $base + 1.0, $base + 2.0, $base + 3.0);
+	}
+	close $fh;
+
+	open my $ifh, '>:raw', $ivecs_file or die "open $ivecs_file: $!";
+	# 4 rows of dim 2 int32 ground-truth IDs
+	for my $r (0 .. 3)
+	{
+		print $ifh pack('l<3', 2, $r * 10 + 1, $r * 10 + 2);
+	}
+	close $ifh;
+}
+append_to_file($csv_file, "id,name,score\n1,alpha,10.5\n2,\"hello,world\",20.5\n3,gamma,30.0\n4,delta,40.25\n");
+append_to_file($tsv_file, "src\tdst\n10\t20\n20\t30\n30\t40\n40\t10\n");
+
+$node->safe_psql('postgres',
+	'CREATE TABLE copy_vecs(id bigint, v text); '
+	  . 'CREATE TABLE copy_csv(id int, name text, score float8); '
+	  . 'CREATE TABLE copy_tsv(src int, dst int);');
+
+# Test --copy-dataset during initialization (-i -I d) with multiple worker threads (-j 2)
+$node->pgbench(
+	"-i -I d -j 2 --dataset=vecs:$fvecs_file --dataset=csv:$csv_file --copy-dataset=vecs:copy_vecs --copy-dataset=csv:copy_csv",
+	0,
+	[qr{^$}],
+	[
+		qr{copying dataset "vecs" \(4 rows\) into copy_vecs},
+		qr{copying dataset "csv" \(4 rows\) into copy_csv}
+	],
+	'pgbench --copy-dataset parallel bulk ingestion');
+
+is($node->safe_psql('postgres', 'SELECT count(*) FROM copy_vecs;'), '4', 'copy_vecs row count after --copy-dataset');
+is($node->safe_psql('postgres', "SELECT v FROM copy_vecs WHERE id = 0;"), '[1,2,3]', 'copy_vecs row 0 vector value');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM copy_csv;'), '4', 'copy_csv row count after --copy-dataset');
+is($node->safe_psql('postgres', "SELECT name FROM copy_csv WHERE id = 2;"), 'hello,world', 'copy_csv quoted comma field');
+
+# Test dataset_count, dataset_get (zero-copy + copy-on-write), dataset_next_id, \dataset_bind, and \copy_dataset
+$node->pgbench(
+	"-n -c 2 -j 2 -t 1 --vector-dataset=vecs:$fvecs_file --dataset=gt:$ivecs_file --dataset=csv:$csv_file --dataset=tsv:$tsv_file",
+	0,
+	[qr{processed: 2/2}],
+	[
+		qr{int 4\b},
+		qr{vector \[1,2,3\]},
+		qr{vector \[99,2,3\]},
+		qr{array \{1,2\}},
+		qr{text 'hello,world'},
+		qr{text 'alpha'}
+	],
+	'pgbench dataset functions, \dataset_bind, and \copy_dataset',
+	{
+		'001_pgbench_datasets' => q{
+\if :client_id = 0
+\set cnt dataset_count('vecs')
+\set d debug(:cnt)
+\set v0 dataset_get('vecs', 0)
+\set d debug(:v0)
+\set v0[0] 99.0
+\set d debug(:v0)
+\set v0_orig dataset_get('vecs', 0)
+\set d debug(:v0_orig)
+\set gt0 dataset_get('gt', 0)
+\set d debug(:gt0)
+\set c1 dataset_get('csv', 1, 1)
+\set d debug(:c1)
+\dataset_bind csv 0 row_id row_name row_score
+\set d debug(:row_name)
+\endif
+\copy_dataset tsv copy_tsv
+}
+	});
+
+is($node->safe_psql('postgres', 'SELECT count(*) FROM copy_tsv;'), '4', 'copy_tsv row count after parallel \copy_dataset');
+$node->safe_psql('postgres', 'DROP TABLE copy_vecs, copy_csv, copy_tsv;');
+
 # Test standard benchmark workload suites (pgbench-b, pgbench-c, pgbench-e, pgbench-h, pgbench-ds, pgbench-htap)
 my $wl_dir = "$FindBin::RealBin/../workloads";
 

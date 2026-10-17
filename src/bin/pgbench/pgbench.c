@@ -56,6 +56,7 @@
 #include "libpq-fe.h"
 #include "pgbench.h"
 #include "commands.h"
+#include "dataset.h"
 #include "engine.h"
 #include "init.h"
 #include "poller.h"
@@ -125,6 +126,8 @@ usage(void)
 		   "  -v, --vacuum-all         vacuum all four standard tables before tests\n"
 		   "  --aggregate-interval=NUM aggregate data over NUM seconds\n"
 		   "  --continue-on-error      continue running after an SQL error\n"
+		   "  --copy-dataset=SPEC      bulk load dataset via parallel COPY (<name>:<table>[(<cols>)])\n"
+		   "  --dataset=NAME=PATH      load shared read-only dataset (.fvecs, .bvecs, .ivecs, .csv, .tsv)\n"
 		   "  --exit-on-abort          exit when any client is aborted\n"
 		   "  --failures-detailed      report the failures grouped by basic types\n"
 		   "  --group=SPEC             define a client group (name=...,clients=...,threads=...,\n"
@@ -138,6 +141,8 @@ usage(void)
 		   "  --sampling-rate=NUM      fraction of transactions to log (e.g., 0.01 for 1%%)\n"
 		   "  --show-script=NAME       show builtin script code, then exit\n"
 		   "  --sla=SPEC               define SLA latency threshold (<target>:p<pct><=<val>[us|ms|s])\n"
+		   "  --vector-dataset=NAME=PATH\n"
+		   "                           alias for --dataset=NAME=PATH\n"
 		   "  --verbose-errors         print messages of all errors\n"
 		   "\nCommon options:\n"
 		   "  --debug                  print debugging output\n"
@@ -447,6 +452,9 @@ main(int argc, char **argv)
 		{"group", required_argument, NULL, 19},
 		{"sla", required_argument, NULL, 20},
 		{"json-report", required_argument, NULL, 21},
+		{"dataset", required_argument, NULL, 22},
+		{"vector-dataset", required_argument, NULL, 23},
+		{"copy-dataset", required_argument, NULL, 24},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -462,6 +470,8 @@ main(int argc, char **argv)
 	bool		benchmarking_option_set = false;
 	bool		initialization_option_set = false;
 	bool		internal_script_used = false;
+	bool		jobs_option_set = false;
+	int			copy_nthreads = 1;
 
 	CState	   *state;			/* status of clients */
 	TState	   *threads;		/* array of thread */
@@ -497,6 +507,7 @@ main(int argc, char **argv)
 	 */
 	gettimeofday(&tv, NULL);
 	epoch_shift = tv.tv_sec * INT64CONST(1000000) + tv.tv_usec - pg_time_now();
+
 
 	pg_logging_init(argv[0]);
 	progname = get_progname(argv[0]);
@@ -615,12 +626,13 @@ main(int argc, char **argv)
 				initialization_option_set = true;
 				break;
 			case 'j':			/* jobs */
-				benchmarking_option_set = true;
+				jobs_option_set = true;
 				if (!option_parse_int(optarg, "-j/--jobs", 1, INT_MAX,
 									  &nthreads))
 				{
 					exit(1);
 				}
+				copy_nthreads = nthreads;
 				break;
 			case 'l':
 				benchmarking_option_set = true;
@@ -820,6 +832,13 @@ main(int argc, char **argv)
 				pg_free(json_report_file);
 				json_report_file = pg_strdup(optarg);
 				break;
+			case 22:			/* dataset */
+			case 23:			/* vector-dataset */
+				parseDatasetSpec(optarg);
+				break;
+			case 24:			/* copy-dataset */
+				registerCopyDatasetSpec(optarg);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -862,8 +881,8 @@ main(int argc, char **argv)
 #endif							/* HAVE_GETRLIMIT */
 	}
 
-	/* set default script if none */
-	if (num_scripts == 0 && !is_init_mode)
+	/* set default script if none (unless running standalone --copy-dataset) */
+	if (num_scripts == 0 && !is_init_mode && num_copy_dataset_specs == 0)
 	{
 		process_builtin(findBuiltin("tpcb-like"), 1);
 		benchmarking_option_set = true;
@@ -883,7 +902,7 @@ main(int argc, char **argv)
 		total_weight += sql_script[i].weight;
 	}
 
-	if (total_weight == 0 && !is_init_mode)
+	if (total_weight == 0 && !is_init_mode && num_copy_dataset_specs == 0)
 		pg_fatal("total script weight must not be zero");
 
 	/* show per script stats if several scripts, groups, SLAs, or JSON report are used */
@@ -930,7 +949,7 @@ main(int argc, char **argv)
 
 	if (is_init_mode)
 	{
-		if (benchmarking_option_set)
+		if (benchmarking_option_set || (jobs_option_set && num_copy_dataset_specs == 0))
 			pg_fatal("some of the specified options cannot be used in initialization (-i) mode");
 
 		if (partitions == 0 && partition_method != PART_NONE)
@@ -965,12 +984,37 @@ main(int argc, char **argv)
 		}
 
 		runInitSteps(initialize_steps);
+		if (num_copy_dataset_specs > 0)
+		{
+			int			saved_nthreads = nthreads;
+
+			con = doConnect();
+			if (con == NULL)
+				pg_fatal("could not create connection for setup");
+			nthreads = copy_nthreads;
+			runRegisteredCopyDatasets(con);
+			nthreads = saved_nthreads;
+			PQfinish(con);
+		}
 		exit(0);
 	}
 	else
 	{
 		if (initialization_option_set)
 			pg_fatal("some of the specified options cannot be used in benchmarking mode");
+	}
+
+	/* Standalone --copy-dataset without any benchmark scripts */
+	if (num_copy_dataset_specs > 0 && num_scripts == 0)
+	{
+		con = doConnect();
+		if (con == NULL)
+			pg_fatal("could not create connection for setup");
+		printVersion(con);
+		nthreads = copy_nthreads;
+		runRegisteredCopyDatasets(con);
+		PQfinish(con);
+		exit(0);
 	}
 
 	if (nxacts > 0 && duration > 0)
@@ -1072,6 +1116,15 @@ main(int argc, char **argv)
 				 PQhost(con), PQport(con), nclients,
 				 duration <= 0 ? "nxacts" : "duration",
 				 duration <= 0 ? nxacts : duration, PQdb(con));
+
+	if (num_copy_dataset_specs > 0)
+	{
+		int			saved_nthreads = nthreads;
+
+		nthreads = copy_nthreads;
+		runRegisteredCopyDatasets(con);
+		nthreads = saved_nthreads;
+	}
 
 	if (internal_script_used)
 		GetTableInfo(con, scale_given);

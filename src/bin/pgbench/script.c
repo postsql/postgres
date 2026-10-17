@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "common/pg_prng.h"
 #include "common/pgbench_funcs.h"
+#include "dataset.h"
 #include "fe_utils/conditional.h"
 #include "pgbench.h"
 #include "script.h"
@@ -81,7 +82,8 @@ static bool
 isLazyFunc(PgBenchFunction func)
 {
 	return func == PGBENCH_AND || func == PGBENCH_OR ||
-		func == PGBENCH_CASE || func == PGBENCH_ARRAY_GENERATE;
+		func == PGBENCH_CASE || func == PGBENCH_ARRAY_GENERATE ||
+		func == PGBENCH_VECTOR;
 }
 
 static void
@@ -100,6 +102,133 @@ evalLazyFunc(CState *st,
 				a2;
 	bool		ba1,
 				ba2;
+
+	if (func == PGBENCH_VECTOR)
+	{
+		PgBenchExprLink *l = args;
+		int			nargs = 0;
+
+		for (; l != NULL; l = l->next)
+			nargs++;
+
+		if (nargs <= 0 || nargs > PGBENCH_MAX_VECTOR_DIM)
+		{
+			pg_log_error("vector dimension %d out of range [1, %d]",
+						 nargs, PGBENCH_MAX_VECTOR_DIM);
+			return false;
+		}
+
+		if (nargs == 1)
+		{
+			double		dval;
+			float		fval;
+
+			if (!evaluateExpr(st, args->expr, &a1))
+				return false;
+
+			if (a1.type == PGBT_NULL)
+			{
+				freeValue(&a1);
+				setNullValue(retval);
+				return true;
+			}
+			if (a1.type == PGBT_VECTOR)
+			{
+				copyValue(retval, &a1);
+				freeValue(&a1);
+				return true;
+			}
+			if (a1.type == PGBT_TEXT)
+			{
+				bool		ok = parseVectorLiteral(a1.u.sval, retval);
+
+				if (!ok)
+					pg_log_error("invalid vector literal: \"%s\"",
+								 a1.u.sval != NULL ? a1.u.sval : "");
+				freeValue(&a1);
+				return ok;
+			}
+			if (a1.type == PGBT_ARRAY)
+			{
+				int			dim = a1.u.aval.nelems;
+				float	   *elems;
+
+				if (dim <= 0 || dim > PGBENCH_MAX_VECTOR_DIM)
+				{
+					pg_log_error("vector dimension %d out of range [1, %d]",
+								 dim, PGBENCH_MAX_VECTOR_DIM);
+					freeValue(&a1);
+					return false;
+				}
+				elems = pg_malloc_array(float, dim);
+				for (int i = 0; i < dim; i++)
+				{
+					double		ed;
+
+					if (!coerceToDouble(&a1.u.aval.elems[i], &ed))
+					{
+						pg_free(elems);
+						freeValue(&a1);
+						return false;
+					}
+					elems[i] = (float) ed;
+				}
+				freeValue(&a1);
+				retval->type = PGBT_VECTOR;
+				retval->u.vval.dim = dim;
+				retval->u.vval.is_borrowed = false;
+				retval->u.vval.elems = elems;
+				return true;
+			}
+			if (!coerceToDouble(&a1, &dval))
+			{
+				freeValue(&a1);
+				return false;
+			}
+			freeValue(&a1);
+			fval = (float) dval;
+			setVectorValue(retval, &fval, 1, false);
+			return true;
+		}
+		else
+		{
+			float	   *elems = pg_malloc_array(float, nargs);
+			int			i = 0;
+
+			for (l = args; l != NULL; l = l->next, i++)
+			{
+				PgBenchValue ev;
+				double		dval;
+
+				if (!evaluateExpr(st, l->expr, &ev))
+				{
+					pg_free(elems);
+					return false;
+				}
+				if (ev.type == PGBT_NULL)
+				{
+					freeValue(&ev);
+					pg_free(elems);
+					setNullValue(retval);
+					return true;
+				}
+				if (!coerceToDouble(&ev, &dval))
+				{
+					freeValue(&ev);
+					pg_free(elems);
+					return false;
+				}
+				freeValue(&ev);
+				elems[i] = (float) dval;
+			}
+
+			retval->type = PGBT_VECTOR;
+			retval->u.vval.dim = nargs;
+			retval->u.vval.is_borrowed = false;
+			retval->u.vval.elems = elems;
+			return true;
+		}
+	}
 
 	Assert(isLazyFunc(func) && args != NULL && args->next != NULL);
 
@@ -268,6 +397,59 @@ evalLazyFunc(CState *st,
 			Assert(0);
 			break;
 	}
+	return false;
+}
+
+/*
+ * Coerce a PgBenchValue (PGBT_VECTOR, PGBT_TEXT "[...]", or PGBT_ARRAY) into a
+ * PGBT_VECTOR. If pval is already PGBT_VECTOR, borrows its elems pointer into
+ * vout (with is_borrowed = true so freeValue(vout) is a no-op).
+ */
+static bool
+coerceToVector(const PgBenchValue *pval, PgBenchValue *vout)
+{
+	if (pval->type == PGBT_VECTOR)
+	{
+		setVectorValue(vout, pval->u.vval.elems, pval->u.vval.dim, true);
+		return true;
+	}
+	if (pval->type == PGBT_TEXT)
+	{
+		if (pval->u.sval != NULL && parseVectorLiteral(pval->u.sval, vout))
+			return true;
+		pg_log_error("cannot coerce text \"%s\" to vector",
+					 pval->u.sval != NULL ? pval->u.sval : "");
+		return false;
+	}
+	if (pval->type == PGBT_ARRAY)
+	{
+		int			dim = pval->u.aval.nelems;
+		float	   *elems;
+
+		if (dim <= 0 || dim > PGBENCH_MAX_VECTOR_DIM)
+		{
+			pg_log_error("cannot coerce array of length %d to vector", dim);
+			return false;
+		}
+		elems = pg_malloc_array(float, dim);
+		for (int i = 0; i < dim; i++)
+		{
+			double		dval;
+
+			if (!coerceToDouble(&pval->u.aval.elems[i], &dval))
+			{
+				pg_free(elems);
+				return false;
+			}
+			elems[i] = (float) dval;
+		}
+		vout->type = PGBT_VECTOR;
+		vout->u.vval.dim = dim;
+		vout->u.vval.is_borrowed = false;
+		vout->u.vval.elems = elems;
+		return true;
+	}
+	pg_log_error("cannot coerce %s to vector", valueTypeName(pval));
 	return false;
 }
 
@@ -668,6 +850,20 @@ evalStandardFunc(CState *st,
 					fprintf(stderr, "array %s\n", s);
 					pg_free(s);
 				}
+				else if (varg->type == PGBT_VECTOR)
+				{
+					char	   *s = formatValue(varg);
+
+					fprintf(stderr, "vector %s\n", s);
+					pg_free(s);
+				}
+				else if (varg->type == PGBT_BYTEA)
+				{
+					char	   *s = formatValue(varg);
+
+					fprintf(stderr, "bytea %s\n", s);
+					pg_free(s);
+				}
 				else			/* internal error, unexpected type */
 					Assert(0);
 
@@ -963,6 +1159,22 @@ evalStandardFunc(CState *st,
 					goto cleanup;
 				}
 
+				if (!coerceToInt(&vargs[1], &idx))
+					goto cleanup;
+
+				if (vargs[0].type == PGBT_VECTOR)
+				{
+					if (idx < 0 || idx >= vargs[0].u.vval.dim)
+					{
+						pg_log_error("vector index " INT64_FORMAT " out of bounds (0 .. %d)",
+									 idx, vargs[0].u.vval.dim - 1);
+						goto cleanup;
+					}
+					setDoubleValue(retval, (double) vargs[0].u.vval.elems[idx]);
+					ok = true;
+					goto cleanup;
+				}
+
 				if (vargs[0].type != PGBT_ARRAY)
 				{
 					pg_log_error("cannot subscript non-array value (type %s)",
@@ -970,13 +1182,10 @@ evalStandardFunc(CState *st,
 					goto cleanup;
 				}
 
-				if (!coerceToInt(&vargs[1], &idx))
-					goto cleanup;
-
 				if (idx < 0 || idx >= vargs[0].u.aval.nelems)
 				{
 					pg_log_error("array index " INT64_FORMAT " out of bounds (0 .. %d)",
-								 idx, vargs[0].u.aval.nelems - 1);
+									 idx, vargs[0].u.aval.nelems - 1);
 					goto cleanup;
 				}
 
@@ -1353,6 +1562,534 @@ evalStandardFunc(CState *st,
 				goto cleanup;
 			}
 
+		case PGBENCH_VECTOR_DIMS:
+			{
+				PgBenchValue v;
+
+				Assert(nargs == 1);
+
+				if (!coerceToVector(&vargs[0], &v))
+					goto cleanup;
+
+				setIntValue(retval, v.u.vval.dim);
+				freeValue(&v);
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_VECTOR_NORM:
+			{
+				PgBenchValue v;
+				double		sum_sq = 0.0;
+
+				Assert(nargs == 1);
+
+				if (!coerceToVector(&vargs[0], &v))
+					goto cleanup;
+
+				for (int i = 0; i < v.u.vval.dim; i++)
+				{
+					double		x = (double) v.u.vval.elems[i];
+
+					sum_sq += x * x;
+				}
+				freeValue(&v);
+				setDoubleValue(retval, sqrt(sum_sq));
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_VECTOR_DISTANCE:
+			{
+				PgBenchValue v1,
+							v2;
+				PgBenchVecDistMetric metric = PGBENCH_VEC_DIST_L2;
+				double		dist;
+
+				Assert(nargs == 2 || nargs == 3);
+
+				if (nargs == 3)
+				{
+					char	   *mstr = NULL;
+
+					if (!coerceToText(&vargs[2], &mstr))
+						goto cleanup;
+
+					if (!pgbench_parse_vec_dist_metric(mstr, &metric))
+					{
+						pg_log_error("invalid vector distance metric \"%s\" (expected \"l2\", \"cosine\", or \"ip\")",
+									 mstr);
+						pg_free(mstr);
+						goto cleanup;
+					}
+					pg_free(mstr);
+				}
+
+				if (!coerceToVector(&vargs[0], &v1))
+					goto cleanup;
+				if (!coerceToVector(&vargs[1], &v2))
+				{
+					freeValue(&v1);
+					goto cleanup;
+				}
+
+				if (v1.u.vval.dim != v2.u.vval.dim)
+				{
+					pg_log_error("vector_distance dimension mismatch (%d != %d)",
+								 v1.u.vval.dim, v2.u.vval.dim);
+					freeValue(&v1);
+					freeValue(&v2);
+					goto cleanup;
+				}
+
+				dist = pgbench_vector_distance(v1.u.vval.elems, v2.u.vval.elems,
+											   v1.u.vval.dim, metric);
+				freeValue(&v1);
+				freeValue(&v2);
+				setDoubleValue(retval, dist);
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RANDOM_VECTOR:
+			{
+				int64		dim;
+				double		min_val = -1.0;
+				double		max_val = 1.0;
+				bool		normalize = false;
+				float	   *elems;
+
+				Assert(nargs >= 1 && nargs <= 4);
+
+				if (!coerceToInt(&vargs[0], &dim))
+					goto cleanup;
+
+				if (dim < 1 || dim > PGBENCH_MAX_VECTOR_DIM)
+				{
+					pg_log_error("random_vector dimension " INT64_FORMAT " out of range [1, %d]",
+								 dim, PGBENCH_MAX_VECTOR_DIM);
+					goto cleanup;
+				}
+
+				if (nargs >= 2 && !coerceToDouble(&vargs[1], &min_val))
+					goto cleanup;
+				if (nargs >= 3 && !coerceToDouble(&vargs[2], &max_val))
+					goto cleanup;
+				if (nargs == 4 && !coerceToBool(&vargs[3], &normalize))
+					goto cleanup;
+
+				if (min_val > max_val)
+				{
+					pg_log_error("empty range [%f, %f] given to random_vector",
+								 min_val, max_val);
+					goto cleanup;
+				}
+
+				elems = pg_malloc_array(float, (int) dim);
+				pgbench_random_vector(&st->cs_func_rs, (int) dim,
+									  min_val, max_val, normalize, elems);
+				retval->type = PGBT_VECTOR;
+				retval->u.vval.dim = (int) dim;
+				retval->u.vval.is_borrowed = false;
+				retval->u.vval.elems = elems;
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RANDOM_VECTOR_GAUSSIAN:
+			{
+				int64		dim;
+				double		sigma = 1.0;
+				bool		normalize = true;
+				float	   *elems;
+
+				Assert(nargs >= 1 && nargs <= 3);
+
+				if (!coerceToInt(&vargs[0], &dim))
+					goto cleanup;
+
+				if (dim < 1 || dim > PGBENCH_MAX_VECTOR_DIM)
+				{
+					pg_log_error("random_vector_gaussian dimension " INT64_FORMAT " out of range [1, %d]",
+								 dim, PGBENCH_MAX_VECTOR_DIM);
+					goto cleanup;
+				}
+
+				if (nargs == 2)
+				{
+					if (vargs[1].type == PGBT_BOOLEAN)
+						normalize = vargs[1].u.bval;
+					else if (!coerceToDouble(&vargs[1], &sigma))
+						goto cleanup;
+				}
+				else if (nargs == 3)
+				{
+					if (!coerceToDouble(&vargs[1], &sigma) ||
+						!coerceToBool(&vargs[2], &normalize))
+						goto cleanup;
+				}
+
+				if (sigma <= 0.0)
+				{
+					pg_log_error("random_vector_gaussian sigma must be > 0");
+					goto cleanup;
+				}
+
+				elems = pg_malloc_array(float, (int) dim);
+				pgbench_random_vector_gaussian(&st->cs_func_rs, (int) dim,
+											   sigma, normalize, elems);
+				retval->type = PGBT_VECTOR;
+				retval->u.vval.dim = (int) dim;
+				retval->u.vval.is_borrowed = false;
+				retval->u.vval.elems = elems;
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_CLUSTERED_VECTOR:
+			{
+				int64		dim,
+							num_clusters,
+							cluster_id = -1;
+				double		sigma = 0.1;
+				int64		seed = 0;
+				float	   *elems;
+
+				Assert(nargs >= 2 && nargs <= 5);
+
+				if (!coerceToInt(&vargs[0], &dim) ||
+					!coerceToInt(&vargs[1], &num_clusters))
+					goto cleanup;
+
+				if (dim < 1 || dim > PGBENCH_MAX_VECTOR_DIM)
+				{
+					pg_log_error("clustered_vector dimension " INT64_FORMAT " out of range [1, %d]",
+								 dim, PGBENCH_MAX_VECTOR_DIM);
+					goto cleanup;
+				}
+				if (num_clusters < 1)
+				{
+					pg_log_error("clustered_vector num_clusters must be >= 1");
+					goto cleanup;
+				}
+
+				if (nargs >= 3 && !coerceToDouble(&vargs[2], &sigma))
+					goto cleanup;
+				if (sigma < 0.0)
+				{
+					pg_log_error("clustered_vector sigma must be >= 0");
+					goto cleanup;
+				}
+
+				if (nargs >= 4)
+				{
+					if (!coerceToInt(&vargs[3], &seed))
+						goto cleanup;
+				}
+				else
+				{
+					Variable   *svar = lookupVariable(&st->variables, "default_seed");
+
+					if (svar != NULL && makeVariableValue(svar) && svar->value.type == PGBT_INT)
+						seed = svar->value.u.ival;
+				}
+
+				if (nargs == 5 && !coerceToInt(&vargs[4], &cluster_id))
+					goto cleanup;
+
+				elems = pg_malloc_array(float, (int) dim);
+				pgbench_clustered_vector(&st->cs_func_rs, (int) dim,
+										 (int) num_clusters, sigma,
+										 seed, (int) cluster_id, elems);
+				retval->type = PGBT_VECTOR;
+				retval->u.vval.dim = (int) dim;
+				retval->u.vval.is_borrowed = false;
+				retval->u.vval.elems = elems;
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_PLANTED_VECTOR:
+			{
+				int64		dim,
+							target_id;
+				double		delta = 0.01;
+				int64		seed = 0;
+				float	   *elems;
+
+				Assert(nargs >= 2 && nargs <= 4);
+
+				if (!coerceToInt(&vargs[0], &dim) ||
+					!coerceToInt(&vargs[1], &target_id))
+					goto cleanup;
+
+				if (dim < 1 || dim > PGBENCH_MAX_VECTOR_DIM)
+				{
+					pg_log_error("planted_vector dimension " INT64_FORMAT " out of range [1, %d]",
+								 dim, PGBENCH_MAX_VECTOR_DIM);
+					goto cleanup;
+				}
+
+				if (nargs >= 3 && !coerceToDouble(&vargs[2], &delta))
+					goto cleanup;
+				if (delta < 0.0)
+				{
+					pg_log_error("planted_vector delta must be >= 0");
+					goto cleanup;
+				}
+
+				if (nargs == 4)
+				{
+					if (!coerceToInt(&vargs[3], &seed))
+						goto cleanup;
+				}
+				else
+				{
+					Variable   *svar = lookupVariable(&st->variables, "default_seed");
+
+					if (svar != NULL && makeVariableValue(svar) && svar->value.type == PGBT_INT)
+						seed = svar->value.u.ival;
+				}
+
+				elems = pg_malloc_array(float, (int) dim);
+				pgbench_planted_vector(&st->cs_func_rs, (int) dim,
+									   target_id, delta, seed, elems);
+				retval->type = PGBT_VECTOR;
+				retval->u.vval.dim = (int) dim;
+				retval->u.vval.is_borrowed = false;
+				retval->u.vval.elems = elems;
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RANDOM_SPARSE_VECTOR:
+			{
+				int64		dim,
+							nnz;
+				double		min_val = 0.1;
+				double		max_val = 1.0;
+				size_t		buflen;
+				char	   *buf;
+
+				Assert(nargs >= 2 && nargs <= 4);
+
+				if (!coerceToInt(&vargs[0], &dim) ||
+					!coerceToInt(&vargs[1], &nnz))
+					goto cleanup;
+
+				if (dim < 1 || dim > 10000000)
+				{
+					pg_log_error("random_sparse_vector dimension " INT64_FORMAT " out of range [1, 10000000]",
+								 dim);
+					goto cleanup;
+				}
+				if (nnz < 0 || nnz > 65536)
+				{
+					pg_log_error("random_sparse_vector nnz " INT64_FORMAT " out of range [0, 65536]",
+								 nnz);
+					goto cleanup;
+				}
+
+				if (nargs >= 3 && !coerceToDouble(&vargs[2], &min_val))
+					goto cleanup;
+				if (nargs == 4 && !coerceToDouble(&vargs[3], &max_val))
+					goto cleanup;
+
+				if (min_val > max_val)
+				{
+					pg_log_error("empty range [%f, %f] given to random_sparse_vector",
+								 min_val, max_val);
+					goto cleanup;
+				}
+
+				buflen = (size_t) Min(nnz, dim) * 28 + 32;
+				buf = pg_malloc(buflen);
+				if (!pgbench_random_sparse_vector(&st->cs_func_rs, (int) dim, (int) nnz,
+												  min_val, max_val, buf, buflen))
+				{
+					pg_free(buf);
+					pg_log_error("failed to format random_sparse_vector");
+					goto cleanup;
+				}
+
+				retval->type = PGBT_TEXT;
+				retval->u.sval = buf;
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_RMAT_EDGE:
+			{
+				int64		scale;
+				double		a = 0.57,
+							b = 0.19,
+							c = 0.19;
+				int64		seed = 0;
+				int64		src_out = 0,
+							dst_out = 0;
+
+				Assert(nargs >= 1 && nargs <= 5);
+
+				if (!coerceToInt(&vargs[0], &scale))
+					goto cleanup;
+
+				if (scale < 1 || scale > 62)
+				{
+					pg_log_error("rmat_edge scale " INT64_FORMAT " out of range [1, 62]",
+								 scale);
+					goto cleanup;
+				}
+
+				if (nargs >= 2 && !coerceToDouble(&vargs[1], &a))
+					goto cleanup;
+				if (nargs >= 3 && !coerceToDouble(&vargs[2], &b))
+					goto cleanup;
+				if (nargs >= 4 && !coerceToDouble(&vargs[3], &c))
+					goto cleanup;
+				if (nargs == 5 && vargs[4].type != PGBT_BOOLEAN &&
+					!coerceToInt(&vargs[4], &seed))
+					goto cleanup;
+
+				if (a < 0.0 || b < 0.0 || c < 0.0 || (a + b + c) > 1.0)
+				{
+					pg_log_error("rmat_edge probabilities must be >= 0 and sum to <= 1.0");
+					goto cleanup;
+				}
+
+				pgbench_rmat_edge(&st->cs_func_rs, (int) scale, a, b, c, seed,
+								  &src_out, &dst_out);
+
+				if (nargs == 5 && vargs[4].type == PGBT_BOOLEAN)
+				{
+					setIntValue(retval, vargs[4].u.bval ? dst_out : src_out);
+				}
+				else
+				{
+					PgBenchValue pair[2];
+
+					setIntValue(&pair[0], src_out);
+					setIntValue(&pair[1], dst_out);
+					setArrayValue(retval, pair, 2);
+				}
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_DATASET_COUNT:
+			{
+				char	   *ds_name = NULL;
+				int64		cnt;
+
+				Assert(nargs == 1);
+
+				if (!coerceToText(&vargs[0], &ds_name))
+					goto cleanup;
+
+				cnt = datasetCount(ds_name);
+				if (cnt < 0)
+				{
+					pg_log_error("unknown dataset \"%s\" in dataset_count", ds_name);
+					pg_free(ds_name);
+					goto cleanup;
+				}
+				pg_free(ds_name);
+				setIntValue(retval, cnt);
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_DATASET_GET:
+			{
+				char	   *ds_name = NULL;
+				int64		row_idx;
+				int64		col_idx = -1;
+				PgBenchDataset *ds;
+
+				Assert(nargs == 2 || nargs == 3);
+
+				if (!coerceToText(&vargs[0], &ds_name))
+					goto cleanup;
+				if (!coerceToInt(&vargs[1], &row_idx))
+				{
+					pg_free(ds_name);
+					goto cleanup;
+				}
+				if (nargs == 3 && !coerceToInt(&vargs[2], &col_idx))
+				{
+					pg_free(ds_name);
+					goto cleanup;
+				}
+
+				ds = findDataset(ds_name);
+				if (ds == NULL)
+				{
+					pg_log_error("unknown dataset \"%s\" in dataset_get", ds_name);
+					pg_free(ds_name);
+					goto cleanup;
+				}
+				pg_free(ds_name);
+
+				if (!datasetGetRow(ds, row_idx, (int) col_idx, retval))
+					goto cleanup;
+
+				ok = true;
+				goto cleanup;
+			}
+
+		case PGBENCH_DATASET_NEXT_ID:
+			{
+				char	   *ds_name = NULL;
+				DatasetCursorMode mode = CURSOR_WRAP_ROUND_ROBIN;
+				PgBenchDataset *ds;
+
+				Assert(nargs == 1 || nargs == 2);
+
+				if (!coerceToText(&vargs[0], &ds_name))
+					goto cleanup;
+
+				if (nargs == 2)
+				{
+					char	   *mode_str = NULL;
+
+					if (!coerceToText(&vargs[1], &mode_str))
+					{
+						pg_free(ds_name);
+						goto cleanup;
+					}
+					if (pg_strcasecmp(mode_str, "wrap") == 0 ||
+						pg_strcasecmp(mode_str, "round_robin") == 0 ||
+						pg_strcasecmp(mode_str, "wrap_round_robin") == 0)
+						mode = CURSOR_WRAP_ROUND_ROBIN;
+					else if (pg_strcasecmp(mode_str, "once") == 0 ||
+							 pg_strcasecmp(mode_str, "once_global") == 0)
+						mode = CURSOR_ONCE_GLOBAL;
+					else
+					{
+						pg_log_error("invalid cursor mode \"%s\" in dataset_next_id (expected \"wrap\" or \"once\")",
+									 mode_str);
+						pg_free(mode_str);
+						pg_free(ds_name);
+						goto cleanup;
+					}
+					pg_free(mode_str);
+				}
+
+				ds = findDataset(ds_name);
+				if (ds == NULL)
+				{
+					pg_log_error("unknown dataset \"%s\" in dataset_next_id", ds_name);
+					pg_free(ds_name);
+					goto cleanup;
+				}
+				pg_free(ds_name);
+
+				if (!datasetNextId(ds, mode, retval))
+					goto cleanup;
+
+				ok = true;
+				goto cleanup;
+			}
+
 		default:
 			/* cannot get here */
 			Assert(0);
@@ -1472,8 +2209,14 @@ getMetaCommand(const char *cmd)
 		mc = META_GSET;
 	else if (pg_strcasecmp(cmd, "aset") == 0)
 		mc = META_ASET;
+	else if (pg_strcasecmp(cmd, "gset_col") == 0)
+		mc = META_GSET_COL;
 	else if (pg_strcasecmp(cmd, "gset_meta") == 0)
 		mc = META_GSET_META;
+	else if (pg_strcasecmp(cmd, "dataset_bind") == 0)
+		mc = META_DATASET_BIND;
+	else if (pg_strcasecmp(cmd, "copy_dataset") == 0)
+		mc = META_COPY_DATASET;
 	else if (pg_strcasecmp(cmd, "startpipeline") == 0)
 		mc = META_STARTPIPELINE;
 	else if (pg_strcasecmp(cmd, "syncpipeline") == 0)
@@ -1661,6 +2404,7 @@ create_sql_command(PQExpBuffer buf)
 	my_command->failures = 0;
 	memset(my_command->argv, 0, sizeof(my_command->argv));
 	my_command->varprefix = NULL;	/* allocated later, if needed */
+	my_command->col_target = NULL;
 	my_command->meta_varprefix = NULL;	/* allocated later, if needed */
 	my_command->expr = NULL;
 	initSimpleStats(&my_command->stats);
@@ -1678,6 +2422,7 @@ free_command(Command *command)
 	for (int i = 0; i < command->argc; i++)
 		pg_free(command->argv[i]);
 	pg_free(command->varprefix);
+	pg_free(command->col_target);
 	pg_free(command->meta_varprefix);
 
 	/*
@@ -2220,6 +2965,29 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
 						 "too many arguments", NULL, -1);
 	}
+	else if (my_command->meta == META_GSET_COL)
+	{
+		if (my_command->argc < 2)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "missing variable name argument", NULL, -1);
+		if (my_command->argc > 3)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "too many arguments", NULL, -1);
+	}
+	else if (my_command->meta == META_DATASET_BIND)
+	{
+		if (my_command->argc < 4)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "\\dataset_bind requires <dataset> <cursor_mode> <var1> [<var2> ...]",
+						 NULL, -1);
+	}
+	else if (my_command->meta == META_COPY_DATASET)
+	{
+		if (my_command->argc < 3)
+			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
+						 "\\copy_dataset requires <dataset> <table> [(cols)]",
+						 NULL, -1);
+	}
 	else
 	{
 		/* my_command->meta == META_NONE */
@@ -2475,15 +3243,18 @@ ParseScript(const char *script, const char *desc, int weight)
 			if (command)
 			{
 				/*
-				 * If this is gset or aset, merge into the preceding command.
-				 * (We don't use a command slot in this case).
+				 * If this is gset, aset, or gset_col, merge into the preceding
+				 * command. (We don't use a command slot in this case).
 				 */
-				if (command->meta == META_GSET || command->meta == META_ASET)
+				if (command->meta == META_GSET || command->meta == META_ASET ||
+					command->meta == META_GSET_COL)
 				{
 					Command    *cmd;
 
 					if (index == 0)
 						syntax_error(desc, lineno, NULL, NULL,
+									 (command->meta == META_GSET_COL) ?
+									 "\\gset_col must follow an SQL command" :
 									 "\\gset must follow an SQL command",
 									 NULL, -1);
 
@@ -2492,14 +3263,21 @@ ParseScript(const char *script, const char *desc, int weight)
 					if (cmd->type != SQL_COMMAND ||
 						cmd->varprefix != NULL)
 						syntax_error(desc, lineno, NULL, NULL,
+									 (command->meta == META_GSET_COL) ?
+									 "\\gset_col must follow an SQL command" :
 									 "\\gset must follow an SQL command",
 									 cmd->first_line, -1);
 
-					/* get variable prefix */
+					/* get variable prefix / target variable */
 					if (command->argc <= 1 || command->argv[1][0] == '\0')
 						cmd->varprefix = pg_strdup("");
+					else if (command->meta == META_GSET_COL && command->argv[1][0] == ':')
+						cmd->varprefix = pg_strdup(command->argv[1] + 1);
 					else
 						cmd->varprefix = pg_strdup(command->argv[1]);
+
+					if (command->meta == META_GSET_COL && command->argc >= 3)
+						cmd->col_target = pg_strdup(command->argv[2]);
 
 					/* update the sql command meta */
 					cmd->meta = command->meta;
