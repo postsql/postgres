@@ -79,12 +79,32 @@ typedef enum TStatus
 	TSTATUS_OTHER_ERROR,
 } TStatus;
 
+#define MAX_GROUPS		32		/* max number of client groups */
+
+/*
+ * Heterogeneous client group configuration and statistics (--group).
+ */
+typedef struct ClientGroup
+{
+	char	   *name;			/* group name */
+	int			nclients;		/* number of clients in group */
+	int			nthreads;		/* number of threads in group */
+	bool		sequential;		/* sequential script selection */
+	double		rate;			/* target TPS rate for group (0 = none) */
+	double		throttle_delay; /* per-thread throttle delay in usec */
+	int			script_indices[128];	/* indices into sql_script[] */
+	int			num_scripts;	/* number of scripts in this group */
+	int64		total_weight;	/* sum of weights of group's scripts */
+	StatsData	stats;			/* aggregated stats for this group */
+} ClientGroup;
+
 /*
  * Thread state
  */
 typedef struct
 {
 	int			tid;			/* thread id */
+	int			group_id;		/* client group index, or -1 */
 	THREAD_T	thread;			/* thread handle */
 	CState	   *state;			/* array of CState */
 	int			nstate;			/* length of state[] */
@@ -110,7 +130,60 @@ typedef struct
 
 	StatsData	stats;
 	int64		latency_late;	/* count executed but late transactions */
+	int			wakeup_pipe[2]; /* non-blocking self-pipe for watermark wakeups */
 } TState;
+
+#define MAX_SLAS		64		/* max number of SLA rules */
+
+typedef enum SlaMetricType
+{
+	SLA_METRIC_LATENCY_PCT = 0, /* p<pct> <= <val>[us|ms|s] */
+	SLA_METRIC_LATENCY_AVG,		/* avg <= <val>[us|ms|s] */
+	SLA_METRIC_LAG_PCT,			/* schedule_lag:p<pct> <= <val>[us|ms|s] */
+	SLA_METRIC_ONTIME_PCT,		/* ontime_pct >= <pct> */
+	SLA_METRIC_RECALL_AVG,		/* recall >= <val> */
+	SLA_METRIC_RECALL_PCT,		/* recall_p<pct> >= <val> */
+	SLA_METRIC_TPS,				/* tps >= <val> or qps >= <val> */
+	SLA_METRIC_ERROR_RATE,		/* error_rate <= <pct> */
+	SLA_METRIC_VALIDATION_FAILURES, /* validation_failures <= <cnt> */
+	SLA_METRIC_VALIDATION_PCT	/* validation_pct >= <pct> */
+} SlaMetricType;
+
+typedef enum SlaOpType
+{
+	SLA_OP_LE = 0,				/* <= */
+	SLA_OP_GE					/* >= */
+} SlaOpType;
+
+/*
+ * SLA compliance rule (--sla [scope:]<metric>(<=|>=)<val>[unit]).
+ */
+typedef struct SlaRule
+{
+	char		   *target;			/* script name/substring, group name, or "total" */
+	char		   *named_metric;	/* optional named recall metric (e.g. "r10", "r1") */
+	SlaMetricType	metric;			/* metric type */
+	SlaOpType		op;				/* comparison operator */
+	double			percentile;		/* e.g. 50.0, 90.0, 95.0, 99.0, 99.9 */
+	double			threshold_usec; /* max allowed latency/lag in microseconds */
+	double			actual_usec;	/* measured latency/lag in microseconds */
+	double			threshold_val;	/* generic threshold (recall, pct, tps) */
+	double			actual_val;		/* generic measured value */
+	bool			evaluated;		/* true if target matched at least 1 sample */
+	bool			passed;			/* true if evaluated and condition satisfied */
+} SlaRule;
+
+extern ClientGroup client_groups[MAX_GROUPS];
+extern int	num_groups;
+extern SlaRule sla_rules[MAX_SLAS];
+extern int	num_slas;
+extern bool sla_failed;
+extern char *json_report_file;
+extern double replay_speed;
+extern double ontime_threshold_ms;
+extern char *replay_trace_file;
+extern int	max_concurrent_sessions;
+extern int	active_sessions_count;
 
 extern int	nxacts;
 extern int	duration;
@@ -146,7 +219,9 @@ extern bool exit_on_abort;
 extern bool continue_on_error;
 
 extern void initRandomState(pg_prng_state *state);
+extern void resolveHostAddrOnce(void);
 extern PGconn *doConnect(void);
+extern PGconn *doConnectAsync(const char *db_override, const char *user_override);
 extern void disconnect_all(CState *state, int length);
 extern void printVersion(PGconn *con);
 extern void printResults(StatsData *total, pg_time_usec_t total_time,

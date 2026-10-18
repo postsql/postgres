@@ -110,13 +110,19 @@ clear_socket_set(socket_set *sa)
 }
 
 void
-add_socket_to_set(socket_set *sa, int fd, int idx)
+add_socket_to_set_ex(socket_set *sa, int fd, int idx, bool wait_write)
 {
 	Assert(idx < sa->maxfds && idx == sa->curfds);
 	sa->pollfds[idx].fd = fd;
-	sa->pollfds[idx].events = POLLIN;
+	sa->pollfds[idx].events = wait_write ? (POLLIN | POLLOUT) : POLLIN;
 	sa->pollfds[idx].revents = 0;
 	sa->curfds++;
+}
+
+void
+add_socket_to_set(socket_set *sa, int fd, int idx)
+{
+	add_socket_to_set_ex(sa, fd, idx, false);
 }
 
 int
@@ -151,7 +157,7 @@ socket_has_input(socket_set *sa, int fd, int idx)
 		return false;
 
 	Assert(idx < sa->curfds && sa->pollfds[idx].fd == fd);
-	return (sa->pollfds[idx].revents & POLLIN) != 0;
+	return (sa->pollfds[idx].revents & (POLLIN | POLLOUT | POLLERR | POLLHUP)) != 0;
 }
 
 #endif							/* POLL_USING_PPOLL */
@@ -189,6 +195,12 @@ clear_socket_set(socket_set *sa)
 {
 	FD_ZERO(&sa->fds);
 	sa->maxfd = -1;
+}
+
+void
+add_socket_to_set_ex(socket_set *sa, int fd, int idx, bool wait_write)
+{
+	add_socket_to_set(sa, fd, idx);
 }
 
 void

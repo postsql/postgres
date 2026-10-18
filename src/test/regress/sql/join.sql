@@ -1937,6 +1937,20 @@ select * from int4_tbl left join (
 ) ss(x) on true
 where ss.x is null;
 
+-- Test a join qual referencing a nulled appendrel output only within a PHV
+explain (verbose, costs off)
+select 1 from int4_tbl t1
+  left join (select 1 as x union all select 2) s on true
+  left join lateral (select s.x as y from int4_tbl t2) ss on true
+  left join int4_tbl t3 on ss.y is null;
+
+-- Same, but the join qual's required_relids don't include the nulling OJ
+explain (verbose, costs off)
+select 1 from ((int4_tbl t1 left join (select 1 as x union all select 2) s on t1.f1 < s.x)
+   join lateral (select coalesce(s.x, t2.f1) as y from int4_tbl t2) ss on true)
+  full join int4_tbl t3 on t3.f1 = t1.f1 and ss.y = t3.f1
+  right join int4_tbl t4 on t3.f1 = t4.f1;
+
 -- Test computation of varnullingrels when translating appendrel Var
 begin;
 
@@ -2494,6 +2508,64 @@ select count(*) from int4_tbl t1 left join
   left join lateral
     (select c.f1 as cnt from int4_tbl c where c.f1 = t2.one offset 0) t3
     on t2.bx = t3.cnt;
+
+--
+-- check that a join is disallowed when its lateral reference can only be
+-- satisfied by way of a rel that laterally references the join itself
+--
+
+explain (costs off)
+select 1 from int4_tbl t1 left join int4_tbl t2 on true,
+  lateral (select t2.f1 offset 0) s1 left join int8_tbl t3 on s1.f1 = t3.q1,
+  lateral (select t3.q2 offset 0) s2
+where s2.q2 > t1.f1;
+
+select 1 from int4_tbl t1 left join int4_tbl t2 on true,
+  lateral (select t2.f1 offset 0) s1 left join int8_tbl t3 on s1.f1 = t3.q1,
+  lateral (select t3.q2 offset 0) s2
+where s2.q2 > t1.f1;
+
+-- likewise when the outer join above the lateral referencer is a full join
+explain (costs off)
+select count(*) from int4_tbl t1 left join int4_tbl t2 on true,
+  lateral (select t2.f1 offset 0) s1 full join int8_tbl t3 on s1.f1 = t3.q1,
+  lateral (select t3.q2 offset 0) s2
+where s2.q2 > t1.f1;
+
+select count(*) from int4_tbl t1 left join int4_tbl t2 on true,
+  lateral (select t2.f1 offset 0) s1 full join int8_tbl t3 on s1.f1 = t3.q1,
+  lateral (select t3.q2 offset 0) s2
+where s2.q2 > t1.f1;
+
+-- likewise when the lateral referencer is part of a sub-joinlist
+set from_collapse_limit to 4;
+
+explain (costs off)
+select count(*) from int4_tbl t1 left join int4_tbl t2 on true,
+  lateral (select t2.f1 offset 0) s1 join int8_tbl t3 on s1.f1 = t3.q1,
+  lateral (select t3.q2 offset 0) s2
+where s2.q2 > t1.f1;
+
+select count(*) from int4_tbl t1 left join int4_tbl t2 on true,
+  lateral (select t2.f1 offset 0) s1 join int8_tbl t3 on s1.f1 = t3.q1,
+  lateral (select t3.q2 offset 0) s2
+where s2.q2 > t1.f1;
+
+reset from_collapse_limit;
+
+--
+-- check that an outer join is not taken to commute with a lower outer join
+-- when its clause references the lower join's RHS only laterally within a
+-- PlaceHolderVar
+--
+
+explain (costs off)
+select 1 from int4_tbl t1
+  left join int4_tbl t2 on true
+  left join lateral (select t2.f1, 1 from int4_tbl t3) s(x, y) on true
+  left join int4_tbl t4 on t4.f1 = s.x
+  join int4_tbl t5 on true
+where s.y is not null;
 
 --
 -- check that a cloned outer-join qual is not enforced multiple times when
@@ -3898,6 +3970,20 @@ JOIN (
 	) _t2t3t4
 ON sj_t1.id = _t2t3t4.id;
 
+-- Check SJE interaction with aggpresorted optimization.
+CREATE TEMP TABLE sje_agg (id int PRIMARY KEY, p int, q int);
+INSERT INTO sje_agg SELECT i, i % 3, (i * 7) % 10 FROM generate_series(1, 30) i;
+ANALYZE sje_agg;
+
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT a.p) AS dp, count(DISTINCT a.q) AS dq,
+       sum(DISTINCT a2.q) AS sq
+FROM sje_agg a JOIN sje_agg a2 ON a.id = a2.id;
+
+SELECT count(DISTINCT a.p) AS dp, count(DISTINCT a.q) AS dq,
+       sum(DISTINCT a2.q) AS sq
+FROM sje_agg a JOIN sje_agg a2 ON a.id = a2.id;
+
 --
 -- Test RowMarks-related code
 --
@@ -3984,6 +4070,13 @@ explain (costs off)
 select * from generate_series(100,200) g,
   lateral (select * from int8_tbl a where g = q1 union all
            select * from int8_tbl b where g = q2) ss;
+
+-- lateral with UNION ALL subselect, where a member is a subquery whose
+-- output contains a lateral reference
+explain (costs off)
+  select ss.v from int8_tbl x,
+    lateral (select x.q1 from (select distinct q2 from int8_tbl) s union all
+             select q2 from int8_tbl) ss(v);
 
 -- lateral with VALUES
 explain (costs off)
@@ -4633,3 +4726,46 @@ SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2
     ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);
 SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2
     ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);
+
+--
+-- Test that a qual from above an antijoin made from a sublink is not pushed
+-- down into the antijoin's RHS.
+--
+
+EXPLAIN (COSTS OFF)
+SELECT s.*
+FROM (VALUES (1)) AS v(z) LEFT JOIN
+  (SELECT 123456 AS c, t1.f1 AS x FROM int4_tbl t1
+   WHERE NOT EXISTS (SELECT 1 FROM tenk1 t2 WHERE t2.unique1 = t1.f1)) s ON true
+WHERE s.x = s.c;
+
+SELECT s.*
+FROM (VALUES (1)) AS v(z) LEFT JOIN
+  (SELECT 123456 AS c, t1.f1 AS x FROM int4_tbl t1
+   WHERE NOT EXISTS (SELECT 1 FROM tenk1 t2 WHERE t2.unique1 = t1.f1)) s ON true
+WHERE s.x = s.c;
+
+-- Test the same for NOT IN, which needs non-nullable inputs to become an
+-- antijoin
+BEGIN;
+
+CREATE TEMP TABLE not_null_tab (f1 int4 NOT NULL);
+INSERT INTO not_null_tab VALUES (0), (123456), (-123456);
+ANALYZE not_null_tab;
+
+EXPLAIN (COSTS OFF)
+SELECT s.*
+FROM (VALUES (1)) AS v(z) LEFT JOIN
+  (SELECT 123456 AS c, t1.f1 AS x FROM not_null_tab t1
+   WHERE t1.f1 NOT IN (SELECT t2.unique1 FROM tenk1 t2
+                       WHERE t2.unique1 IS NOT NULL)) s ON true
+WHERE s.x = s.c;
+
+SELECT s.*
+FROM (VALUES (1)) AS v(z) LEFT JOIN
+  (SELECT 123456 AS c, t1.f1 AS x FROM not_null_tab t1
+   WHERE t1.f1 NOT IN (SELECT t2.unique1 FROM tenk1 t2
+                       WHERE t2.unique1 IS NOT NULL)) s ON true
+WHERE s.x = s.c;
+
+ROLLBACK;

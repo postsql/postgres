@@ -14,6 +14,7 @@
 #define SCRIPT_H
 
 #include "common/pg_prng.h"
+#include "common/pgbench_funcs.h"
 #include "pgbench.h"
 #include "pqexpbuffer.h"
 #include "stats.h"
@@ -23,20 +24,6 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-
-/*
- * Hashing constants
- */
-#define FNV_PRIME			UINT64CONST(0x100000001b3)
-#define FNV_OFFSET_BASIS	UINT64CONST(0xcbf29ce484222325)
-#define MM2_MUL				UINT64CONST(0xc6a4a7935bd1e995)
-#define MM2_MUL_TIMES_8		UINT64CONST(0x35253c9ade8f4ca8)
-#define MM2_ROT				47
-
-#define MIN_GAUSSIAN_PARAM		2.0 /* minimum parameter for gauss */
-
-#define MIN_ZIPFIAN_PARAM		1.001	/* minimum parameter for zipfian */
-#define MAX_ZIPFIAN_PARAM		1000.0	/* maximum parameter for zipfian */
 
 #define nbranches	1			/* Makes little sense to change this.  Change
 								 * -s instead */
@@ -75,16 +62,43 @@ typedef enum MetaCommand
 	META_SETSHELL,				/* \setshell */
 	META_SHELL,					/* \shell */
 	META_SLEEP,					/* \sleep */
+	META_KEYING_TIME,			/* \keying_time */
+	META_THINK_TIME,			/* \think_time */
 	META_GSET,					/* \gset */
 	META_ASET,					/* \aset */
+	META_GSET_COL,				/* \gset_col */
+	META_GSET_META,				/* \gset_meta */
+	META_DATASET_BIND,			/* \dataset_bind */
+	META_COPY_DATASET,			/* \copy_dataset */
+	META_WAIT_UNTIL,			/* \wait_until */
+	META_ADVANCE_WATERMARK,		/* \advance_watermark */
+	META_BEGIN_DEPENDENT_WRITE, /* \begin_dependent_write */
+	META_END_DEPENDENT_WRITE,	/* \end_dependent_write */
+	META_PHASE_BARRIER,			/* \phase_barrier */
+	META_RESERVOIR_PUSH,		/* \reservoir_push */
+	META_RESERVOIR_SAMPLE,		/* \reservoir_sample */
+	META_SESSION_CONNECT,		/* \session_connect */
+	META_SESSION_DISCONNECT,	/* \session_disconnect */
+	META_CALL,					/* \call */
+	META_RECORD_RECALL,			/* \record_recall */
+	META_VALIDATE_RESULT,		/* \validate_result */
 	META_IF,					/* \if */
 	META_ELIF,					/* \elif */
 	META_ELSE,					/* \else */
 	META_ENDIF,					/* \endif */
+	META_FOR,					/* \for */
+	META_ENDFOR,				/* \endfor */
+	META_WHILE,					/* \while */
+	META_ENDWHILE,				/* \endwhile */
+	META_TRY,					/* \try */
+	META_CATCH,					/* \catch */
+	META_ENDTRY,				/* \endtry */
+	META_EXPECT_ERROR,			/* \expect_error */
 	META_STARTPIPELINE,			/* \startpipeline */
 	META_SYNCPIPELINE,			/* \syncpipeline */
 	META_ENDPIPELINE,			/* \endpipeline */
 } MetaCommand;
+
 
 typedef enum QueryMode
 {
@@ -131,7 +145,14 @@ typedef struct Command
 	char	   *argv[MAX_ARGS];
 	char	   *prepname;
 	char	   *varprefix;
+	char	   *col_target;
+	char	   *meta_varprefix;
 	PgBenchExpr *expr;
+	PgBenchExpr *index_expr;
+	PgBenchExpr *end_expr;
+	PgBenchExpr *step_expr;
+	int			jump_target;
+	int			endtry_target;
 	SimpleStats stats;
 	int64		retries;
 	int64		failures;
@@ -158,11 +179,16 @@ typedef struct BuiltinScript
 } BuiltinScript;
 
 extern bool evaluateExpr(CState *st, PgBenchExpr *expr, PgBenchValue *retval);
+extern bool computeRecallOrNdcgAtK(const PgBenchValue *ret_val,
+								   const PgBenchValue *gt_val,
+								   int64 k, bool is_ndcg,
+								   double *out_score);
 extern int	chooseScript(pg_prng_state *random_state);
 
 extern void postprocess_sql_command(Command *my_command);
 extern void process_file(const char *filename, int weight);
 extern void process_builtin(const BuiltinScript *bi, int weight);
+extern void process_replay_builtin(int weight);
 extern void listAvailableScripts(void);
 extern const BuiltinScript *findBuiltin(const char *tb);
 extern int	parseScriptWeight(const char *option, char **script);

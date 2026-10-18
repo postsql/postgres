@@ -12,8 +12,11 @@
  */
 #include "postgres_fe.h"
 
+#include <fcntl.h>
 #include <math.h>
+#include <netdb.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "commands.h"
@@ -21,6 +24,7 @@
 #include "common/pg_prng.h"
 #include "common/pgbench_funcs.h"
 #include "common/string.h"
+#include "dataset.h"
 #include "engine.h"
 #include "fe_utils/string_utils.h"
 #include "init.h"
@@ -28,6 +32,21 @@
 #include "script.h"
 #include "stats.h"
 #include "variable.h"
+
+ClientGroup client_groups[MAX_GROUPS];
+int	num_groups = 0;
+SlaRule sla_rules[MAX_SLAS];
+int	num_slas = 0;
+bool sla_failed = false;
+char *json_report_file = NULL;
+double replay_speed = 1.0;
+double ontime_threshold_ms = 50.0;
+char *replay_trace_file = NULL;
+int	max_concurrent_sessions = 0;
+int	active_sessions_count = 0;
+static int	aborted_clients_count = 0;
+static char *resolved_hostaddr = NULL;
+static char *saved_password = NULL;
 
 int	nxacts = 0;			/* number of transactions per client */
 int	duration = 0;		/* duration in seconds */
@@ -135,13 +154,44 @@ initRandomState(pg_prng_state *state)
 	pg_prng_seed(state, pg_prng_uint64(&base_random_sequence));
 }
 
+/*
+ * Resolve pghost once before spawning worker threads so that non-blocking
+ * PQconnectStartParams() calls during \session_connect pass hostaddr and
+ * never block the thread's event loop on synchronous DNS getaddrinfo().
+ */
+void
+resolveHostAddrOnce(void)
+{
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	char		hostbuf[NI_MAXHOST];
+
+	if (resolved_hostaddr != NULL || pghost == NULL || *pghost == '\0' ||
+		pghost[0] == '/' || pghost[0] == '@' || strchr(pghost, ',') != NULL)
+		return;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	if (getaddrinfo(pghost, pgport, &hints, &res) == 0 && res != NULL)
+	{
+		if (getnameinfo(res->ai_addr, res->ai_addrlen,
+						hostbuf, sizeof(hostbuf),
+						NULL, 0, NI_NUMERICHOST) == 0)
+		{
+			resolved_hostaddr = pg_strdup(hostbuf);
+		}
+		freeaddrinfo(res);
+	}
+}
+
 /* set up a connection to the backend */
 PGconn *
 doConnect(void)
 {
 	PGconn	   *conn;
 	bool		new_pass;
-	static char *password = NULL;
 
 	/*
 	 * Start the connection.  Loop until we have a password if requested by
@@ -149,25 +199,31 @@ doConnect(void)
 	 */
 	do
 	{
-#define PARAMS_ARRAY_SIZE	7
+#define PARAMS_ARRAY_SIZE	8
 
 		const char *keywords[PARAMS_ARRAY_SIZE];
 		const char *values[PARAMS_ARRAY_SIZE];
+		int			k = 0;
 
-		keywords[0] = "host";
-		values[0] = pghost;
-		keywords[1] = "port";
-		values[1] = pgport;
-		keywords[2] = "user";
-		values[2] = username;
-		keywords[3] = "password";
-		values[3] = password;
-		keywords[4] = "dbname";
-		values[4] = dbName;
-		keywords[5] = "fallback_application_name";
-		values[5] = progname;
-		keywords[6] = NULL;
-		values[6] = NULL;
+		keywords[k] = "host";
+		values[k++] = pghost;
+		if (resolved_hostaddr != NULL)
+		{
+			keywords[k] = "hostaddr";
+			values[k++] = resolved_hostaddr;
+		}
+		keywords[k] = "port";
+		values[k++] = pgport;
+		keywords[k] = "user";
+		values[k++] = username;
+		keywords[k] = "password";
+		values[k++] = saved_password;
+		keywords[k] = "dbname";
+		values[k++] = dbName;
+		keywords[k] = "fallback_application_name";
+		values[k++] = progname;
+		keywords[k] = NULL;
+		values[k] = NULL;
 
 		new_pass = false;
 
@@ -181,15 +237,67 @@ doConnect(void)
 
 		if (PQstatus(conn) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(conn) &&
-			!password)
+			!saved_password)
 		{
 			PQfinish(conn);
-			password = simple_prompt("Password: ", false);
+			saved_password = simple_prompt("Password: ", false);
 			new_pass = true;
 		}
 	} while (new_pass);
 
 	/* check to see that the backend connection was successfully made */
+	if (PQstatus(conn) == CONNECTION_BAD)
+	{
+		pg_log_error("%s", PQerrorMessage(conn));
+		PQfinish(conn);
+		return NULL;
+	}
+
+	return conn;
+}
+
+/*
+ * Initiate a non-blocking connection to the backend for \session_connect.
+ */
+PGconn *
+doConnectAsync(const char *db_override, const char *user_override)
+{
+	PGconn	   *conn;
+	const char *keywords[PARAMS_ARRAY_SIZE];
+	const char *values[PARAMS_ARRAY_SIZE];
+	int			k = 0;
+	const char *eff_db = (db_override != NULL && *db_override != '\0') ?
+		db_override : dbName;
+	const char *eff_user = (user_override != NULL && *user_override != '\0') ?
+		user_override : username;
+
+	keywords[k] = "host";
+	values[k++] = pghost;
+	if (resolved_hostaddr != NULL)
+	{
+		keywords[k] = "hostaddr";
+		values[k++] = resolved_hostaddr;
+	}
+	keywords[k] = "port";
+	values[k++] = pgport;
+	keywords[k] = "user";
+	values[k++] = eff_user;
+	keywords[k] = "password";
+	values[k++] = saved_password;
+	keywords[k] = "dbname";
+	values[k++] = eff_db;
+	keywords[k] = "fallback_application_name";
+	values[k++] = progname;
+	keywords[k] = NULL;
+	values[k] = NULL;
+
+	conn = PQconnectStartParams(keywords, values, true);
+	if (!conn)
+	{
+		pg_log_error("connection to database \"%s\" failed", eff_db);
+		return NULL;
+	}
+
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
 		pg_log_error("%s", PQerrorMessage(conn));
@@ -332,6 +440,135 @@ canContinueOnError(EStatus estatus)
 }
 
 /*
+ * Check if a 5-character SQLSTATE matches a pattern from \catch or
+ * \expect_error.  NULL or "*" matches any error; a 2-character pattern
+ * matches the SQLSTATE class prefix; otherwise case-insensitive exact match.
+ */
+static bool
+sqlstateMatches(const char *pattern, const char *sqlstate)
+{
+	size_t		plen;
+
+	if (pattern == NULL || pattern[0] == '\0' || strcmp(pattern, "*") == 0)
+		return true;
+	if (sqlstate == NULL || sqlstate[0] == '\0')
+		return false;
+
+	plen = strlen(pattern);
+	if (plen == 2)
+		return (pg_strncasecmp(pattern, sqlstate, 2) == 0);
+
+	return (pg_strcasecmp(pattern, sqlstate) == 0);
+}
+
+/*
+ * Unwind all active \call frames back to the root script, freeing sub-script
+ * conditional stacks.
+ */
+static void
+unwindCallStack(CState *st)
+{
+	while (st->call_depth > 0)
+	{
+		CallFrame  *frame = &st->call_stack[--st->call_depth];
+
+		conditional_stack_destroy(st->cstack);
+		st->cstack = frame->cstack;
+		st->use_file = frame->script_idx;
+		st->command = (frame->return_cmd > 0) ? (frame->return_cmd - 1) : 0;
+		st->loop_depth = frame->loop_depth;
+		if (st->loop_depth > 0)
+			memcpy(st->loop_stack, frame->loop_stack,
+				   sizeof(ForLoopState) * st->loop_depth);
+		st->try_depth = frame->try_depth;
+		if (st->try_depth > 0)
+			memcpy(st->try_stack, frame->try_stack,
+				   sizeof(TryState) * st->try_depth);
+	}
+}
+
+/*
+ * Check if the current SQL error is expected/caught by \expect_error or an
+ * active \try block.  If so, populate caught-error recovery targets on st and
+ * return true.
+ */
+static bool
+checkCaughtError(CState *st, const char *sqlstate)
+{
+	int			d;
+
+	if (st->expect_error)
+	{
+		const char *pat = st->expect_sqlstate;
+
+		st->expect_error = false;
+		st->expect_sqlstate = NULL;
+		if (sqlstateMatches(pat, sqlstate))
+		{
+			st->error_caught = true;
+			st->caught_jump_target = st->command + 1;
+			st->caught_cstack_depth = conditional_stack_depth(st->cstack);
+			st->caught_loop_depth = st->loop_depth;
+			return true;
+		}
+	}
+
+	for (;;)
+	{
+		for (d = st->try_depth - 1; d >= 0; d--)
+		{
+			TryState   *ts = &st->try_stack[d];
+
+			if (!ts->in_catch && sqlstateMatches(ts->sqlstate_pat, sqlstate))
+			{
+				st->error_caught = true;
+				st->caught_cstack_depth = ts->cstack_depth;
+				st->caught_loop_depth = ts->loop_depth;
+				if (ts->catch_cmd != ts->endtry_cmd)
+				{
+					ts->in_catch = true;
+					st->try_depth = d + 1;
+					st->caught_jump_target = ts->catch_cmd + 1;
+				}
+				else
+				{
+					/* \try without \catch: jump directly past \endtry */
+					st->try_depth = d;
+					st->caught_jump_target = ts->endtry_cmd + 1;
+				}
+				return true;
+			}
+		}
+
+		/*
+		 * If we are inside a \call sub-script and no \try block in the current
+		 * frame matched, pop one frame and check the caller's \try stack.
+		 */
+		if (st->call_depth > 0)
+		{
+			CallFrame  *frame = &st->call_stack[--st->call_depth];
+
+			conditional_stack_destroy(st->cstack);
+			st->cstack = frame->cstack;
+			st->use_file = frame->script_idx;
+			st->command = (frame->return_cmd > 0) ? (frame->return_cmd - 1) : 0;
+			st->loop_depth = frame->loop_depth;
+			if (st->loop_depth > 0)
+				memcpy(st->loop_stack, frame->loop_stack,
+					   sizeof(ForLoopState) * st->loop_depth);
+			st->try_depth = frame->try_depth;
+			if (st->try_depth > 0)
+				memcpy(st->try_stack, frame->try_stack,
+					   sizeof(TryState) * st->try_depth);
+		}
+		else
+			break;
+	}
+
+	return false;
+}
+
+/*
  * Process query response from the backend.
  *
  * If varprefix is not NULL, it's the variable name prefix where to store
@@ -353,7 +590,9 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 	 */
 	Assert((meta == META_NONE && varprefix == NULL) ||
 		   ((meta == META_ENDPIPELINE) && varprefix == NULL) ||
-		   ((meta == META_GSET || meta == META_ASET) && varprefix != NULL));
+		   ((meta == META_GSET || meta == META_ASET || meta == META_GSET_COL) && varprefix != NULL));
+
+	st->last_sqlstate[0] = '\0';
 
 	res = PQgetResult(st->con);
 
@@ -369,6 +608,26 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 		{
 			case PGRES_COMMAND_OK:	/* non-SELECT commands */
 			case PGRES_EMPTY_QUERY: /* may be used for testing no-op overhead */
+				if (PQresultStatus(res) == PGRES_COMMAND_OK)
+				{
+					const char *cmdtuples = PQcmdTuples(res);
+					const char *cmdstatus = PQcmdStatus(res);
+
+					st->last_nrows = (cmdtuples != NULL && *cmdtuples != '\0') ?
+						strtoi64(cmdtuples, NULL, 10) : 0;
+					if (cmdstatus != NULL &&
+						pg_strncasecmp(cmdstatus, "ROLLBACK", 8) == 0)
+						st->last_status = "ROLLBACK";
+					else
+						st->last_status = "OK";
+				}
+				else
+				{
+					st->last_nrows = 0;
+					st->last_status = "OK";
+				}
+				strlcpy(st->last_sqlstate, "00000", sizeof(st->last_sqlstate));
+
 				if (is_last && meta == META_GSET)
 				{
 					pg_log_error("client %d script %d command %d query %d: expected one row, got %d",
@@ -376,13 +635,40 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 					st->estatus = ESTATUS_META_COMMAND_ERROR;
 					goto error;
 				}
+				if (is_last && meta == META_GSET_COL)
+				{
+					pg_log_error("client %d script %d command %d query %d: expected tuples, got command status",
+								 st->id, st->use_file, st->command, qrynum);
+					st->estatus = ESTATUS_META_COMMAND_ERROR;
+					goto error;
+				}
+				if (is_last &&
+					sql_script[st->use_file].commands[st->command]->meta_varprefix != NULL)
+				{
+					if (!populateGSetMeta(st,
+										  sql_script[st->use_file].commands[st->command]->meta_varprefix))
+						goto error;
+				}
 				break;
 
 			case PGRES_TUPLES_OK:
-				if ((is_last && meta == META_GSET) || meta == META_ASET)
+				st->last_nrows = PQntuples(res);
+				st->last_status = "OK";
+				strlcpy(st->last_sqlstate, "00000", sizeof(st->last_sqlstate));
+
+				if ((is_last && (meta == META_GSET || meta == META_GSET_COL)) ||
+					meta == META_ASET)
 				{
 					if (!processGSetResult(st, sql_script[st->use_file].commands[st->command],
 										   res, is_last, qrynum))
+						goto error;
+				}
+				if (is_last &&
+					sql_script[st->use_file].commands[st->command]->meta_varprefix != NULL)
+				{
+					if (!processGSetMetaResult(st,
+											   sql_script[st->use_file].commands[st->command],
+											   res))
 						goto error;
 				}
 				/* otherwise the result is simply thrown away by PQclear below */
@@ -413,13 +699,28 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 
 			case PGRES_NONFATAL_ERROR:
 			case PGRES_FATAL_ERROR:
-				st->estatus = getSQLErrorStatus(st, PQresultErrorField(res,
-																	   PG_DIAG_SQLSTATE));
-				if (canRetryError(st->estatus) || canContinueOnError(st->estatus))
 				{
-					if (verbose_errors)
-						commandError(st, PQresultErrorMessage(res));
-					goto error;
+					const char *sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+
+					st->last_status = "ERROR";
+					st->last_nrows = 0;
+					strlcpy(st->last_sqlstate,
+							(sqlstate && *sqlstate) ? sqlstate : "XX000",
+							sizeof(st->last_sqlstate));
+					st->estatus = getSQLErrorStatus(st, sqlstate);
+					if (st->estatus != ESTATUS_CONN_ERROR &&
+						checkCaughtError(st, st->last_sqlstate))
+					{
+						if (verbose_errors)
+							commandError(st, PQresultErrorMessage(res));
+						goto error;
+					}
+					if (canRetryError(st->estatus) || canContinueOnError(st->estatus))
+					{
+						if (verbose_errors)
+							commandError(st, PQresultErrorMessage(res));
+						goto error;
+					}
 				}
 				pg_fallthrough;
 
@@ -643,6 +944,139 @@ printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 }
 
 /*
+ * Check if an SQL command string is a standalone ROLLBACK statement.
+ */
+static bool
+isStandaloneRollback(const char *sql)
+{
+	const char *p = sql;
+
+	while (isspace((unsigned char) *p))
+		p++;
+	if (pg_strncasecmp(p, "rollback", 8) != 0)
+		return false;
+	p += 8;
+	while (isspace((unsigned char) *p) || *p == ';')
+		p++;
+	return (*p == '\0');
+}
+
+/*
+ * Complete recovery from an error caught by \try ... \catch or \expect_error.
+ */
+static void
+finishCaughtError(TState *thread, CState *st)
+{
+	Command    *cmd = sql_script[st->use_file].commands[st->command];
+
+	thread->stats.expected_rollbacks++;
+	if (per_script_stats)
+		sql_script[st->use_file].stats.expected_rollbacks++;
+
+	if (cmd->meta_varprefix != NULL)
+	{
+		if (!populateGSetMeta(st, cmd->meta_varprefix))
+		{
+			st->state = CSTATE_ABORTED;
+			return;
+		}
+	}
+
+	st->error_caught = false;
+	st->estatus = ESTATUS_NO_ERROR;
+	st->next_command = st->caught_jump_target;
+	st->state = CSTATE_END_COMMAND;
+}
+
+/*
+ * Return the effective per-thread throttle delay in microseconds.
+ */
+static inline double
+getThreadThrottleDelay(const TState *thread)
+{
+	if (thread->group_id >= 0 &&
+		client_groups[thread->group_id].throttle_delay > 0)
+		return client_groups[thread->group_id].throttle_delay;
+	return throttle_delay;
+}
+
+/*
+ * Choose a script index from a client group's script list.
+ */
+static int
+chooseGroupScript(const ClientGroup *grp, CState *st, pg_prng_state *random_state)
+{
+	int			i = 0;
+	int64		w;
+
+	if (grp->sequential)
+	{
+		int			idx = grp->script_indices[st->seq_counter % grp->num_scripts];
+
+		st->seq_counter++;
+		return idx;
+	}
+
+	if (grp->num_scripts == 1)
+		return grp->script_indices[0];
+
+	w = pgbench_random(random_state, 0, grp->total_weight - 1);
+	do
+	{
+		w -= sql_script[grp->script_indices[i++]].weight;
+	} while (w >= 0);
+
+	return grp->script_indices[i - 1];
+}
+
+/*
+ * Check whether a client waiting on an unsatisfied causal watermark in
+ * CSTATE_WAIT_SYNC is deadlocked because all unfinished clients across all
+ * threads are either finished/aborted or also blocked on unsatisfied causal
+ * watermarks.
+ */
+static bool
+isCausalWatermarkDeadlocked(TState *thread, CState *st)
+{
+	TState	   *all_threads = thread - thread->tid;
+
+	for (int pass = 0; pass < 2; pass++)
+	{
+		if (getWatermarkChan(st->sync_dep_channel) >= st->sync_dep_watermark)
+			return false;
+
+		for (int t = 0; t < nthreads; t++)
+		{
+			TState	   *th = &all_threads[t];
+
+			for (int i = 0; i < th->nstate; i++)
+			{
+				CState	   *c = &th->state[i];
+				ConnectionStateEnum cstate = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+
+				if (cstate == CSTATE_FINISHED || cstate == CSTATE_ABORTED)
+					continue;
+
+				if (cstate == CSTATE_WAIT_SYNC)
+				{
+					bool		has_dep = __atomic_load_n(&c->has_sync_dep, __ATOMIC_ACQUIRE);
+					int			chan = __atomic_load_n(&c->sync_dep_channel, __ATOMIC_ACQUIRE);
+					int64		dep_wm = __atomic_load_n(&c->sync_dep_watermark, __ATOMIC_ACQUIRE);
+
+					if (has_dep && getWatermarkChan(chan) < dep_wm)
+						continue;
+				}
+
+				/* Found at least one client that can still make progress */
+				return false;
+			}
+		}
+	}
+
+	return (getWatermarkChan(st->sync_dep_channel) < st->sync_dep_watermark);
+}
+
+/*
  * Advance the state machine of a connection.
  */
 static void
@@ -658,6 +1092,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 	 * expressions, which might take a non-negligible amount of time, though.
 	 */
 	pg_time_usec_t now = 0;
+	double		eff_throttle_delay = getThreadThrottleDelay(thread);
 
 	/*
 	 * Loop in the state machine, until we have to wait for a result from the
@@ -676,7 +1111,12 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 		{
 				/* Select transaction (script) to run.  */
 			case CSTATE_CHOOSE_SCRIPT:
-				st->use_file = chooseScript(&thread->ts_choose_rs);
+				unwindCallStack(st);
+				if (st->group_id >= 0)
+					st->use_file = chooseGroupScript(&client_groups[st->group_id],
+													 st, &thread->ts_choose_rs);
+				else
+					st->use_file = chooseScript(&thread->ts_choose_rs);
 				Assert(conditional_stack_empty(st->cstack));
 
 				/* reset transaction variables to default values */
@@ -691,12 +1131,13 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * a new transaction, or to get throttled if that's requested.
 				 */
 				st->state = timer_exceeded ? CSTATE_FINISHED :
-					throttle_delay > 0 ? CSTATE_PREPARE_THROTTLE : CSTATE_START_TX;
+					eff_throttle_delay > 0 ? CSTATE_PREPARE_THROTTLE : CSTATE_START_TX;
 				break;
 
 				/* Start new transaction (script) */
 			case CSTATE_START_TX:
 				pg_time_now_lazy(&now);
+				st->bench_start_us = thread->bench_start;
 
 				/* establish connection if needed, i.e. under --connect */
 				if (st->con == NULL)
@@ -720,8 +1161,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					thread->conn_duration += now - start;
 
 					/* Reset session-local state */
-					pg_free(st->prepared);
-					st->prepared = NULL;
+					freeCStatePrepared(st);
 				}
 
 				/*
@@ -738,12 +1178,32 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * When not throttling, this is also the transaction's
 				 * scheduled start time.
 				 */
-				if (!throttle_delay)
+				if (!eff_throttle_delay)
 					st->txn_scheduled = now;
 
 				/* Begin with the first command */
 				st->state = CSTATE_START_COMMAND;
 				st->command = 0;
+				st->next_command = -1;
+				st->loop_depth = 0;
+				st->try_depth = 0;
+				unwindCallStack(st);
+				cancelDependentWrite(st);
+				st->expect_error = false;
+				st->expect_sqlstate = NULL;
+				st->error_caught = false;
+				st->txn_keying_time = 0;
+				st->txn_think_time = 0;
+				st->has_keying_time = false;
+				st->has_think_time = false;
+				st->sleep_type = META_NONE;
+				st->has_sync_dep = false;
+				st->sync_dep_watermark = 0;
+				st->sync_scheduled_us = 0;
+				st->has_scheduled_time = false;
+				st->txn_recall_count = 0;
+				st->txn_validation_passed = 0;
+				st->txn_validation_failed = 0;
 				break;
 
 				/*
@@ -760,10 +1220,10 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * than a transaction, the next transaction will start right
 				 * away.
 				 */
-				Assert(throttle_delay > 0);
+				Assert(eff_throttle_delay > 0);
 
 				thread->throttle_trigger +=
-					pgbench_random_poisson(&thread->ts_throttle_rs, throttle_delay);
+					pgbench_random_poisson(&thread->ts_throttle_rs, eff_throttle_delay);
 				st->txn_scheduled = thread->throttle_trigger;
 
 				/*
@@ -831,12 +1291,59 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				command = sql_script[st->use_file].commands[st->command];
 
 				/*
+				 * If we reached the end of a \call sub-script, pop the call
+				 * frame, record sub-script execution latency, and resume the
+				 * caller script at return_cmd without ending the transaction.
+				 */
+				if (command == NULL && st->call_depth > 0)
+				{
+					int			called_script = st->use_file;
+					CallFrame  *frame = &st->call_stack[--st->call_depth];
+					double		call_lat;
+
+					Assert(conditional_stack_empty(st->cstack));
+					conditional_stack_destroy(st->cstack);
+
+					pg_time_now_lazy(&now);
+					call_lat = (double) (now - frame->call_begin);
+					if (call_lat < 0.0)
+						call_lat = 0.0;
+					accumStats(&sql_script[called_script].stats, false,
+							   call_lat, 0.0, ESTATUS_NO_ERROR, 1, false);
+
+					st->cstack = frame->cstack;
+					st->use_file = frame->script_idx;
+					st->command = frame->return_cmd;
+					st->next_command = -1;
+					st->loop_depth = frame->loop_depth;
+					if (st->loop_depth > 0)
+						memcpy(st->loop_stack, frame->loop_stack,
+							   sizeof(ForLoopState) * st->loop_depth);
+					st->try_depth = frame->try_depth;
+					if (st->try_depth > 0)
+						memcpy(st->try_stack, frame->try_stack,
+							   sizeof(TryState) * st->try_depth);
+
+					if (report_per_command && frame->return_cmd > 0)
+					{
+						Command    *call_cmd = sql_script[st->use_file].commands[frame->return_cmd - 1];
+
+						addToSimpleStats(&call_cmd->stats,
+										 PG_TIME_GET_DOUBLE(now - frame->call_begin));
+					}
+
+					st->state = conditional_active(st->cstack) ?
+						CSTATE_START_COMMAND : CSTATE_SKIP_COMMAND;
+					break;
+				}
+
+				/*
 				 * Transition to script end processing if done, but close up
 				 * shop if a pipeline is open at this point.
 				 */
 				if (command == NULL)
 				{
-					if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
+					if (st->con == NULL || PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
 						st->state = CSTATE_END_TX;
 					else
 					{
@@ -858,7 +1365,52 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				/* Execute the command */
 				if (command->type == SQL_COMMAND)
 				{
-					/* disallow \aset and \gset in pipeline mode */
+					if (st->con == NULL)
+					{
+						pg_time_usec_t start;
+
+						pg_time_now_lazy(&now);
+						start = now;
+						if ((st->con = doConnect()) == NULL)
+						{
+							pg_log_error("client %d aborted while establishing connection",
+										 st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+						now = pg_time_now();
+						thread->conn_duration += now - start;
+						(void) __atomic_fetch_add(&active_sessions_count, 1, __ATOMIC_RELAXED);
+						freeCStatePrepared(st);
+					}
+
+					/*
+					 * If we are inside a \catch block and the connection was
+					 * already rolled back to idle by pgbench's automatic
+					 * rollback recovery, treat an explicit ROLLBACK statement
+					 * as a no-op so the backend doesn't emit a "there is no
+					 * transaction in progress" warning.
+					 */
+					if (st->try_depth > 0 &&
+						st->try_stack[st->try_depth - 1].in_catch &&
+						PQpipelineStatus(st->con) == PQ_PIPELINE_OFF &&
+						getTransactionStatus(st->con) == TSTATUS_IDLE &&
+						isStandaloneRollback(command->argv[0]))
+					{
+						st->last_status = "ROLLBACK";
+						if (command->meta_varprefix != NULL)
+						{
+							if (!populateGSetMeta(st, command->meta_varprefix))
+							{
+								st->state = CSTATE_ABORTED;
+								break;
+							}
+						}
+						st->state = CSTATE_END_COMMAND;
+						break;
+					}
+
+					/* disallow \aset, \gset, and \gset_meta in pipeline mode */
 					if (PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
 					{
 						if (command->meta == META_GSET)
@@ -870,6 +1422,12 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 						else if (command->meta == META_ASET)
 						{
 							commandFailed(st, "aset", "\\aset is not allowed in pipeline mode");
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+						else if (command->meta_varprefix != NULL)
+						{
+							commandFailed(st, "gset_meta", "\\gset_meta is not allowed in pipeline mode");
 							st->state = CSTATE_ABORTED;
 							break;
 						}
@@ -895,6 +1453,11 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					 * Possible state changes when executing meta commands:
 					 * - on errors CSTATE_ABORTED
 					 * - on sleep CSTATE_SLEEP
+					 * - on wait_until CSTATE_WAIT_SYNC
+					 * - on phase_barrier CSTATE_WAIT_PHASE_BARRIER
+					 * - on session_connect CSTATE_CONNECTING
+					 * - on session_disconnect CSTATE_DISCONNECTING
+					 * - on call CSTATE_START_COMMAND
 					 * - else CSTATE_END_COMMAND
 					 */
 					st->state = executeMetaCommand(st, &now);
@@ -909,7 +1472,13 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 				Assert(st->state == CSTATE_WAIT_RESULT ||
 					   st->state == CSTATE_END_COMMAND ||
+					   st->state == CSTATE_START_COMMAND ||
 					   st->state == CSTATE_SLEEP ||
+					   st->state == CSTATE_WAIT_SYNC ||
+					   st->state == CSTATE_WAIT_PHASE_BARRIER ||
+					   st->state == CSTATE_IDLE ||
+					   st->state == CSTATE_CONNECTING ||
+					   st->state == CSTATE_DISCONNECTING ||
 					   st->state == CSTATE_ABORTED);
 				break;
 
@@ -957,7 +1526,9 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					if (PQpipelineStatus(st->con) != PQ_PIPELINE_ON)
 						st->state = CSTATE_END_COMMAND;
 				}
-				else if (canRetryError(st->estatus) || canContinueOnError(st->estatus))
+				else if (st->error_caught ||
+						 canRetryError(st->estatus) ||
+						 canContinueOnError(st->estatus))
 					st->state = CSTATE_ERROR;
 				else
 					st->state = CSTATE_ABORTED;
@@ -965,22 +1536,192 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 
 				/*
 				 * Wait until sleep is done. This state is entered after a
-				 * \sleep metacommand. The behavior is similar to
-				 * CSTATE_THROTTLE, but proceeds to CSTATE_START_COMMAND
-				 * instead of CSTATE_START_TX.
+				 * \sleep, \keying_time, or \think_time metacommand. The
+				 * behavior is similar to CSTATE_THROTTLE, but proceeds to
+				 * CSTATE_START_COMMAND instead of CSTATE_START_TX.
 				 */
 			case CSTATE_SLEEP:
 				pg_time_now_lazy(&now);
 				if (now < st->sleep_until)
 					return;		/* still sleeping, nothing to do here */
 				/* Else done sleeping. */
+				if (st->sleep_type == META_KEYING_TIME)
+					st->txn_keying_time += (now - st->sleep_begin);
+				else if (st->sleep_type == META_THINK_TIME)
+					st->txn_think_time += (now - st->sleep_begin);
+				st->sleep_type = META_NONE;
 				st->state = CSTATE_END_COMMAND;
 				break;
+
+				/*
+				 * Wait until causal watermark and/or scheduled timestamp is
+				 * reached (\wait_until).
+				 */
+			case CSTATE_WAIT_SYNC:
+				if (st->has_sync_dep &&
+					getWatermarkChan(st->sync_dep_channel) < st->sync_dep_watermark)
+				{
+					if (__atomic_load_n(&aborted_clients_count, __ATOMIC_ACQUIRE) > 0)
+					{
+						pg_log_error("client %d aborted while waiting for causal watermark because another client aborted",
+									 st->id);
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+					if (isCausalWatermarkDeadlocked(thread, st))
+					{
+						pg_log_error("client %d aborted while waiting for causal watermark " INT64_FORMAT " on channel %d: no active client can advance the watermark",
+									 st->id, st->sync_dep_watermark, st->sync_dep_channel);
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+					return;
+				}
+				pg_time_now_lazy(&now);
+				if (st->sync_scheduled_us > 0 && now < st->sync_scheduled_us)
+					return;
+				if (st->has_scheduled_time)
+					st->txn_begin = now;
+				st->state = CSTATE_END_COMMAND;
+				st->has_sync_dep = false;
+				st->sync_dep_watermark = 0;
+				st->sync_dep_channel = 0;
+				st->sync_scheduled_us = 0;
+				break;
+
+				/*
+				 * Wait until all active clients reach \phase_barrier.
+				 */
+			case CSTATE_WAIT_PHASE_BARRIER:
+				if (__atomic_load_n(&aborted_clients_count, __ATOMIC_ACQUIRE) > 0)
+				{
+					pg_log_error("client %d aborted while waiting at phase barrier because another client aborted",
+								 st->id);
+					st->state = CSTATE_ABORTED;
+					break;
+				}
+				if (checkPhaseBarrierReady(st))
+				{
+					st->state = CSTATE_END_COMMAND;
+					break;
+				}
+				return;
+
+			case CSTATE_IDLE:
+				{
+					if (max_concurrent_sessions > 0)
+					{
+						int			cur = __atomic_load_n(&active_sessions_count, __ATOMIC_ACQUIRE);
+
+						while (cur < max_concurrent_sessions)
+						{
+							if (__atomic_compare_exchange_n(&active_sessions_count,
+															&cur, cur + 1, true,
+															__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+								goto session_slot_acquired;
+						}
+						return; /* wait for an active session to disconnect */
+					}
+					else
+					{
+						(void) __atomic_fetch_add(&active_sessions_count, 1, __ATOMIC_RELAXED);
+					}
+
+session_slot_acquired:
+					pg_time_now_lazy(&now);
+					st->session_conn_start = now;
+					st->con = doConnectAsync(st->session_target_db, st->session_target_user);
+					if (st->con == NULL)
+					{
+						(void) __atomic_fetch_sub(&active_sessions_count, 1, __ATOMIC_RELEASE);
+						if (max_concurrent_sessions > 0)
+							wakeWatermarkWaiters();
+						commandFailed(st, "session_connect",
+									  "could not initiate asynchronous connection");
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+					st->connect_poll_mode = (int) PGRES_POLLING_WRITING;
+					st->state = CSTATE_CONNECTING;
+					break;
+				}
+
+				/*
+				 * Drive non-blocking libpq connection establishment via
+				 * PQconnectPoll() (\session_connect).
+				 */
+			case CSTATE_CONNECTING:
+				{
+					PostgresPollingStatusType pstatus = PQconnectPoll(st->con);
+
+					if (pstatus == PGRES_POLLING_OK)
+					{
+						now = pg_time_now();
+						if (st->session_conn_start > 0)
+						{
+							thread->conn_duration += now - st->session_conn_start;
+							st->session_conn_start = 0;
+						}
+						st->state = CSTATE_END_COMMAND;
+						break;
+					}
+					else if (pstatus == PGRES_POLLING_READING ||
+							 pstatus == PGRES_POLLING_WRITING)
+					{
+						st->connect_poll_mode = (int) pstatus;
+						return;
+					}
+					else
+					{
+						pg_log_error("client %d asynchronous connection failed: %s",
+									 st->id, PQerrorMessage(st->con));
+						finishCon(st);
+						st->estatus = ESTATUS_CONN_ERROR;
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+				}
+
+				/*
+				 * Disconnect active backend session (\session_disconnect).
+				 */
+			case CSTATE_DISCONNECTING:
+				{
+					pg_time_usec_t start;
+
+					pg_time_now_lazy(&now);
+					start = now;
+					finishCon(st);
+					freeCStatePrepared(st);
+					now = pg_time_now();
+					thread->conn_duration += now - start;
+					st->state = CSTATE_END_COMMAND;
+					break;
+				}
 
 				/*
 				 * End of command: record stats and proceed to next command.
 				 */
 			case CSTATE_END_COMMAND:
+
+				command = sql_script[st->use_file].commands[st->command];
+
+				/*
+				 * If a SQL command (or pipeline) succeeded, clear any one-shot
+				 * \expect_error flag that was set before it.  In pipeline mode,
+				 * SQL results are read at \endpipeline, so keep expect_error
+				 * armed until the pipeline finishes.
+				 */
+				if (st->expect_error &&
+					((command->type == SQL_COMMAND &&
+					  (st->con == NULL || PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)) ||
+					 (command->type == META_COMMAND &&
+					  (command->meta == META_ENDPIPELINE ||
+					   command->meta == META_SYNCPIPELINE))))
+				{
+					st->expect_error = false;
+					st->expect_sqlstate = NULL;
+				}
 
 				/*
 				 * command completed: accumulate per-command execution times
@@ -991,14 +1732,20 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				{
 					pg_time_now_lazy(&now);
 
-					command = sql_script[st->use_file].commands[st->command];
 					/* XXX could use a mutex here, but we choose not to */
 					addToSimpleStats(&command->stats,
 									 PG_TIME_GET_DOUBLE(now - st->stmt_begin));
 				}
 
 				/* Go ahead with next command, to be executed or skipped */
-				st->command++;
+				if (st->next_command >= 0)
+				{
+					st->command = st->next_command;
+					st->next_command = -1;
+				}
+				else
+					st->command++;
+
 				st->state = conditional_active(st->cstack) ?
 					CSTATE_START_COMMAND : CSTATE_SKIP_COMMAND;
 				break;
@@ -1011,9 +1758,24 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					TStatus		tstatus;
 
 					Assert(st->estatus != ESTATUS_NO_ERROR);
+					cancelDependentWrite(st);
 
-					/* Clear the conditional stack */
-					conditional_stack_reset(st->cstack);
+					if (st->error_caught)
+					{
+						while (conditional_stack_depth(st->cstack) > st->caught_cstack_depth)
+							conditional_stack_pop(st->cstack);
+						st->loop_depth = st->caught_loop_depth;
+					}
+					else
+					{
+						/* Clear the conditional and control flow stacks */
+						unwindCallStack(st);
+						conditional_stack_reset(st->cstack);
+						st->loop_depth = 0;
+						st->try_depth = 0;
+						st->expect_error = false;
+						st->expect_sqlstate = NULL;
+					}
 
 					/* Read and discard until a sync point in pipeline mode */
 					if (PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
@@ -1032,6 +1794,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					tstatus = getTransactionStatus(st->con);
 					if (tstatus == TSTATUS_IN_BLOCK)
 					{
+						st->last_status = "ROLLBACK";
+
 						/* Try to rollback a (failed) transaction block. */
 						if (!PQsendQuery(st->con, "ROLLBACK"))
 						{
@@ -1044,12 +1808,17 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					}
 					else if (tstatus == TSTATUS_IDLE)
 					{
-						/*
-						 * If time is over, we're done; otherwise, check if we
-						 * can retry the error.
-						 */
-						st->state = timer_exceeded ? CSTATE_FINISHED :
-							doRetry(st, &now) ? CSTATE_RETRY : CSTATE_FAILURE;
+						if (st->error_caught)
+							finishCaughtError(thread, st);
+						else
+						{
+							/*
+							 * If time is over, we're done; otherwise, check
+							 * if we can retry the error.
+							 */
+							st->state = timer_exceeded ? CSTATE_FINISHED :
+								doRetry(st, &now) ? CSTATE_RETRY : CSTATE_FAILURE;
+						}
 					}
 					else
 					{
@@ -1093,12 +1862,17 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 							res = PQgetResult(st->con);
 							Assert(res == NULL);
 
-							/*
-							 * If time is over, we're done; otherwise, check
-							 * if we can retry the error.
-							 */
-							st->state = timer_exceeded ? CSTATE_FINISHED :
-								doRetry(st, &now) ? CSTATE_RETRY : CSTATE_FAILURE;
+							if (st->error_caught)
+								finishCaughtError(thread, st);
+							else
+							{
+								/*
+								 * If time is over, we're done; otherwise,
+								 * check if we can retry the error.
+								 */
+								st->state = timer_exceeded ? CSTATE_FINISHED :
+									doRetry(st, &now) ? CSTATE_RETRY : CSTATE_FAILURE;
+							}
 							break;
 						default:
 							pg_log_error("client %d aborted while rolling back the transaction after an error; %s",
@@ -1114,6 +1888,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * Retry the transaction after an error.
 				 */
 			case CSTATE_RETRY:
+				unwindCallStack(st);
+				cancelDependentWrite(st);
 				command = sql_script[st->use_file].commands[st->command];
 
 				/*
@@ -1135,6 +1911,22 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 
 				/* Process the first transaction command. */
 				st->command = 0;
+				st->next_command = -1;
+				st->loop_depth = 0;
+				st->try_depth = 0;
+				st->expect_error = false;
+				st->expect_sqlstate = NULL;
+				st->error_caught = false;
+				st->txn_keying_time = 0;
+				st->txn_think_time = 0;
+				st->has_keying_time = false;
+				st->has_think_time = false;
+				st->sleep_type = META_NONE;
+				st->has_sync_dep = false;
+				st->sync_dep_watermark = 0;
+				st->sync_scheduled_us = 0;
+				st->txn_validation_passed = 0;
+				st->txn_validation_failed = 0;
 				st->estatus = ESTATUS_NO_ERROR;
 				st->state = CSTATE_START_COMMAND;
 				break;
@@ -1143,6 +1935,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * Record a failed transaction.
 				 */
 			case CSTATE_FAILURE:
+				unwindCallStack(st);
+				cancelDependentWrite(st);
 				command = sql_script[st->use_file].commands[st->command];
 
 				/* Accumulate the failure. */
@@ -1163,7 +1957,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 			case CSTATE_END_TX:
 				{
-					TStatus		tstatus;
+					cancelDependentWrite(st);
 
 					/* transaction finished: calculate latency and do log */
 					processXactStats(thread, st, &now, false, agg);
@@ -1178,22 +1972,26 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					 * We must complete all the transaction blocks that were
 					 * started in this script.
 					 */
-					tstatus = getTransactionStatus(st->con);
-					if (tstatus == TSTATUS_IN_BLOCK)
+					if (st->con != NULL)
 					{
-						pg_log_error("client %d aborted: end of script reached without completing the last transaction",
-									 st->id);
-						st->state = CSTATE_ABORTED;
-						break;
-					}
-					else if (tstatus != TSTATUS_IDLE)
-					{
-						if (tstatus == TSTATUS_CONN_ERROR)
-							pg_log_error("perhaps the backend died while processing");
+						TStatus		tstatus = getTransactionStatus(st->con);
 
-						pg_log_error("client %d aborted while receiving the transaction status", st->id);
-						st->state = CSTATE_ABORTED;
-						break;
+						if (tstatus == TSTATUS_IN_BLOCK)
+						{
+							pg_log_error("client %d aborted: end of script reached without completing the last transaction",
+										 st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+						else if (tstatus != TSTATUS_IDLE)
+						{
+							if (tstatus == TSTATUS_CONN_ERROR)
+								pg_log_error("perhaps the backend died while processing");
+
+							pg_log_error("client %d aborted while receiving the transaction status", st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
 					}
 
 					if (is_connect)
@@ -1202,6 +2000,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 
 						pg_time_now_lazy(&start);
 						finishCon(st);
+						freeCStatePrepared(st);
 						now = pg_time_now();
 						thread->conn_duration += now - start;
 					}
@@ -1229,6 +2028,11 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 			case CSTATE_ABORTED:
 			case CSTATE_FINISHED:
+				cancelDependentWrite(st);
+				notifyPhaseBarrierClientDone(st);
+				if (st->state == CSTATE_ABORTED)
+					(void) __atomic_fetch_add(&aborted_clients_count, 1, __ATOMIC_RELEASE);
+				wakeWatermarkWaiters();
 
 				/*
 				 * Don't measure the disconnection delays here even if in
@@ -1242,7 +2046,9 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * necessary because we cannot report complete results anyways
 				 * in this case.
 				 */
+				unwindCallStack(st);
 				finishCon(st);
+				freeCStatePrepared(st);
 				return;
 		}
 	}
@@ -1263,6 +2069,7 @@ doLog(TState *thread, CState *st,
 {
 	FILE	   *logfile = thread->logfile;
 	pg_time_usec_t now = pg_time_now() + epoch_shift;
+	bool		has_throttle = (getThreadThrottleDelay(thread) > 0);
 
 	Assert(use_log);
 
@@ -1307,7 +2114,7 @@ doLog(TState *thread, CState *st,
 					agg->latency.min,
 					agg->latency.max);
 
-			if (throttle_delay)
+			if (has_throttle)
 			{
 				lag_sum = agg->lag.sum;
 				lag_sum2 = agg->lag.sum2;
@@ -1349,7 +2156,7 @@ doLog(TState *thread, CState *st,
 		}
 
 		/* accumulate the current transaction */
-		accumStats(agg, tx_skipped, latency, lag, st->estatus, st->tries, throttle_delay > 0);
+		accumStats(agg, tx_skipped, latency, lag, st->estatus, st->tries, has_throttle);
 	}
 	else
 	{
@@ -1365,7 +2172,7 @@ doLog(TState *thread, CState *st,
 					st->id, st->cnt, getResultString(tx_skipped, st->estatus, failures_detailed),
 					st->use_file, now / 1000000, now % 1000000);
 
-		if (throttle_delay)
+		if (has_throttle)
 			fprintf(logfile, " %.0f", lag);
 		if (max_tries != 1)
 			fprintf(logfile, " %u", st->tries - 1);
@@ -1386,20 +2193,59 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 {
 	double		latency = 0.0,
 				lag = 0.0;
-	bool		detailed = progress || throttle_delay || latency_limit ||
-		use_log || per_script_stats;
+	double		eff_throttle_delay = getThreadThrottleDelay(thread);
+	bool		has_schedule = (eff_throttle_delay > 0 || st->has_scheduled_time);
+	bool		has_pacing = (st->has_keying_time || st->has_think_time);
+	bool		detailed = progress || has_schedule || latency_limit ||
+		use_log || per_script_stats || num_groups > 0 || num_slas > 0 ||
+		json_report_file != NULL || has_pacing || st->txn_recall_count > 0 ||
+		st->txn_validation_passed > 0 || st->txn_validation_failed > 0;
 
 	if (detailed && !tx_skipped && st->estatus == ESTATUS_NO_ERROR)
 	{
 		pg_time_now_lazy(now);
 
-		/* compute latency & lag */
-		latency = (*now) - st->txn_scheduled;
+		/*
+		 * Compute latency & lag; exclude explicit keying_time and think_time
+		 * so transaction latency measures server turnaround time.
+		 */
+		latency = (*now) - st->txn_scheduled -
+			(st->txn_keying_time + st->txn_think_time);
+		if (latency < 0.0)
+			latency = 0.0;
 		lag = st->txn_begin - st->txn_scheduled;
+		if (lag < 0.0)
+			lag = 0.0;
 	}
 
 	/* keep detailed thread stats */
-	accumStats(&thread->stats, tx_skipped, latency, lag, st->estatus, st->tries, throttle_delay > 0);
+	accumStats(&thread->stats, tx_skipped, latency, lag, st->estatus, st->tries, has_schedule);
+	if (!tx_skipped && st->estatus == ESTATUS_NO_ERROR)
+	{
+		bool		has_unnamed = false;
+
+		if (has_schedule)
+			addToLagStats(&thread->stats, lag, ontime_threshold_ms * 1000.0);
+
+		for (int r = 0; r < st->txn_recall_count; r++)
+		{
+			if (st->txn_recall_names[r][0] != '\0')
+				addToNamedRecallStats(&thread->stats, st->txn_recall_names[r], st->txn_recalls[r]);
+			else
+			{
+				addToRecallStats(&thread->stats, st->txn_recalls[r]);
+				has_unnamed = true;
+			}
+		}
+		if (!has_unnamed && st->txn_recall_count > 0)
+			addToRecallStats(&thread->stats, st->txn_recalls[0]);
+		thread->stats.validation_passed += st->txn_validation_passed;
+		thread->stats.validation_failed += st->txn_validation_failed;
+		if (st->has_keying_time)
+			addToSimpleStats(&thread->stats.keying_time, (double) st->txn_keying_time);
+		if (st->has_think_time)
+			addToSimpleStats(&thread->stats.think_time, (double) st->txn_think_time);
+	}
 
 	/* count transactions over the latency limit, if needed */
 	if (latency_limit && latency > latency_limit)
@@ -1413,8 +2259,44 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 
 	/* XXX could use a mutex here, but we choose not to */
 	if (per_script_stats)
+	{
 		accumStats(&sql_script[st->use_file].stats, tx_skipped, latency, lag,
-				   st->estatus, st->tries, throttle_delay > 0);
+				   st->estatus, st->tries, has_schedule);
+		if (!tx_skipped && st->estatus == ESTATUS_NO_ERROR)
+		{
+			bool		has_unnamed_s = false;
+
+			if (has_schedule)
+				addToLagStats(&sql_script[st->use_file].stats, lag,
+							  ontime_threshold_ms * 1000.0);
+			for (int r = 0; r < st->txn_recall_count; r++)
+			{
+				if (st->txn_recall_names[r][0] != '\0')
+					addToNamedRecallStats(&sql_script[st->use_file].stats,
+										  st->txn_recall_names[r],
+										  st->txn_recalls[r]);
+				else
+				{
+					addToRecallStats(&sql_script[st->use_file].stats,
+									 st->txn_recalls[r]);
+					has_unnamed_s = true;
+				}
+			}
+			if (!has_unnamed_s && st->txn_recall_count > 0)
+				addToRecallStats(&sql_script[st->use_file].stats,
+								 st->txn_recalls[0]);
+			sql_script[st->use_file].stats.validation_passed += st->txn_validation_passed;
+			sql_script[st->use_file].stats.validation_failed += st->txn_validation_failed;
+			if (st->has_keying_time)
+				addToSimpleStats(&sql_script[st->use_file].stats.keying_time,
+								 (double) st->txn_keying_time);
+			if (st->has_think_time)
+				addToSimpleStats(&sql_script[st->use_file].stats.think_time,
+								 (double) st->txn_think_time);
+		}
+	}
+
+	st->txn_recall_count = 0;
 }
 
 
@@ -1549,6 +2431,52 @@ printVersion(PGconn *con)
 	fflush(stdout);
 }
 
+/*
+ * Print a JSON-escaped double-quoted string to fp.
+ */
+static void
+fprintJsonString(FILE *fp, const char *str)
+{
+	fputc('"', fp);
+	if (str != NULL)
+	{
+		for (const unsigned char *p = (const unsigned char *) str; *p != '\0'; p++)
+		{
+			switch (*p)
+			{
+				case '"':
+					fputs("\\\"", fp);
+					break;
+				case '\\':
+					fputs("\\\\", fp);
+					break;
+				case '\b':
+					fputs("\\b", fp);
+					break;
+				case '\f':
+					fputs("\\f", fp);
+					break;
+				case '\n':
+					fputs("\\n", fp);
+					break;
+				case '\r':
+					fputs("\\r", fp);
+					break;
+				case '\t':
+					fputs("\\t", fp);
+					break;
+				default:
+					if (*p < 0x20)
+						fprintf(fp, "\\u%04x", (unsigned int) *p);
+					else
+						fputc(*p, fp);
+					break;
+			}
+		}
+	}
+	fputc('"', fp);
+}
+
 /* print out results */
 void
 printResults(StatsData *total,
@@ -1602,6 +2530,11 @@ printResults(StatsData *total,
 	printf("number of failed transactions: " INT64_FORMAT " (%.3f%%)\n",
 		   failures, 100.0 * failures / total_cnt);
 
+	if (total->expected_rollbacks > 0)
+		printf("number of expected rollbacks: " INT64_FORMAT " (%.3f%%)\n",
+			   total->expected_rollbacks,
+			   100.0 * total->expected_rollbacks / total_cnt);
+
 	if (failures_detailed)
 	{
 		printf("number of serialization failures: " INT64_FORMAT " (%.3f%%)\n",
@@ -1632,8 +2565,14 @@ printResults(StatsData *total,
 			   latency_limit / 1000.0, latency_late, total->cnt,
 			   (total->cnt > 0) ? 100.0 * latency_late / total->cnt : 0.0);
 
-	if (throttle_delay || progress || latency_limit)
+	if (throttle_delay || progress || latency_limit || num_groups > 0 ||
+		num_slas > 0 || json_report_file != NULL ||
+		total->keying_time.count > 0 || total->think_time.count > 0 ||
+		total->lag_hist_count > 0 || total->recall.count > 0)
+	{
 		printSimpleStats("latency", &total->latency);
+		printLatencyPercentiles("latency percentiles", total);
+	}
 	else
 	{
 		/* no measurement, show average latency computed from run time */
@@ -1641,6 +2580,15 @@ printResults(StatsData *total,
 			   0.001 * total_duration * nclients / total_cnt,
 			   failures > 0 ? " (including failures)" : "");
 	}
+
+	if (total->keying_time.count > 0)
+		printSimpleStats("keying time", &total->keying_time);
+	if (total->think_time.count > 0)
+		printSimpleStats("think time", &total->think_time);
+	if (total->recall.count > 0)
+		printRecallStats("recall", total);
+	if (total->validation_passed + total->validation_failed > 0)
+		printValidationStats("validation results", total);
 
 	if (throttle_delay)
 	{
@@ -1652,6 +2600,19 @@ printResults(StatsData *total,
 		 */
 		printf("rate limit schedule lag: avg %.3f (max %.3f) ms\n",
 			   0.001 * total->lag.sum / total->cnt, 0.001 * total->lag.max);
+	}
+	else if (total->lag.count > 0)
+	{
+		printf("schedule lag: avg %.3f (max %.3f) ms\n",
+			   0.001 * total->lag.sum / total->lag.count, 0.001 * total->lag.max);
+	}
+	if (total->lag_hist_count > 0)
+	{
+		printLagPercentiles("schedule lag percentiles", total);
+		if (total->scheduled_count > 0)
+			printf("schedule on-time (<= %.1f ms): " INT64_FORMAT "/" INT64_FORMAT " (%.3f%%)\n",
+				   ontime_threshold_ms, total->ontime_count, total->scheduled_count,
+				   100.0 * total->ontime_count / total->scheduled_count);
 	}
 
 	/*
@@ -1672,6 +2633,47 @@ printResults(StatsData *total,
 	{
 		printf("initial connection time = %.3f ms\n", 0.001 * conn_elapsed_duration);
 		printf("tps = %f (without initial connection time)\n", tps);
+	}
+
+	/* Report per-group statistics if client groups were configured */
+	if (num_groups > 0)
+	{
+		for (int g = 0; g < num_groups; g++)
+		{
+			ClientGroup *grp = &client_groups[g];
+			StatsData  *gstats = &grp->stats;
+			int64		g_failures = getFailures(gstats);
+			int64		g_total_cnt =
+				gstats->cnt + gstats->cnt_skipped + g_failures;
+
+			printf("client group %d: %s (clients: %d, threads: %d%s)\n",
+				   g + 1, grp->name, grp->nclients, grp->nthreads,
+				   grp->sequential ? ", sequential" : "");
+
+			if (g_total_cnt > 0)
+			{
+				printf(" - number of transactions actually processed: " INT64_FORMAT " (tps = %f)\n",
+					   gstats->cnt, gstats->cnt / bench_duration);
+				printf(" - number of failed transactions: " INT64_FORMAT " (%.3f%%)\n",
+					   g_failures, 100.0 * g_failures / g_total_cnt);
+				if (gstats->expected_rollbacks > 0)
+					printf(" - number of expected rollbacks: " INT64_FORMAT " (%.3f%%)\n",
+						   gstats->expected_rollbacks,
+						   100.0 * gstats->expected_rollbacks / g_total_cnt);
+				printSimpleStats(" - latency", &gstats->latency);
+				printLatencyPercentiles(" - latency percentiles", gstats);
+				if (gstats->keying_time.count > 0)
+					printSimpleStats(" - keying time", &gstats->keying_time);
+				if (gstats->think_time.count > 0)
+					printSimpleStats(" - think time", &gstats->think_time);
+				if (gstats->recall.count > 0)
+					printRecallStats(" - recall", gstats);
+				if (gstats->validation_passed + gstats->validation_failed > 0)
+					printValidationStats(" - validation results", gstats);
+				if (gstats->lag_hist_count > 0)
+					printLagPercentiles(" - schedule lag percentiles", gstats);
+			}
+		}
 	}
 
 	/* Report per-script/command statistics */
@@ -1705,6 +2707,11 @@ printResults(StatsData *total,
 					printf(" - number of failed transactions: " INT64_FORMAT " (%.3f%%)\n",
 						   script_failures,
 						   100.0 * script_failures / script_total_cnt);
+
+					if (sstats->expected_rollbacks > 0)
+						printf(" - number of expected rollbacks: " INT64_FORMAT " (%.3f%%)\n",
+							   sstats->expected_rollbacks,
+							   100.0 * sstats->expected_rollbacks / script_total_cnt);
 
 					if (failures_detailed)
 					{
@@ -1742,6 +2749,17 @@ printResults(StatsData *total,
 
 				}
 				printSimpleStats(" - latency", &sstats->latency);
+				printLatencyPercentiles(" - latency percentiles", sstats);
+				if (sstats->keying_time.count > 0)
+					printSimpleStats(" - keying time", &sstats->keying_time);
+				if (sstats->think_time.count > 0)
+					printSimpleStats(" - think time", &sstats->think_time);
+				if (sstats->recall.count > 0)
+					printRecallStats(" - recall", sstats);
+				if (sstats->validation_passed + sstats->validation_failed > 0)
+					printValidationStats(" - validation results", sstats);
+				if (sstats->lag_hist_count > 0)
+					printLagPercentiles(" - schedule lag percentiles", sstats);
 			}
 
 			/*
@@ -1781,6 +2799,620 @@ printResults(StatsData *total,
 			}
 		}
 	}
+
+	/*
+	 * Compute and report standard composite metrics (tpmC and QphH@SF) when
+	 * matching scripts or sequential OLAP streams are present.
+	 */
+	{
+		int64		new_order_cnt = 0;
+		bool		has_tpmc = false;
+		double		tpmc = 0.0;
+		int64		tpch_query_cnt = 0;
+		bool		has_qphh = false;
+		double		qphh = 0.0;
+
+		for (int i = 0; i < num_scripts; i++)
+		{
+			const char *desc = sql_script[i].desc;
+
+			if (strstr(desc, "new_order") != NULL ||
+				strstr(desc, "new-order") != NULL ||
+				strstr(desc, "NewOrder") != NULL)
+			{
+				has_tpmc = true;
+				new_order_cnt += (per_script_stats ? sql_script[i].stats.cnt : total->cnt);
+			}
+		}
+
+		for (int g = 0; g < num_groups; g++)
+		{
+			if (client_groups[g].sequential)
+			{
+				has_qphh = true;
+				tpch_query_cnt += client_groups[g].stats.cnt;
+			}
+		}
+		if (!has_qphh)
+		{
+			for (int i = 0; i < num_scripts; i++)
+			{
+				const char *desc = sql_script[i].desc;
+
+				if (strstr(desc, "tpch") != NULL || strstr(desc, "qphh") != NULL ||
+					strstr(desc, "pgbench-h") != NULL || strstr(desc, "pgbench_h") != NULL)
+				{
+					has_qphh = true;
+					tpch_query_cnt += (per_script_stats ? sql_script[i].stats.cnt : total->cnt);
+				}
+			}
+		}
+
+		if (has_tpmc && bench_duration > 0.0)
+		{
+			tpmc = (new_order_cnt * 60.0) / bench_duration;
+			printf("tpmC = %.2f (New-Order transactions: " INT64_FORMAT ")\n",
+				   tpmc, new_order_cnt);
+		}
+		if (has_qphh && bench_duration > 0.0)
+		{
+			qphh = (tpch_query_cnt * 3600.0) / bench_duration;
+			printf("QphH@SF%d = %.2f (queries: " INT64_FORMAT ")\n",
+				   scale, qphh, tpch_query_cnt);
+		}
+
+		/* Evaluate and report SLA compliance rules */
+		if (num_slas > 0)
+		{
+			printf("SLA compliance:\n");
+			for (int k = 0; k < num_slas; k++)
+			{
+				SlaRule    *rule = &sla_rules[k];
+				StatsData	matched;
+				bool		found = false;
+				const char *target_name = rule->target;
+				const char *op_str = (rule->op == SLA_OP_GE) ? ">=" : "<=";
+
+				if (pg_strncasecmp(target_name, "group:", 6) == 0)
+					target_name += 6;
+				else if (pg_strncasecmp(target_name, "script:", 7) == 0)
+					target_name += 7;
+
+				initStats(&matched, 0);
+
+				if (pg_strcasecmp(target_name, "total") == 0 ||
+					pg_strcasecmp(target_name, "all") == 0 ||
+					strcmp(target_name, "*") == 0)
+				{
+					mergeStats(&matched, total);
+					found = true;
+				}
+				else
+				{
+					for (int g = 0; g < num_groups; g++)
+					{
+						if (strcmp(client_groups[g].name, target_name) == 0)
+						{
+							mergeStats(&matched, &client_groups[g].stats);
+							found = true;
+						}
+					}
+					if (!found)
+					{
+						for (int i = 0; i < num_scripts; i++)
+						{
+							if (strcmp(sql_script[i].desc, target_name) == 0 ||
+								strstr(sql_script[i].desc, target_name) != NULL)
+							{
+								mergeStats(&matched,
+										   per_script_stats ? &sql_script[i].stats : total);
+								found = true;
+							}
+						}
+					}
+					if (!found && rule->named_metric != NULL &&
+						(rule->metric == SLA_METRIC_RECALL_AVG || rule->metric == SLA_METRIC_RECALL_PCT))
+					{
+						if (findNamedRecallStats(total, rule->named_metric) != NULL)
+						{
+							mergeStats(&matched, total);
+							found = true;
+						}
+					}
+				}
+
+				switch (rule->metric)
+				{
+					case SLA_METRIC_LATENCY_PCT:
+						rule->evaluated = (found && matched.hist_count > 0);
+						rule->actual_usec = rule->evaluated ?
+							getLatencyPercentile(&matched, rule->percentile) : 0.0;
+						rule->actual_val = 0.001 * rule->actual_usec;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_LE) ?
+							 (rule->actual_usec <= rule->threshold_usec) :
+							 (rule->actual_usec >= rule->threshold_usec));
+						printf(" - SLA %s:p%g %s %.3f ms: actual = %.3f ms [%s]\n",
+							   rule->target,
+							   rule->percentile,
+							   op_str,
+							   0.001 * rule->threshold_usec,
+							   0.001 * rule->actual_usec,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_LATENCY_AVG:
+						rule->evaluated = (found && matched.latency.count > 0);
+						rule->actual_usec = rule->evaluated ?
+							(matched.latency.sum / matched.latency.count) : 0.0;
+						rule->actual_val = 0.001 * rule->actual_usec;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_LE) ?
+							 (rule->actual_usec <= rule->threshold_usec) :
+							 (rule->actual_usec >= rule->threshold_usec));
+						printf(" - SLA %s:avg %s %.3f ms: actual = %.3f ms [%s]\n",
+							   rule->target,
+							   op_str,
+							   0.001 * rule->threshold_usec,
+							   0.001 * rule->actual_usec,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_LAG_PCT:
+						rule->evaluated = (found && matched.lag_hist_count > 0);
+						rule->actual_usec = rule->evaluated ?
+							getLagPercentile(&matched, rule->percentile) : 0.0;
+						rule->actual_val = 0.001 * rule->actual_usec;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_LE) ?
+							 (rule->actual_usec <= rule->threshold_usec) :
+							 (rule->actual_usec >= rule->threshold_usec));
+						printf(" - SLA %s:schedule_lag:p%g %s %.3f ms: actual = %.3f ms [%s]\n",
+							   rule->target,
+							   rule->percentile,
+							   op_str,
+							   0.001 * rule->threshold_usec,
+							   0.001 * rule->actual_usec,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_ONTIME_PCT:
+						rule->evaluated = (found && matched.scheduled_count > 0);
+						rule->actual_val = rule->evaluated ?
+							(100.0 * matched.ontime_count / matched.scheduled_count) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:ontime_pct %s %.2f%%: actual = %.2f%% [%s]\n",
+							   rule->target,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_RECALL_AVG:
+						if (rule->named_metric != NULL && rule->named_metric[0] != '\0')
+						{
+							const NamedRecallStats *ns = findNamedRecallStats(&matched, rule->named_metric);
+
+							if (ns != NULL)
+							{
+								rule->evaluated = (found && ns->stats.count > 0);
+								rule->actual_val = (rule->evaluated && ns->stats.count > 0) ?
+									(ns->stats.sum / ns->stats.count) : 0.0;
+								rule->passed = rule->evaluated &&
+									((rule->op == SLA_OP_GE) ?
+									 (rule->actual_val >= rule->threshold_val) :
+									 (rule->actual_val <= rule->threshold_val));
+								printf(" - SLA %s:%s:recall %s %.4f: actual = %.4f [%s]\n",
+									   rule->target,
+									   rule->named_metric,
+									   op_str,
+									   rule->threshold_val,
+									   rule->actual_val,
+									   rule->passed ? "PASS" : "FAIL");
+								break;
+							}
+						}
+						rule->evaluated = (found && matched.recall.count > 0);
+						rule->actual_val = rule->evaluated ?
+							(matched.recall.sum / matched.recall.count) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:recall %s %.4f: actual = %.4f [%s]\n",
+							   rule->target,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_RECALL_PCT:
+						if (rule->named_metric != NULL && rule->named_metric[0] != '\0')
+						{
+							const NamedRecallStats *ns = findNamedRecallStats(&matched, rule->named_metric);
+
+							if (ns != NULL)
+							{
+								rule->evaluated = (found && ns->stats.count > 0);
+								rule->actual_val = rule->evaluated ?
+									getNamedRecallPercentile(&matched, rule->named_metric, rule->percentile) : 0.0;
+								rule->passed = rule->evaluated &&
+									((rule->op == SLA_OP_GE) ?
+									 (rule->actual_val >= rule->threshold_val) :
+									 (rule->actual_val <= rule->threshold_val));
+								printf(" - SLA %s:%s:recall_p%g %s %.4f: actual = %.4f [%s]\n",
+									   rule->target,
+									   rule->named_metric,
+									   rule->percentile,
+									   op_str,
+									   rule->threshold_val,
+									   rule->actual_val,
+									   rule->passed ? "PASS" : "FAIL");
+								break;
+							}
+						}
+						rule->evaluated = (found && matched.recall.count > 0);
+						rule->actual_val = rule->evaluated ?
+							getRecallPercentile(&matched, rule->percentile) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:recall_p%g %s %.4f: actual = %.4f [%s]\n",
+							   rule->target,
+							   rule->percentile,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_TPS:
+						rule->evaluated = (found && bench_duration > 0.0);
+						rule->actual_val = rule->evaluated ?
+							(matched.cnt / bench_duration) : 0.0;
+						rule->passed = rule->evaluated &&
+							((rule->op == SLA_OP_GE) ?
+							 (rule->actual_val >= rule->threshold_val) :
+							 (rule->actual_val <= rule->threshold_val));
+						printf(" - SLA %s:tps %s %.2f: actual = %.2f [%s]\n",
+							   rule->target,
+							   op_str,
+							   rule->threshold_val,
+							   rule->actual_val,
+							   rule->passed ? "PASS" : "FAIL");
+						break;
+
+					case SLA_METRIC_ERROR_RATE:
+						{
+							int64		m_fail = getFailures(&matched);
+							int64		m_tot = matched.cnt + matched.cnt_skipped + m_fail;
+
+							rule->evaluated = (found && m_tot > 0);
+							rule->actual_val = rule->evaluated ?
+								(100.0 * m_fail / m_tot) : 0.0;
+							rule->passed = rule->evaluated &&
+								((rule->op == SLA_OP_LE) ?
+								 (rule->actual_val <= rule->threshold_val) :
+								 (rule->actual_val >= rule->threshold_val));
+							printf(" - SLA %s:error_rate %s %.3f%%: actual = %.3f%% [%s]\n",
+								   rule->target,
+								   op_str,
+								   rule->threshold_val,
+								   rule->actual_val,
+								   rule->passed ? "PASS" : "FAIL");
+							break;
+						}
+
+					case SLA_METRIC_VALIDATION_FAILURES:
+						{
+							rule->evaluated = found;
+							rule->actual_val = (double) matched.validation_failed;
+							rule->passed = rule->evaluated &&
+								((rule->op == SLA_OP_LE) ?
+								 (rule->actual_val <= rule->threshold_val) :
+								 (rule->actual_val >= rule->threshold_val));
+							printf(" - SLA %s:validation_failures %s %.0f: actual = %.0f [%s]\n",
+								   rule->target,
+								   op_str,
+								   rule->threshold_val,
+								   rule->actual_val,
+								   rule->passed ? "PASS" : "FAIL");
+							break;
+						}
+
+					case SLA_METRIC_VALIDATION_PCT:
+						{
+							int64		val_tot = matched.validation_passed + matched.validation_failed;
+
+							rule->evaluated = (found && val_tot > 0);
+							rule->actual_val = rule->evaluated ?
+								(100.0 * (double) matched.validation_passed / (double) val_tot) : 0.0;
+							rule->passed = rule->evaluated &&
+								((rule->op == SLA_OP_GE) ?
+								 (rule->actual_val >= rule->threshold_val) :
+								 (rule->actual_val <= rule->threshold_val));
+							printf(" - SLA %s:validation_pct %s %.2f%%: actual = %.2f%% [%s]\n",
+								   rule->target,
+								   op_str,
+								   rule->threshold_val,
+								   rule->actual_val,
+								   rule->passed ? "PASS" : "FAIL");
+							break;
+						}
+				}
+
+				if (!rule->passed)
+					sla_failed = true;
+			}
+		}
+
+		/* Export structured JSON telemetry report if requested */
+		if (json_report_file != NULL)
+		{
+			FILE	   *jfp = fopen(json_report_file, "w");
+
+			if (jfp == NULL)
+				pg_fatal("could not open JSON report file \"%s\": %m",
+						 json_report_file);
+
+			fprintf(jfp, "{\n");
+			fprintf(jfp, "  \"configuration\": {\n");
+			fprintf(jfp, "    \"scale\": %d,\n", scale);
+			fprintf(jfp, "    \"clients\": %d,\n", nclients);
+			fprintf(jfp, "    \"threads\": %d,\n", nthreads);
+			fprintf(jfp, "    \"duration_sec\": %d,\n", duration);
+			fprintf(jfp, "    \"transactions_per_client\": %d,\n", nxacts);
+			fprintf(jfp, "    \"query_mode\": \"%s\"\n", QUERYMODE[querymode]);
+			fprintf(jfp, "  },\n");
+
+			fprintf(jfp, "  \"overall\": {\n");
+			fprintf(jfp, "    \"transactions_processed\": " INT64_FORMAT ",\n", total->cnt);
+			fprintf(jfp, "    \"transactions_failed\": " INT64_FORMAT ",\n", failures);
+			fprintf(jfp, "    \"expected_rollbacks\": " INT64_FORMAT ",\n", total->expected_rollbacks);
+			fprintf(jfp, "    \"transactions_skipped\": " INT64_FORMAT ",\n", total->cnt_skipped);
+			fprintf(jfp, "    \"validation_passed\": " INT64_FORMAT ",\n", total->validation_passed);
+			fprintf(jfp, "    \"validation_failed\": " INT64_FORMAT ",\n", total->validation_failed);
+			fprintf(jfp, "    \"validation_pct\": %.4f,\n",
+					(total->validation_passed + total->validation_failed) > 0 ?
+					100.0 * (double) total->validation_passed /
+					(double) (total->validation_passed + total->validation_failed) : 100.0);
+			fprintf(jfp, "    \"duration_sec\": %.6f,\n", bench_duration);
+			fprintf(jfp, "    \"tps\": %.6f,\n", tps);
+			fprintf(jfp, "    \"latency_ms\": {\n");
+			fprintf(jfp, "      \"avg\": %.3f,\n",
+					total->latency.count > 0 ? 0.001 * total->latency.sum / total->latency.count : 0.0);
+			fprintf(jfp, "      \"min\": %.3f,\n", 0.001 * total->latency.min);
+			fprintf(jfp, "      \"max\": %.3f,\n", 0.001 * total->latency.max);
+			fprintf(jfp, "      \"p50\": %.3f,\n", 0.001 * getLatencyPercentile(total, 50.0));
+			fprintf(jfp, "      \"p90\": %.3f,\n", 0.001 * getLatencyPercentile(total, 90.0));
+			fprintf(jfp, "      \"p95\": %.3f,\n", 0.001 * getLatencyPercentile(total, 95.0));
+			fprintf(jfp, "      \"p99\": %.3f,\n", 0.001 * getLatencyPercentile(total, 99.0));
+			fprintf(jfp, "      \"p99_9\": %.3f\n", 0.001 * getLatencyPercentile(total, 99.9));
+			fprintf(jfp, "    },\n");
+			fprintf(jfp, "    \"recall\": {\n");
+			fprintf(jfp, "      \"samples\": " INT64_FORMAT ",\n", total->recall.count);
+			fprintf(jfp, "      \"avg\": %.4f,\n",
+					total->recall.count > 0 ? total->recall.sum / total->recall.count : 0.0);
+			fprintf(jfp, "      \"min\": %.4f,\n",
+					total->recall.count > 0 ? total->recall.min : 0.0);
+			fprintf(jfp, "      \"max\": %.4f,\n",
+					total->recall.count > 0 ? total->recall.max : 0.0);
+			fprintf(jfp, "      \"p5\": %.4f,\n", getRecallPercentile(total, 5.0));
+			fprintf(jfp, "      \"p50\": %.4f,\n", getRecallPercentile(total, 50.0));
+			fprintf(jfp, "      \"distribution\": {\n");
+			for (int d = 0; d < RECALL_DIST10_BUCKETS; d++)
+			{
+				if (d == RECALL_DIST10_BUCKETS - 1)
+					fprintf(jfp, "        \"0.%d-1.0\": " INT64_FORMAT "\n", d, total->recall_dist10[d]);
+				else
+					fprintf(jfp, "        \"0.%d-0.%d\": " INT64_FORMAT ",\n", d, d + 1, total->recall_dist10[d]);
+			}
+			fprintf(jfp, "      }\n");
+			if (total->recall.count >= 4 && total->q1_recall_count > 0 && total->q4_recall_count > 0)
+			{
+				double		q1_avg = total->q1_recall_sum / total->q1_recall_count;
+				double		q4_sum = 0.0;
+				double		q4_avg;
+				double		delta;
+				double		deg_pct;
+
+				for (int j = 0; j < total->q4_recall_count; j++)
+					q4_sum += total->q4_recall_ring[j];
+				q4_avg = q4_sum / total->q4_recall_count;
+				delta = q4_avg - q1_avg;
+				deg_pct = (q1_avg > 0.000001) ? (delta / q1_avg * 100.0) : 0.0;
+
+				fprintf(jfp, ",\n      \"aging_degradation\": {\n");
+				fprintf(jfp, "        \"initial_recall\": %.4f,\n", q1_avg);
+				fprintf(jfp, "        \"mature_recall\": %.4f,\n", q4_avg);
+				fprintf(jfp, "        \"delta\": %.4f,\n", delta);
+				fprintf(jfp, "        \"degradation_pct\": %.4f\n", deg_pct);
+				fprintf(jfp, "      }\n");
+			}
+			fprintf(jfp, "    }");
+			if (total->num_named_recalls > 0)
+			{
+				fprintf(jfp, ",\n    \"named_recall\": {\n");
+				for (int i = 0; i < total->num_named_recalls; i++)
+				{
+					const NamedRecallStats *ns = &total->named_recalls[i];
+					double		avg = ns->stats.count > 0 ? ns->stats.sum / ns->stats.count : 0.0;
+					double		var = ns->stats.count > 0 ? (ns->stats.sum2 / ns->stats.count) - (avg * avg) : 0.0;
+					double		stddev = (var > 0.0) ? sqrt(var) : 0.0;
+
+					fprintf(jfp, "      \"%s\": {\n", ns->name);
+					fprintf(jfp, "        \"samples\": " INT64_FORMAT ",\n", ns->stats.count);
+					fprintf(jfp, "        \"avg\": %.4f,\n", avg);
+					fprintf(jfp, "        \"stddev\": %.4f,\n", stddev);
+					fprintf(jfp, "        \"min\": %.4f,\n", ns->stats.count > 0 ? ns->stats.min : 0.0);
+					fprintf(jfp, "        \"max\": %.4f,\n", ns->stats.count > 0 ? ns->stats.max : 0.0);
+					fprintf(jfp, "        \"p5\": %.4f,\n", getNamedRecallPercentile(total, ns->name, 5.0));
+					fprintf(jfp, "        \"p50\": %.4f,\n", getNamedRecallPercentile(total, ns->name, 50.0));
+					fprintf(jfp, "        \"distribution\": {\n");
+					for (int d = 0; d < RECALL_DIST10_BUCKETS; d++)
+					{
+						if (d == RECALL_DIST10_BUCKETS - 1)
+							fprintf(jfp, "          \"0.%d-1.0\": " INT64_FORMAT "\n", d, ns->dist10[d]);
+						else
+							fprintf(jfp, "          \"0.%d-0.%d\": " INT64_FORMAT ",\n", d, d + 1, ns->dist10[d]);
+					}
+					fprintf(jfp, "        }");
+					if (ns->stats.count >= 4 && ns->q1_count > 0 && ns->q4_count > 0)
+					{
+						double		q1_avg = ns->q1_sum / ns->q1_count;
+						double		q4_sum = 0.0;
+						double		q4_avg;
+						double		delta;
+						double		deg_pct;
+
+						for (int j = 0; j < ns->q4_count; j++)
+							q4_sum += ns->q4_ring[j];
+						q4_avg = q4_sum / ns->q4_count;
+						delta = q4_avg - q1_avg;
+						deg_pct = (q1_avg > 0.000001) ? (delta / q1_avg * 100.0) : 0.0;
+
+						fprintf(jfp, ",\n        \"aging_degradation\": {\n");
+						fprintf(jfp, "          \"initial_recall\": %.4f,\n", q1_avg);
+						fprintf(jfp, "          \"mature_recall\": %.4f,\n", q4_avg);
+						fprintf(jfp, "          \"delta\": %.4f,\n", delta);
+						fprintf(jfp, "          \"degradation_pct\": %.4f\n", deg_pct);
+						fprintf(jfp, "        }\n");
+					}
+					else
+						fprintf(jfp, "\n");
+					fprintf(jfp, "      }%s\n", (i + 1 < total->num_named_recalls) ? "," : "");
+				}
+				fprintf(jfp, "    }");
+			}
+			fprintf(jfp, ",\n");
+			fprintf(jfp, "    \"schedule_lag_ms\": {\n");
+			fprintf(jfp, "      \"avg\": %.3f,\n",
+					total->lag.count > 0 ? 0.001 * total->lag.sum / total->lag.count : 0.0);
+			fprintf(jfp, "      \"p50\": %.3f,\n", 0.001 * getLagPercentile(total, 50.0));
+			fprintf(jfp, "      \"p90\": %.3f,\n", 0.001 * getLagPercentile(total, 90.0));
+			fprintf(jfp, "      \"p95\": %.3f,\n", 0.001 * getLagPercentile(total, 95.0));
+			fprintf(jfp, "      \"p99\": %.3f,\n", 0.001 * getLagPercentile(total, 99.0));
+			fprintf(jfp, "      \"ontime_pct\": %.3f\n",
+					total->scheduled_count > 0 ? 100.0 * total->ontime_count / total->scheduled_count : 100.0);
+			fprintf(jfp, "    }\n");
+			fprintf(jfp, "  },\n");
+
+			fprintf(jfp, "  \"composite_metrics\": {\n");
+			fprintf(jfp, "    \"tpmC\": %.2f,\n", tpmc);
+			fprintf(jfp, "    \"QphH\": %.2f\n", qphh);
+			fprintf(jfp, "  },\n");
+
+			fprintf(jfp, "  \"groups\": [\n");
+			for (int g = 0; g < num_groups; g++)
+			{
+				ClientGroup *grp = &client_groups[g];
+				StatsData  *gs = &grp->stats;
+
+				fprintf(jfp, "    {\n");
+				fprintf(jfp, "      \"name\": ");
+				fprintJsonString(jfp, grp->name);
+				fprintf(jfp, ",\n");
+				fprintf(jfp, "      \"clients\": %d,\n", grp->nclients);
+				fprintf(jfp, "      \"threads\": %d,\n", grp->nthreads);
+				fprintf(jfp, "      \"sequential\": %s,\n", grp->sequential ? "true" : "false");
+				fprintf(jfp, "      \"transactions_processed\": " INT64_FORMAT ",\n", gs->cnt);
+				fprintf(jfp, "      \"transactions_failed\": " INT64_FORMAT ",\n", getFailures(gs));
+				fprintf(jfp, "      \"expected_rollbacks\": " INT64_FORMAT ",\n", gs->expected_rollbacks);
+				fprintf(jfp, "      \"tps\": %.6f,\n", bench_duration > 0 ? gs->cnt / bench_duration : 0.0);
+				fprintf(jfp, "      \"latency_ms\": {\n");
+				fprintf(jfp, "        \"avg\": %.3f,\n",
+						gs->latency.count > 0 ? 0.001 * gs->latency.sum / gs->latency.count : 0.0);
+				fprintf(jfp, "        \"p50\": %.3f,\n", 0.001 * getLatencyPercentile(gs, 50.0));
+				fprintf(jfp, "        \"p90\": %.3f,\n", 0.001 * getLatencyPercentile(gs, 90.0));
+				fprintf(jfp, "        \"p95\": %.3f,\n", 0.001 * getLatencyPercentile(gs, 95.0));
+				fprintf(jfp, "        \"p99\": %.3f,\n", 0.001 * getLatencyPercentile(gs, 99.0));
+				fprintf(jfp, "        \"p99_9\": %.3f\n", 0.001 * getLatencyPercentile(gs, 99.9));
+				fprintf(jfp, "      },\n");
+				fprintf(jfp, "      \"recall\": {\n");
+				fprintf(jfp, "        \"samples\": " INT64_FORMAT ",\n", gs->recall.count);
+				fprintf(jfp, "        \"avg\": %.4f,\n",
+						gs->recall.count > 0 ? gs->recall.sum / gs->recall.count : 0.0);
+				fprintf(jfp, "        \"p5\": %.4f,\n", getRecallPercentile(gs, 5.0));
+				fprintf(jfp, "        \"p50\": %.4f\n", getRecallPercentile(gs, 50.0));
+				fprintf(jfp, "      }\n");
+				fprintf(jfp, "    }%s\n", (g + 1 < num_groups) ? "," : "");
+			}
+			fprintf(jfp, "  ],\n");
+
+			fprintf(jfp, "  \"scripts\": [\n");
+			for (int i = 0; i < num_scripts; i++)
+			{
+				StatsData  *ss = per_script_stats ? &sql_script[i].stats : total;
+
+				fprintf(jfp, "    {\n");
+				fprintf(jfp, "      \"index\": %d,\n", i + 1);
+				fprintf(jfp, "      \"name\": ");
+				fprintJsonString(jfp, sql_script[i].desc);
+				fprintf(jfp, ",\n");
+				fprintf(jfp, "      \"weight\": %d,\n", sql_script[i].weight);
+				fprintf(jfp, "      \"transactions_processed\": " INT64_FORMAT ",\n", ss->cnt);
+				fprintf(jfp, "      \"transactions_failed\": " INT64_FORMAT ",\n", getFailures(ss));
+				fprintf(jfp, "      \"expected_rollbacks\": " INT64_FORMAT ",\n", ss->expected_rollbacks);
+				fprintf(jfp, "      \"tps\": %.6f,\n", bench_duration > 0 ? ss->cnt / bench_duration : 0.0);
+				fprintf(jfp, "      \"latency_ms\": {\n");
+				fprintf(jfp, "        \"avg\": %.3f,\n",
+						ss->latency.count > 0 ? 0.001 * ss->latency.sum / ss->latency.count : 0.0);
+				fprintf(jfp, "        \"p50\": %.3f,\n", 0.001 * getLatencyPercentile(ss, 50.0));
+				fprintf(jfp, "        \"p90\": %.3f,\n", 0.001 * getLatencyPercentile(ss, 90.0));
+				fprintf(jfp, "        \"p95\": %.3f,\n", 0.001 * getLatencyPercentile(ss, 95.0));
+				fprintf(jfp, "        \"p99\": %.3f,\n", 0.001 * getLatencyPercentile(ss, 99.0));
+				fprintf(jfp, "        \"p99_9\": %.3f\n", 0.001 * getLatencyPercentile(ss, 99.9));
+				fprintf(jfp, "      },\n");
+				fprintf(jfp, "      \"recall\": {\n");
+				fprintf(jfp, "        \"samples\": " INT64_FORMAT ",\n", ss->recall.count);
+				fprintf(jfp, "        \"avg\": %.4f,\n",
+						ss->recall.count > 0 ? ss->recall.sum / ss->recall.count : 0.0);
+				fprintf(jfp, "        \"p5\": %.4f,\n", getRecallPercentile(ss, 5.0));
+				fprintf(jfp, "        \"p50\": %.4f\n", getRecallPercentile(ss, 50.0));
+				fprintf(jfp, "      }\n");
+				fprintf(jfp, "    }%s\n", (i + 1 < num_scripts) ? "," : "");
+			}
+			fprintf(jfp, "  ],\n");
+
+			fprintf(jfp, "  \"sla_verifications\": [\n");
+			for (int k = 0; k < num_slas; k++)
+			{
+				SlaRule    *rule = &sla_rules[k];
+
+				fprintf(jfp, "    {\n");
+				fprintf(jfp, "      \"target\": ");
+				fprintJsonString(jfp, rule->target);
+				fprintf(jfp, ",\n");
+				if (rule->named_metric != NULL)
+				{
+					fprintf(jfp, "      \"named_metric\": ");
+					fprintJsonString(jfp, rule->named_metric);
+					fprintf(jfp, ",\n");
+				}
+				fprintf(jfp, "      \"percentile\": %g,\n", rule->percentile);
+				fprintf(jfp, "      \"threshold_ms\": %.3f,\n", 0.001 * rule->threshold_usec);
+				fprintf(jfp, "      \"actual_ms\": %.3f,\n", 0.001 * rule->actual_usec);
+				fprintf(jfp, "      \"threshold\": %.4f,\n",
+						(rule->metric == SLA_METRIC_LATENCY_PCT ||
+						 rule->metric == SLA_METRIC_LATENCY_AVG ||
+						 rule->metric == SLA_METRIC_LAG_PCT) ?
+						0.001 * rule->threshold_usec : rule->threshold_val);
+				fprintf(jfp, "      \"actual\": %.4f,\n", rule->actual_val);
+				fprintf(jfp, "      \"passed\": %s\n", rule->passed ? "true" : "false");
+				fprintf(jfp, "    }%s\n", (k + 1 < num_slas) ? "," : "");
+			}
+			fprintf(jfp, "  ],\n");
+			fprintf(jfp, "  \"sla_all_passed\": %s\n", sla_failed ? "false" : "true");
+			fprintf(jfp, "}\n");
+			fclose(jfp);
+		}
+	}
 }
 
 THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC
@@ -1791,12 +3423,23 @@ threadRun(void *arg)
 	pg_time_usec_t start;
 	int			nstate = thread->nstate;
 	int			remains = nstate;	/* number of remaining clients */
-	socket_set *sockets = alloc_socket_set(nstate);
+	socket_set *sockets = alloc_socket_set(nstate + 1);
 	int64		thread_start,
 				last_report,
 				next_report;
 	StatsData	last,
 				aggs;
+
+	thread->wakeup_pipe[0] = -1;
+	thread->wakeup_pipe[1] = -1;
+#ifndef WIN32
+	if (pipe(thread->wakeup_pipe) == 0)
+	{
+		(void) fcntl(thread->wakeup_pipe[0], F_SETFL, O_NONBLOCK);
+		(void) fcntl(thread->wakeup_pipe[1], F_SETFL, O_NONBLOCK);
+		registerThreadWakeupPipe(thread->tid, thread->wakeup_pipe[1]);
+	}
+#endif
 
 	/* open log file if requested */
 	if (use_log)
@@ -1834,12 +3477,16 @@ threadRun(void *arg)
 		/* make connections to the database before starting */
 		for (int i = 0; i < nstate; i++)
 		{
+			if (max_concurrent_sessions > 0 && state[i].id >= max_concurrent_sessions)
+				continue;
+
 			if ((state[i].con = doConnect()) == NULL)
 			{
 				/* coldly abort on initial connection failure */
 				pg_fatal("could not create connection for client %d",
 						 state[i].id);
 			}
+			(void) __atomic_fetch_add(&active_sessions_count, 1, __ATOMIC_RELAXED);
 		}
 	}
 
@@ -1866,6 +3513,7 @@ threadRun(void *arg)
 		int			nsocks;		/* number of sockets to be waited for */
 		pg_time_usec_t min_usec;
 		pg_time_usec_t now = 0; /* set this only if needed */
+		bool		waiting_watermark = false;
 
 		/*
 		 * identify which client sockets should be checked for input, and
@@ -1891,6 +3539,77 @@ threadRun(void *arg)
 							 st->sleep_until : st->txn_scheduled) - now;
 				if (min_usec > this_usec)
 					min_usec = this_usec;
+			}
+			else if (st->state == CSTATE_WAIT_SYNC)
+			{
+				bool		dep_unsatisfied =
+					(st->has_sync_dep &&
+					 getWatermarkChan(st->sync_dep_channel) < st->sync_dep_watermark);
+				pg_time_usec_t sched_wait = 0;
+
+				if (__atomic_load_n(&aborted_clients_count, __ATOMIC_ACQUIRE) > 0 ||
+					(dep_unsatisfied && isCausalWatermarkDeadlocked(thread, st)))
+				{
+					min_usec = 0;
+					break;
+				}
+
+				if (st->sync_scheduled_us > 0)
+				{
+					pg_time_now_lazy(&now);
+					if (now < st->sync_scheduled_us)
+						sched_wait = st->sync_scheduled_us - now;
+				}
+
+				if (!dep_unsatisfied && sched_wait == 0)
+				{
+					min_usec = 0;
+					break;
+				}
+				if (dep_unsatisfied)
+				{
+					waiting_watermark = true;
+					if (min_usec > 10000)
+						min_usec = 10000;
+				}
+				if (sched_wait > 0 && min_usec > sched_wait)
+					min_usec = sched_wait;
+			}
+			else if (st->state == CSTATE_WAIT_PHASE_BARRIER)
+			{
+				if (__atomic_load_n(&aborted_clients_count, __ATOMIC_ACQUIRE) > 0 ||
+					checkPhaseBarrierReady(st))
+				{
+					min_usec = 0;
+					break;
+				}
+				waiting_watermark = true;
+				if (min_usec > 10000)
+					min_usec = 10000;
+			}
+			else if (st->state == CSTATE_IDLE)
+			{
+				if (max_concurrent_sessions <= 0 ||
+					__atomic_load_n(&active_sessions_count, __ATOMIC_ACQUIRE) < max_concurrent_sessions)
+				{
+					min_usec = 0;
+					break;
+				}
+				waiting_watermark = true;
+				if (min_usec > 10000)
+					min_usec = 10000;
+			}
+			else if (st->state == CSTATE_CONNECTING)
+			{
+				int			sock = PQsocket(st->con);
+
+				if (sock < 0)
+				{
+					min_usec = 0;
+					break;
+				}
+				add_socket_to_set_ex(sockets, sock, nsocks++,
+									 st->connect_poll_mode == (int) PGRES_POLLING_WRITING);
 			}
 			else if (st->state == CSTATE_WAIT_RESULT ||
 					 st->state == CSTATE_WAIT_ROLLBACK_RESULT)
@@ -1920,6 +3639,9 @@ threadRun(void *arg)
 				break;
 			}
 		}
+
+		if (waiting_watermark && min_usec > 0 && thread->wakeup_pipe[0] >= 0)
+			add_socket_to_set(sockets, thread->wakeup_pipe[0], nsocks++);
 
 		/* also wake up to print the next progress report on time */
 		if (progress && min_usec > 0 && thread->tid == 0)
@@ -1967,6 +3689,17 @@ threadRun(void *arg)
 				pg_log_error("%s() failed: %m", SOCKET_WAIT_METHOD);
 				goto done;
 			}
+
+#ifndef WIN32
+			if (waiting_watermark && thread->wakeup_pipe[0] >= 0)
+			{
+				char		drain_buf[64];
+
+				while (read(thread->wakeup_pipe[0], drain_buf, sizeof(drain_buf)) > 0)
+				{
+				}
+			}
+#endif
 		}
 		else
 		{
@@ -1983,13 +3716,24 @@ threadRun(void *arg)
 			CState	   *st = &state[i];
 
 			if (st->state == CSTATE_WAIT_RESULT ||
-				st->state == CSTATE_WAIT_ROLLBACK_RESULT)
+				st->state == CSTATE_WAIT_ROLLBACK_RESULT ||
+				st->state == CSTATE_CONNECTING)
 			{
-				/* don't call advanceConnectionState unless data is available */
+				/* don't call advanceConnectionState unless socket is ready */
 				int			sock = PQsocket(st->con);
 
 				if (sock < 0)
 				{
+					if (st->state == CSTATE_CONNECTING)
+					{
+						advanceConnectionState(thread, st, &aggs);
+						if (exit_on_abort && st->state == CSTATE_ABORTED)
+							goto done;
+						else if (st->state == CSTATE_FINISHED ||
+								 st->state == CSTATE_ABORTED)
+							remains--;
+						continue;
+					}
 					pg_log_error("invalid socket: %s", PQerrorMessage(st->con));
 					goto done;
 				}
@@ -2051,6 +3795,19 @@ threadRun(void *arg)
 	}
 
 done:
+#ifndef WIN32
+	if (thread->wakeup_pipe[1] >= 0)
+	{
+		registerThreadWakeupPipe(thread->tid, -1);
+		close(thread->wakeup_pipe[1]);
+		thread->wakeup_pipe[1] = -1;
+	}
+	if (thread->wakeup_pipe[0] >= 0)
+	{
+		close(thread->wakeup_pipe[0]);
+		thread->wakeup_pipe[0] = -1;
+	}
+#endif
 	if (exit_on_abort)
 	{
 		/*
@@ -2067,6 +3824,15 @@ done:
 		}
 	}
 
+	for (int i = 0; i < nstate; i++)
+	{
+		unwindCallStack(&state[i]);
+		freeCStatePrepared(&state[i]);
+		pg_free(state[i].session_target_db);
+		state[i].session_target_db = NULL;
+		pg_free(state[i].session_target_user);
+		state[i].session_target_user = NULL;
+	}
 	disconnect_all(state, nstate);
 
 	if (thread->logfile)
@@ -2090,6 +3856,9 @@ finishCon(CState *st)
 	{
 		PQfinish(st->con);
 		st->con = NULL;
+		(void) __atomic_fetch_sub(&active_sessions_count, 1, __ATOMIC_RELEASE);
+		if (max_concurrent_sessions > 0)
+			wakeWatermarkWaiters();
 	}
 }
 

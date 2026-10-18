@@ -1635,19 +1635,16 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 									child_domain->jd_relids);
 				jtitem->qualscope = bms_union(left_item->qualscope,
 											  right_item->qualscope);
-				/* caution: ANTI join derived from SEMI will lack rtindex */
-				if (j->rtindex != 0)
-				{
-					parent_domain->jd_relids =
-						bms_add_member(parent_domain->jd_relids,
-									   j->rtindex);
-					jtitem->qualscope = bms_add_member(jtitem->qualscope,
+				Assert(j->rtindex != 0);
+				parent_domain->jd_relids =
+					bms_add_member(parent_domain->jd_relids,
+								   j->rtindex);
+				jtitem->qualscope = bms_add_member(jtitem->qualscope,
+												   j->rtindex);
+				root->outer_join_rels = bms_add_member(root->outer_join_rels,
 													   j->rtindex);
-					root->outer_join_rels = bms_add_member(root->outer_join_rels,
-														   j->rtindex);
-					mark_rels_nulled_by_join(root, j->rtindex,
-											 right_item->qualscope);
-				}
+				mark_rels_nulled_by_join(root, j->rtindex,
+										 right_item->qualscope);
 				jtitem->inner_join_rels = bms_union(left_item->inner_join_rels,
 													right_item->inner_join_rels);
 				jtitem->left_rels = left_item->qualscope;
@@ -2116,6 +2113,13 @@ make_outerjoininfo(PlannerInfo *root,
 	 * rel's columns are all NULL?
 	 */
 	strict_relids = find_nonnullable_rels((Node *) clause);
+
+	/*
+	 * find_nonnullable_rels looks inside PlaceHolderVars, so it can report
+	 * rels that the clause references only laterally.  Ignore those, since
+	 * like clause_relids we treat a PHV as computed at its ph_eval_at.
+	 */
+	strict_relids = bms_int_members(strict_relids, clause_relids);
 
 	/* Remember whether the clause is strict for any LHS relations */
 	sjinfo->lhs_strict = bms_overlap(strict_relids, left_rels);

@@ -42,11 +42,13 @@ extern ConnectionStateEnum executeMetaCommand(CState *st, pg_time_usec_t *now);
 extern void skipConditionalCommands(CState *st);
 extern bool processGSetResult(CState *st, Command *command, PGresult *res,
 							  bool is_last, int qrynum);
+extern bool populateGSetMeta(CState *st, const char *prefix);
+extern bool processGSetMetaResult(CState *st, Command *command, PGresult *res);
 
 /* Helper APIs for commands */
 extern void commandFailed(CState *st, const char *cmd, const char *message);
 extern void commandError(CState *st, const char *message);
-extern bool evaluateSleep(Variables *variables, int argc, char **argv, int *usecs);
+extern bool evaluateSleep(Variables *variables, int argc, char **argv, int64 *usecs);
 extern bool runShellCommand(Variables *variables, char *variable, char **argv, int argc);
 
 /* Handler declarations */
@@ -56,14 +58,29 @@ extern ConnectionStateEnum handle_cmd_if(CState *st, Command *cmd, pg_time_usec_
 extern ConnectionStateEnum handle_cmd_elif(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_else(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_endif(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_for(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_endfor(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_while(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_endwhile(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_try(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_catch(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_endtry(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_expect_error(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_gset_meta(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_setshell(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_shell(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_startpipeline(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_syncpipeline(CState *st, Command *cmd, pg_time_usec_t *now);
 extern ConnectionStateEnum handle_cmd_endpipeline(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_session_connect(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_session_disconnect(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_call(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_record_recall(CState *st, Command *cmd, pg_time_usec_t *now);
+extern ConnectionStateEnum handle_cmd_validate_result(CState *st, Command *cmd, pg_time_usec_t *now);
 
 /* Preparation helpers used across commands and SQL preparation */
 extern void allocCStatePrepared(CState *st);
+extern void freeCStatePrepared(CState *st);
 extern void prepareCommand(CState *st, int command_num);
 extern void prepareCommandsInPipeline(CState *st);
 
