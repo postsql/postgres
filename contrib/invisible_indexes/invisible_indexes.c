@@ -564,10 +564,12 @@ invisible_indexes_set_invisible_internal(Oid indexoid, bool make_invisible)
 #endif
 	   )
 	{
+		char *relname = pstrdup(RelationGetRelationName(rel));
+
 		relation_close(rel, ShareUpdateExclusiveLock);
 		ereport(ERROR,
 		        (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-		         errmsg("\"%s\" is not an index", RelationGetRelationName(rel))));
+		         errmsg("\"%s\" is not an index", relname)));
 	}
 	relation_close(rel, ShareUpdateExclusiveLock);
 
