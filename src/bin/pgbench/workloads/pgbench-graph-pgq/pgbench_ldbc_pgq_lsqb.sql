@@ -32,18 +32,27 @@ SELECT count(*) AS q2_count
 
 \validate_result (:q2_count >= 0) true
 
--- Q3: Country-localized friendship triangle using multi-pattern GRAPH_TABLE:
+-- Q3: Country-localized friendship triangle:
 --     Person1 -[:knows]-> Person2 -[:knows]-> Person3 -[:knows]-> Person1
 --     all located in cities of the same country
 SELECT count(*) AS q3_count
   FROM GRAPH_TABLE (snb_graph
-      MATCH (p1 IS Person)-[IS knows]->(p2 IS Person)-[IS knows]->(p3 IS Person)-[IS knows]->(p1 IS Person),
-            (p1 IS Person)-[IS isLocatedIn]->(c1 IS Place)-[IS isPartOf]->(country IS Place),
-            (p2 IS Person)-[IS isLocatedIn]->(c2 IS Place)-[IS isPartOf]->(country IS Place),
-            (p3 IS Person)-[IS isLocatedIn]->(c3 IS Place)-[IS isPartOf]->(country IS Place)
+      MATCH (p1 IS Person)-[IS knows]->(p2 IS Person)-[IS knows]->(p3 IS Person)-[IS knows]->(p1 IS Person)
       WHERE p1.id < p2.id AND p2.id < p3.id
-      COLUMNS (1 AS one)
-  ) \gset
+      COLUMNS (p1.city_id AS c1_id, p2.city_id AS c2_id, p3.city_id AS c3_id)
+  ) tri
+  JOIN GRAPH_TABLE (snb_graph
+      MATCH (c1 IS Place)-[IS isPartOf]->(country IS Place)
+      COLUMNS (c1.id AS city_id, country.id AS country_id)
+  ) l1 ON l1.city_id = tri.c1_id
+  JOIN GRAPH_TABLE (snb_graph
+      MATCH (c2 IS Place)-[IS isPartOf]->(country IS Place)
+      COLUMNS (c2.id AS city_id, country.id AS country_id)
+  ) l2 ON l2.city_id = tri.c2_id AND l2.country_id = l1.country_id
+  JOIN GRAPH_TABLE (snb_graph
+      MATCH (c3 IS Place)-[IS isPartOf]->(country IS Place)
+      COLUMNS (c3.id AS city_id, country.id AS country_id)
+  ) l3 ON l3.city_id = tri.c3_id AND l3.country_id = l1.country_id \gset
 
 \validate_result (:q3_count >= 0) true
 

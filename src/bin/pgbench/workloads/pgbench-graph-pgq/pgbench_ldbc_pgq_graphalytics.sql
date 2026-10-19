@@ -7,123 +7,80 @@
 
 \set root_id 1
 
--- 1. Breadth-First Search (BFS) via WITH RECURSIVE + GRAPH_TABLE edge step
+-- 1. Breadth-First Search (BFS) via WITH RECURSIVE ... UNION DISTINCT ON (vertex_id) + GRAPH_TABLE edge step
 WITH RECURSIVE bfs AS (
-    SELECT g.vertex_id,
-           0 AS depth,
-           0::bigint AS parent_id,
-           ARRAY[g.vertex_id] AS visited
+    SELECT g.vertex_id AS vertex_id,
+           0 AS min_depth,
+           0::bigint AS parent_id
       FROM GRAPH_TABLE (snb_graph
           MATCH (p IS Person WHERE p.id = :root_id)
           COLUMNS (p.id AS vertex_id)
       ) g
-    UNION ALL
+    UNION DISTINCT ON (vertex_id)
     SELECT g.dst_id AS vertex_id,
-           b.depth + 1 AS depth,
-           b.vertex_id AS parent_id,
-           b.visited || g.dst_id
+           b.min_depth + 1 AS min_depth,
+           b.vertex_id AS parent_id
       FROM bfs b,
            GRAPH_TABLE (snb_graph
                MATCH (src IS Person WHERE src.id = b.vertex_id)-[IS knows]->(dst IS Person)
                COLUMNS (dst.id AS dst_id)
            ) g
-     WHERE b.depth < 4
-       AND NOT (g.dst_id = ANY(b.visited))
-),
-bfs_levels AS (
-    SELECT vertex_id,
-           MIN(depth) AS min_depth
-      FROM bfs
-     GROUP BY vertex_id
+     WHERE b.min_depth < 4
 )
 SELECT count(*) AS bfs_reachable,
        COALESCE(MIN(min_depth) FILTER (WHERE vertex_id = :root_id), -1) AS bfs_root_depth,
        COALESCE(MAX(min_depth), 0) AS bfs_max_depth
-  FROM bfs_levels \gset
+  FROM bfs \gset
 
 \validate_result :bfs_root_depth 0
 \validate_result (:bfs_reachable >= 1 and :bfs_max_depth >= 0) true
 
--- 2. Weakly Connected Components (WCC) via iterative label propagation over GRAPH_TABLE edges
-WITH edges AS (
-    SELECT src_id, dst_id
-      FROM GRAPH_TABLE (snb_graph
-          MATCH (src IS Person)-[IS knows]->(dst IS Person)
-          COLUMNS (src.id AS src_id, dst.id AS dst_id)
-      )
-),
-wcc0 AS (
-    SELECT vid, vid AS cid
+-- 2. Weakly Connected Components (WCC) via WITH RECURSIVE ... UNION DISTINCT ON (vid ORDER BY cid ASC) over GRAPH_TABLE edges
+WITH RECURSIVE wcc AS (
+    SELECT g.vid AS vid,
+           g.vid AS cid,
+           0 AS round
       FROM GRAPH_TABLE (snb_graph
           MATCH (p IS Person)
           COLUMNS (p.id AS vid)
-      )
-),
-wcc1 AS (
-    SELECT w.vid,
-           LEAST(w.cid, COALESCE(MIN(nb.cid), w.cid)) AS cid
-      FROM wcc0 w
-      LEFT JOIN edges k ON k.src_id = w.vid
-      LEFT JOIN wcc0 nb ON nb.vid = k.dst_id
-     GROUP BY w.vid, w.cid
-),
-wcc2 AS (
-    SELECT w.vid,
-           LEAST(w.cid, COALESCE(MIN(nb.cid), w.cid)) AS cid
-      FROM wcc1 w
-      LEFT JOIN edges k ON k.src_id = w.vid
-      LEFT JOIN wcc1 nb ON nb.vid = k.dst_id
-     GROUP BY w.vid, w.cid
-),
-wcc3 AS (
-    SELECT w.vid,
-           LEAST(w.cid, COALESCE(MIN(nb.cid), w.cid)) AS cid
-      FROM wcc2 w
-      LEFT JOIN edges k ON k.src_id = w.vid
-      LEFT JOIN wcc2 nb ON nb.vid = k.dst_id
-     GROUP BY w.vid, w.cid
-),
-wcc4 AS (
-    SELECT w.vid,
-           LEAST(w.cid, COALESCE(MIN(nb.cid), w.cid)) AS cid
-      FROM wcc3 w
-      LEFT JOIN edges k ON k.src_id = w.vid
-      LEFT JOIN wcc3 nb ON nb.vid = k.dst_id
-     GROUP BY w.vid, w.cid
+      ) g
+    UNION DISTINCT ON (vid ORDER BY cid ASC)
+    SELECT g.dst_id AS vid,
+           w.cid AS cid,
+           w.round + 1 AS round
+      FROM wcc w,
+           GRAPH_TABLE (snb_graph
+               MATCH (src IS Person WHERE src.id = w.vid)-[IS knows]->(dst IS Person)
+               COLUMNS (dst.id AS dst_id)
+           ) g
+     WHERE w.round < 4
 )
 SELECT count(DISTINCT cid) AS wcc_components,
        count(*) AS wcc_vertices
-  FROM wcc4 \gset
+  FROM wcc \gset
 
 \validate_result (:wcc_components >= 1 and :wcc_components <= :wcc_vertices) true
 
--- 3. Single-Source Shortest Paths (SSSP) over weighted knows edges in GRAPH_TABLE
+-- 3. Single-Source Shortest Paths (SSSP) over weighted knows edges via UNION DISTINCT ON (vid ORDER BY min_dist ASC)
 WITH RECURSIVE sssp AS (
     SELECT :root_id::bigint AS vid,
-           0.0::float8 AS dist,
-           0 AS hops,
-           ARRAY[:root_id::bigint] AS path
-    UNION ALL
+           0.0::float8 AS min_dist,
+           0 AS hops
+    UNION DISTINCT ON (vid ORDER BY min_dist ASC)
     SELECT g.dst_id AS vid,
-           s.dist + g.weight AS dist,
-           s.hops + 1,
-           s.path || g.dst_id
+           s.min_dist + g.weight AS min_dist,
+           s.hops + 1 AS hops
       FROM sssp s,
            GRAPH_TABLE (snb_graph
                MATCH (src IS Person WHERE src.id = s.vid)-[k IS knows]->(dst IS Person)
                COLUMNS (dst.id AS dst_id, k.weight AS weight)
            ) g
      WHERE s.hops < 3
-       AND NOT (g.dst_id = ANY(s.path))
-),
-sssp_best AS (
-    SELECT vid, MIN(dist) AS min_dist
-      FROM sssp
-     GROUP BY vid
+       AND g.dst_id <> :root_id
 )
 SELECT COALESCE(MIN(min_dist) FILTER (WHERE vid = :root_id), -1.0) AS sssp_root_dist,
        COALESCE(MAX(min_dist), 0.0) AS sssp_max_dist
-  FROM sssp_best \gset
+  FROM sssp \gset
 
 \validate_result :sssp_root_dist 0.0 0.000001
 \validate_result (:sssp_max_dist >= 0.0) true

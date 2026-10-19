@@ -25,10 +25,10 @@ WITH RECURSIVE target_root AS (
      LIMIT 1
 ),
 reply_tree AS (
-    SELECT tr.id
+    SELECT tr.id AS id
       FROM target_root tr
-    UNION ALL
-    SELECT g.child_id
+    UNION DISTINCT ON (id)
+    SELECT g.child_id AS id
       FROM reply_tree rt,
            GRAPH_TABLE (snb_graph
                MATCH (child IS Message)-[IS replyOf]->(parent IS Message WHERE parent.id = rt.id)

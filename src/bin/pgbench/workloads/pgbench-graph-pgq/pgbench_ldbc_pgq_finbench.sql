@@ -63,23 +63,21 @@ SELECT DISTINCT g.shared_acct_id,
  LIMIT 10;
 
 -- 2. Complex Reads (TCR1, TCR2, TCR4, TCR8)
--- TCR1: 1..3 Hop Temporal Transfer Path with strictly ascending timestamps (t1 < t2 < t3)
+-- TCR1: 1..3 Hop Temporal Transfer Path with strictly ascending timestamps via UNION DISTINCT ON (curr_acct, last_ts)
 WITH RECURSIVE temporal_paths AS (
     SELECT g.dst_acct AS curr_acct,
            g.created_ts AS last_ts,
-           1 AS hop_dist,
-           ARRAY[:acct_id::bigint, g.dst_acct] AS path
+           1 AS hop_dist
       FROM GRAPH_TABLE (finbench_graph
           MATCH (src IS Account WHERE src.id = :acct_id)
                 -[t1 IS transfer WHERE t1.created_ts >= :start_ts AND t1.created_ts <= :end_ts]->
                 (dst IS Account)
           COLUMNS (dst.id AS dst_acct, t1.created_ts AS created_ts)
       ) g
-    UNION ALL
+    UNION DISTINCT ON (curr_acct, last_ts)
     SELECT g.dst_acct AS curr_acct,
            g.created_ts AS last_ts,
-           tp.hop_dist + 1,
-           tp.path || g.dst_acct
+           tp.hop_dist + 1 AS hop_dist
       FROM temporal_paths tp,
            GRAPH_TABLE (finbench_graph
                MATCH (src IS Account WHERE src.id = tp.curr_acct)
@@ -88,7 +86,7 @@ WITH RECURSIVE temporal_paths AS (
                COLUMNS (dst.id AS dst_acct, tn.created_ts AS created_ts)
            ) g
      WHERE tp.hop_dist < 3
-       AND NOT (g.dst_acct = ANY(tp.path))
+       AND g.dst_acct <> :acct_id
 )
 SELECT count(*) AS tcr1_paths
   FROM temporal_paths tp,

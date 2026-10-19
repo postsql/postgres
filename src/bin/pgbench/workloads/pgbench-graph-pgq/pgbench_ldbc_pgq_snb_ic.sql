@@ -15,29 +15,30 @@
 \set cutoff_ts 1700090000000000
 \set window_start_ts 1700000000000000
 
--- IC1 & IC2: 1..2 hop friends via GRAPH_TABLE and their recent messages before cutoff_ts
-WITH k_hops AS (
-    SELECT friend_id, last_name, 1 AS dist
+-- IC1 & IC2: 1..2 hop friends deduplicated on-the-fly via UNION DISTINCT ON (friend_id) and GRAPH_TABLE
+WITH RECURSIVE k_hops AS (
+    SELECT g1.friend_id AS friend_id, 1 AS min_dist
       FROM GRAPH_TABLE (snb_graph
           MATCH (src IS Person WHERE src.id = :person_id)-[IS knows]->(f1 IS Person)
-          COLUMNS (f1.id AS friend_id, f1.last_name AS last_name)
-      )
-    UNION ALL
-    SELECT friend_id, last_name, 2 AS dist
-      FROM GRAPH_TABLE (snb_graph
-          MATCH (src IS Person WHERE src.id = :person_id)-[IS knows]->(f1 IS Person)-[IS knows]->(f2 IS Person)
-          WHERE f2.id <> src.id
-          COLUMNS (f2.id AS friend_id, f2.last_name AS last_name)
-      )
-),
-dedup_friends AS (
-    SELECT friend_id, last_name, MIN(dist) AS min_dist
-      FROM k_hops
-     GROUP BY friend_id, last_name
+          COLUMNS (f1.id AS friend_id)
+      ) g1
+    UNION DISTINCT ON (friend_id)
+    SELECT g2.friend_id AS friend_id, h.min_dist + 1 AS min_dist
+      FROM k_hops h,
+           GRAPH_TABLE (snb_graph
+               MATCH (src IS Person WHERE src.id = h.friend_id)-[IS knows]->(f2 IS Person)
+               COLUMNS (f2.id AS friend_id)
+           ) g2
+     WHERE h.min_dist < 2
+       AND g2.friend_id <> :person_id
 )
-SELECT df.friend_id AS disc_person_id
-  FROM dedup_friends df
- ORDER BY df.min_dist ASC, df.last_name ASC, df.friend_id ASC
+SELECT h.friend_id AS disc_person_id
+  FROM k_hops h,
+       GRAPH_TABLE (snb_graph
+           MATCH (p IS Person WHERE p.id = h.friend_id)
+           COLUMNS (p.id AS id, p.last_name AS last_name)
+       ) p
+ ORDER BY h.min_dist ASC, p.last_name ASC, p.id ASC
  LIMIT 10 \gset_col disc_person_id
 
 \if reservoir_count('persons') >= 0
@@ -56,20 +57,22 @@ SELECT g.disc_msg_id
 \reservoir_push messages :disc_msg_id
 \endif
 
--- IC3 & IC4: Popular tags among 1..2 hop friends' posts within time window
-WITH friends AS (
-    SELECT fid
+-- IC3 & IC4: Popular tags among 1..2 hop friends' posts within time window via UNION DISTINCT ON (fid)
+WITH RECURSIVE friends AS (
+    SELECT g1.fid AS fid, 1 AS hop
       FROM GRAPH_TABLE (snb_graph
           MATCH (src IS Person WHERE src.id = :person_id)-[IS knows]->(f1 IS Person)
           COLUMNS (f1.id AS fid)
-      )
-    UNION
-    SELECT fid
-      FROM GRAPH_TABLE (snb_graph
-          MATCH (src IS Person WHERE src.id = :person_id)-[IS knows]->(f1 IS Person)-[IS knows]->(f2 IS Person)
-          WHERE f2.id <> src.id
-          COLUMNS (f2.id AS fid)
-      )
+      ) g1
+    UNION DISTINCT ON (fid)
+    SELECT g2.fid AS fid, f.hop + 1 AS hop
+      FROM friends f,
+           GRAPH_TABLE (snb_graph
+               MATCH (src IS Person WHERE src.id = f.fid)-[IS knows]->(f2 IS Person)
+               COLUMNS (f2.id AS fid)
+           ) g2
+     WHERE f.hop < 2
+       AND g2.fid <> :person_id
 )
 SELECT g.tag_name,
        count(*) AS post_count
@@ -124,22 +127,19 @@ SELECT g.friend_id,
  ORDER BY reply_count DESC, g.friend_id ASC
  LIMIT 10;
 
--- IC13: Bounded Shortest Path between :person_id and :other_person_id via WITH RECURSIVE + GRAPH_TABLE step
+-- IC13: Bounded Shortest Path between :person_id and :other_person_id via WITH RECURSIVE ... UNION DISTINCT ON (node_id)
 WITH RECURSIVE bfs AS (
     SELECT :person_id::bigint AS node_id,
-           0 AS depth,
-           ARRAY[:person_id::bigint] AS path
-    UNION ALL
-    SELECT g.dst_id,
-           b.depth + 1,
-           b.path || g.dst_id
+           0 AS depth
+    UNION DISTINCT ON (node_id)
+    SELECT g.dst_id AS node_id,
+           b.depth + 1 AS depth
       FROM bfs b,
            GRAPH_TABLE (snb_graph
                MATCH (src IS Person WHERE src.id = b.node_id)-[IS knows]->(dst IS Person)
                COLUMNS (dst.id AS dst_id)
            ) g
      WHERE b.depth < 4
-       AND NOT (g.dst_id = ANY(b.path))
 )
 SELECT COALESCE(MIN(depth), -1) AS shortest_path_len
   FROM bfs
