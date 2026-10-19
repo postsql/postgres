@@ -12,7 +12,9 @@ endif
 
 pg_lz4 = shared_module('pg_lz4',
   pg_lz4_sources,
-  kwargs: contrib_mod_args,
+  kwargs: contrib_mod_args + {
+    'dependencies': contrib_mod_args['dependencies'] + [lz4],
+  },
 )
 contrib_targets += pg_lz4
 

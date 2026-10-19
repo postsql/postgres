@@ -13,7 +13,13 @@
  */
 #include "postgres.h"
 
+#ifndef WIN32
 #include <dlfcn.h>
+#endif
+
+#ifndef RTLD_LOCAL
+#define RTLD_LOCAL 0
+#endif
 
 #include "access/detoast.h"
 #include "access/encoding_context.h"
@@ -49,44 +55,484 @@ typedef struct Lz4LibApi
 
 static Lz4LibApi lz4_api = {0};
 
+/*
+ * Self-contained standard LZ4 block + dictionary software fallback used when
+ * the host environment does not provide an external liblz4 shared library
+ * (e.g., Windows CI builds with -Dauto_features=disabled).
+ */
+typedef struct FbLz4Stream
+{
+	const char *dict;
+	int			dict_size;
+} FbLz4Stream;
+
+static uint32
+fb_lz4_read_u32(const uint8 *p)
+{
+	uint32		v;
+
+	memcpy(&v, p, sizeof(uint32));
+	return v;
+}
+
+static int
+fb_lz4_compressBound(int inputSize)
+{
+	if (inputSize < 0)
+		return 0;
+	return inputSize + (inputSize / 255) + 16;
+}
+
+static int
+fb_lz4_compress_ext(const char *src, char *dst, int srcSize, int dstCapacity,
+					const char *dict, int dictSize)
+{
+	const uint8 *ip = (const uint8 *) src;
+	const uint8 *anchor = ip;
+	const uint8 *const iend = ip + srcSize;
+	const uint8 *const mflimit = iend - 12;
+	const uint8 *const matchlimit = iend - 5;
+	uint8	   *op = (uint8 *) dst;
+	uint8	   *const oend = op + dstCapacity;
+	int32		htab[4096];
+	const uint8 *dict_base = NULL;
+	int			use_dict_size = 0;
+
+	if (srcSize < 0 || dstCapacity <= 0)
+		return 0;
+
+	if (srcSize == 0)
+	{
+		if (dstCapacity < 1)
+			return 0;
+		*op++ = 0;
+		return 1;
+	}
+
+	for (int i = 0; i < 4096; i++)
+		htab[i] = PG_INT32_MIN;
+
+	if (dict != NULL && dictSize >= 4)
+	{
+		use_dict_size = (dictSize > 65535) ? 65535 : dictSize;
+		dict_base = (const uint8 *) dict + (dictSize - use_dict_size);
+		for (int p = -use_dict_size; p <= -4; p++)
+		{
+			uint32		v = fb_lz4_read_u32(dict_base + use_dict_size + p);
+			uint32		h = (v * 2654435761U) >> 20;
+
+			htab[h] = p;
+		}
+	}
+
+	if (srcSize >= 13)
+	{
+		while (ip <= mflimit)
+		{
+			int			cur = (int) (ip - (const uint8 *) src);
+			uint32		v = fb_lz4_read_u32(ip);
+			uint32		h = (v * 2654435761U) >> 20;
+			int32		ref = htab[h];
+			int			offset = cur - ref;
+			int			mlen = 0;
+
+			htab[h] = cur;
+
+			if (ref > PG_INT32_MIN && offset > 0 && offset <= 65535)
+			{
+				if (ref >= 0)
+				{
+					const uint8 *refp = (const uint8 *) src + ref;
+
+					if (fb_lz4_read_u32(refp) == v)
+					{
+						int			max_m = (int) (matchlimit - ip);
+
+						mlen = 4;
+						while (mlen < max_m && refp[mlen] == ip[mlen])
+							mlen++;
+					}
+				}
+				else if (dict_base != NULL && ref + 4 <= 0)
+				{
+					const uint8 *refp = dict_base + use_dict_size + ref;
+
+					if (fb_lz4_read_u32(refp) == v)
+					{
+						int			max_dict_m = -ref;
+						int			max_src_m = (int) (matchlimit - ip);
+						int			max_m = (max_dict_m < max_src_m) ? max_dict_m : max_src_m;
+
+						mlen = 4;
+						while (mlen < max_m && refp[mlen] == ip[mlen])
+							mlen++;
+					}
+				}
+			}
+
+			if (mlen >= 4)
+			{
+				int			lit_len = (int) (ip - anchor);
+				int			m_code = mlen - 4;
+				uint8	   *token_ptr;
+
+				if (op + 1 + (lit_len / 255) + 1 + lit_len + 2 + (m_code / 255) + 1 > oend)
+					return 0;
+
+				token_ptr = op++;
+				if (lit_len >= 15)
+				{
+					int			rem = lit_len - 15;
+
+					*token_ptr = (uint8) (15 << 4);
+					while (rem >= 255)
+					{
+						*op++ = 255;
+						rem -= 255;
+					}
+					*op++ = (uint8) rem;
+				}
+				else
+					*token_ptr = (uint8) (lit_len << 4);
+
+				if (lit_len > 0)
+				{
+					memcpy(op, anchor, lit_len);
+					op += lit_len;
+				}
+
+				*op++ = (uint8) (offset & 0xFF);
+				*op++ = (uint8) ((offset >> 8) & 0xFF);
+
+				if (m_code >= 15)
+				{
+					int			rem = m_code - 15;
+
+					*token_ptr |= 15;
+					while (rem >= 255)
+					{
+						*op++ = 255;
+						rem -= 255;
+					}
+					*op++ = (uint8) rem;
+				}
+				else
+					*token_ptr |= (uint8) m_code;
+
+				ip += mlen;
+				anchor = ip;
+			}
+			else
+			{
+				ip++;
+			}
+		}
+	}
+
+	{
+		int			last_lit = (int) (iend - anchor);
+		uint8	   *token_ptr;
+
+		if (op + 1 + (last_lit / 255) + 1 + last_lit > oend)
+			return 0;
+
+		token_ptr = op++;
+		if (last_lit >= 15)
+		{
+			int			rem = last_lit - 15;
+
+			*token_ptr = (uint8) (15 << 4);
+			while (rem >= 255)
+			{
+				*op++ = 255;
+				rem -= 255;
+			}
+			*op++ = (uint8) rem;
+		}
+		else
+			*token_ptr = (uint8) (last_lit << 4);
+
+		if (last_lit > 0)
+		{
+			memcpy(op, anchor, last_lit);
+			op += last_lit;
+		}
+	}
+
+	return (int) (op - (uint8 *) dst);
+}
+
+static int
+fb_lz4_decompress_safe_usingDict(const char *src, char *dst, int compressedSize,
+								 int maxOutputSize, const char *dictStart, int dictSize)
+{
+	const uint8 *ip = (const uint8 *) src;
+	const uint8 *const iend = ip + compressedSize;
+	uint8	   *op = (uint8 *) dst;
+	uint8	   *const oend = op + maxOutputSize;
+	const uint8 *dict_base = NULL;
+	int			use_dict_size = 0;
+
+	if (compressedSize < 0 || maxOutputSize < 0)
+		return -1;
+	if (compressedSize == 0)
+		return (maxOutputSize == 0) ? 0 : -1;
+
+	if (dictStart != NULL && dictSize > 0)
+	{
+		use_dict_size = dictSize;
+		dict_base = (const uint8 *) dictStart;
+	}
+
+	while (ip < iend)
+	{
+		uint8		token = *ip++;
+		int			lit_len = token >> 4;
+		int			match_len;
+		int			offset;
+		int			cur_out;
+
+		if (lit_len == 15)
+		{
+			uint8		s;
+
+			do
+			{
+				if (ip >= iend)
+					return -(int) (ip - (const uint8 *) src) - 1;
+				s = *ip++;
+				lit_len += s;
+				if (lit_len > maxOutputSize)
+					return -(int) (ip - (const uint8 *) src) - 1;
+			} while (s == 255);
+		}
+
+		if (ip + lit_len > iend || op + lit_len > oend)
+			return -(int) (ip - (const uint8 *) src) - 1;
+
+		if (lit_len > 0)
+		{
+			memcpy(op, ip, lit_len);
+			ip += lit_len;
+			op += lit_len;
+		}
+
+		if (ip == iend)
+		{
+			if ((token & 0x0F) != 0)
+				return -(int) (ip - (const uint8 *) src) - 1;
+			break;
+		}
+
+		if (ip + 2 > iend)
+			return -(int) (ip - (const uint8 *) src) - 1;
+
+		offset = (int) ip[0] | ((int) ip[1] << 8);
+		ip += 2;
+		if (offset <= 0)
+			return -(int) (ip - (const uint8 *) src) - 1;
+
+		match_len = (token & 0x0F) + 4;
+		if ((token & 0x0F) == 15)
+		{
+			uint8		s;
+
+			do
+			{
+				if (ip >= iend)
+					return -(int) (ip - (const uint8 *) src) - 1;
+				s = *ip++;
+				match_len += s;
+				if (match_len > maxOutputSize)
+					return -(int) (ip - (const uint8 *) src) - 1;
+			} while (s == 255);
+		}
+
+		if (op + match_len > oend)
+			return -(int) (ip - (const uint8 *) src) - 1;
+
+		cur_out = (int) (op - (uint8 *) dst);
+		if (offset <= cur_out)
+		{
+			const uint8 *match = op - offset;
+
+			for (int k = 0; k < match_len; k++)
+				*op++ = *match++;
+		}
+		else
+		{
+			int			dict_back = offset - cur_out;
+			int			dict_off;
+			int			copy_from_dict;
+
+			if (dict_base == NULL || dict_back > use_dict_size)
+				return -(int) (ip - (const uint8 *) src) - 1;
+
+			dict_off = use_dict_size - dict_back;
+			copy_from_dict = use_dict_size - dict_off;
+			if (copy_from_dict > match_len)
+				copy_from_dict = match_len;
+
+			memcpy(op, dict_base + dict_off, copy_from_dict);
+			op += copy_from_dict;
+			match_len -= copy_from_dict;
+
+			if (match_len > 0)
+			{
+				const uint8 *match = (const uint8 *) dst;
+
+				for (int k = 0; k < match_len; k++)
+					*op++ = *match++;
+			}
+		}
+	}
+
+	return (int) (op - (uint8 *) dst);
+}
+
+static int
+fb_lz4_compress_default(const char *src, char *dst, int srcSize, int dstCapacity)
+{
+	return fb_lz4_compress_ext(src, dst, srcSize, dstCapacity, NULL, 0);
+}
+
+static int
+fb_lz4_decompress_safe(const char *src, char *dst, int compressedSize, int dstCapacity)
+{
+	return fb_lz4_decompress_safe_usingDict(src, dst, compressedSize, dstCapacity, NULL, 0);
+}
+
+static void *
+fb_lz4_createStream(void)
+{
+	return calloc(1, sizeof(FbLz4Stream));
+}
+
+static int
+fb_lz4_freeStream(void *streamPtr)
+{
+	if (streamPtr != NULL)
+		free(streamPtr);
+	return 0;
+}
+
+static void
+fb_lz4_resetStream_fast(void *streamPtr)
+{
+	if (streamPtr != NULL)
+		memset(streamPtr, 0, sizeof(FbLz4Stream));
+}
+
+static int
+fb_lz4_loadDict(void *streamPtr, const char *dictionary, int dictSize)
+{
+	FbLz4Stream *s = (FbLz4Stream *) streamPtr;
+
+	if (s == NULL)
+		return 0;
+	s->dict = dictionary;
+	s->dict_size = dictSize;
+	return dictSize;
+}
+
+static void
+fb_lz4_attach_dictionary(void *workingStream, const void *dictionaryStream)
+{
+	FbLz4Stream *ws = (FbLz4Stream *) workingStream;
+	const FbLz4Stream *ds = (const FbLz4Stream *) dictionaryStream;
+
+	if (ws != NULL && ds != NULL)
+	{
+		ws->dict = ds->dict;
+		ws->dict_size = ds->dict_size;
+	}
+}
+
+static int
+fb_lz4_compress_fast_continue(void *streamPtr, const char *src, char *dst,
+							  int srcSize, int dstCapacity, int acceleration)
+{
+	FbLz4Stream *ws = (FbLz4Stream *) streamPtr;
+
+	(void) acceleration;
+	return fb_lz4_compress_ext(src, dst, srcSize, dstCapacity,
+							   ws ? ws->dict : NULL,
+							   ws ? ws->dict_size : 0);
+}
+
 static void
 ensure_lz4_loaded(void)
 {
-	void	   *handle;
+	static const char *const lz4_lib_candidates[] = {
+		"liblz4.so.1",
+		"liblz4.so",
+		"liblz4.1.dylib",
+		"liblz4.dylib",
+		"/opt/local/lib/liblz4.1.dylib",
+		"/opt/local/lib/liblz4.dylib",
+		"/opt/homebrew/lib/liblz4.1.dylib",
+		"/opt/homebrew/lib/liblz4.dylib",
+		"/usr/local/lib/liblz4.1.dylib",
+		"/usr/local/lib/liblz4.dylib",
+		"liblz4.dll",
+		"lz4.dll",
+		"C:\\msys64\\ucrt64\\bin\\liblz4.dll",
+		"C:\\mingw64\\bin\\liblz4.dll",
+		NULL
+	};
+	void	   *handle = NULL;
 
 	if (lz4_api.loaded)
 		return;
 
-	handle = dlopen("liblz4.so.1", RTLD_NOW | RTLD_LOCAL);
-	if (handle == NULL)
-		handle = dlopen("liblz4.so", RTLD_NOW | RTLD_LOCAL);
-	if (handle == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("could not load liblz4 shared library: %s", dlerror())));
-
-	lz4_api.compressBound = dlsym(handle, "LZ4_compressBound");
-	lz4_api.compress_default = dlsym(handle, "LZ4_compress_default");
-	lz4_api.decompress_safe = dlsym(handle, "LZ4_decompress_safe");
-	lz4_api.createStream = dlsym(handle, "LZ4_createStream");
-	lz4_api.freeStream = dlsym(handle, "LZ4_freeStream");
-	lz4_api.resetStream_fast = dlsym(handle, "LZ4_resetStream_fast");
-	lz4_api.loadDict = dlsym(handle, "LZ4_loadDict");
-	lz4_api.attach_dictionary = dlsym(handle, "LZ4_attach_dictionary");
-	lz4_api.compress_fast_continue = dlsym(handle, "LZ4_compress_fast_continue");
-	lz4_api.decompress_safe_usingDict = dlsym(handle, "LZ4_decompress_safe_usingDict");
-
-	if (!lz4_api.compressBound || !lz4_api.compress_default ||
-		!lz4_api.decompress_safe || !lz4_api.createStream ||
-		!lz4_api.freeStream || !lz4_api.resetStream_fast ||
-		!lz4_api.loadDict || !lz4_api.attach_dictionary ||
-		!lz4_api.compress_fast_continue || !lz4_api.decompress_safe_usingDict)
+	if (getenv("PG_COMPRESSION_FORCE_FALLBACK") == NULL)
 	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("liblz4 is missing required dictionary compression symbols")));
+#ifndef WIN32
+		void	   *self = dlopen(NULL, RTLD_NOW | RTLD_LOCAL);
+
+		if (self != NULL && dlsym(self, "LZ4_compressBound") != NULL)
+			handle = self;
+#endif
+
+		for (int i = 0; handle == NULL && lz4_lib_candidates[i] != NULL; i++)
+			handle = dlopen(lz4_lib_candidates[i], RTLD_NOW | RTLD_LOCAL);
 	}
 
+	if (handle != NULL)
+	{
+		lz4_api.compressBound = dlsym(handle, "LZ4_compressBound");
+		lz4_api.compress_default = dlsym(handle, "LZ4_compress_default");
+		lz4_api.decompress_safe = dlsym(handle, "LZ4_decompress_safe");
+		lz4_api.createStream = dlsym(handle, "LZ4_createStream");
+		lz4_api.freeStream = dlsym(handle, "LZ4_freeStream");
+		lz4_api.resetStream_fast = dlsym(handle, "LZ4_resetStream_fast");
+		lz4_api.loadDict = dlsym(handle, "LZ4_loadDict");
+		lz4_api.attach_dictionary = dlsym(handle, "LZ4_attach_dictionary");
+		lz4_api.compress_fast_continue = dlsym(handle, "LZ4_compress_fast_continue");
+		lz4_api.decompress_safe_usingDict = dlsym(handle, "LZ4_decompress_safe_usingDict");
+
+		if (lz4_api.compressBound && lz4_api.compress_default &&
+			lz4_api.decompress_safe && lz4_api.createStream &&
+			lz4_api.freeStream && lz4_api.resetStream_fast &&
+			lz4_api.loadDict && lz4_api.attach_dictionary &&
+			lz4_api.compress_fast_continue && lz4_api.decompress_safe_usingDict)
+		{
+			lz4_api.loaded = true;
+			return;
+		}
+	}
+
+	/* Fall back to built-in standard LZ4 implementation */
+	lz4_api.compressBound = fb_lz4_compressBound;
+	lz4_api.compress_default = fb_lz4_compress_default;
+	lz4_api.decompress_safe = fb_lz4_decompress_safe;
+	lz4_api.createStream = fb_lz4_createStream;
+	lz4_api.freeStream = fb_lz4_freeStream;
+	lz4_api.resetStream_fast = fb_lz4_resetStream_fast;
+	lz4_api.loadDict = fb_lz4_loadDict;
+	lz4_api.attach_dictionary = fb_lz4_attach_dictionary;
+	lz4_api.compress_fast_continue = fb_lz4_compress_fast_continue;
+	lz4_api.decompress_safe_usingDict = fb_lz4_decompress_safe_usingDict;
 	lz4_api.loaded = true;
 }
 

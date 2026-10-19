@@ -12,7 +12,9 @@ endif
 
 pg_zstd = shared_module('pg_zstd',
   pg_zstd_sources,
-  kwargs: contrib_mod_args,
+  kwargs: contrib_mod_args + {
+    'dependencies': contrib_mod_args['dependencies'] + [zstd],
+  },
 )
 contrib_targets += pg_zstd
 

@@ -1201,8 +1201,13 @@ toast_direct_delete_tid(Relation toastrel, ItemPointer tid, bool is_speculative)
 	{
 		simple_heap_delete(toastrel, tid);
 		if (RelationGetDirectToastSelfPrune(toastrel))
-			RecordPageWithFreeSpace(toastrel, ItemPointerGetBlockNumber(tid),
+		{
+			BlockNumber blkno = ItemPointerGetBlockNumber(tid);
+
+			RecordPageWithFreeSpace(toastrel, blkno,
 									BLCKSZ - SizeOfPageHeaderData);
+			FreeSpaceMapVacuumRange(toastrel, blkno, blkno + 1);
+		}
 	}
 }
 

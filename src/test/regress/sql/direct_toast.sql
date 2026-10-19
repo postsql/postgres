@@ -544,6 +544,8 @@ CREATE TABLE tab_sup_direct(id int, val text)
   WITH (toast_flavour = 'direct', autovacuum_enabled = off);
 ALTER TABLE tab_sup_direct ALTER COLUMN val SET STORAGE EXTERNAL;
 
+CHECKPOINT;
+
 DO $$
 DECLARE
     lsn0 pg_lsn;
@@ -637,6 +639,8 @@ INSERT INTO tab_tier_direct VALUES
   (2, repeat('p', 600), decode(repeat(md5('tier2'), 1400), 'hex')),
   (3, repeat('p', 600), decode(repeat(md5('tier3'), 20000), 'hex'));
 
+VACUUM FREEZE tab_tier_oid, tab_tier_oid8, tab_tier_direct;
+
 CREATE FUNCTION measure_toast_io(tbl regclass, query_sql text,
                                  OUT heap_io bigint, OUT idx_io bigint)
 LANGUAGE plpgsql AS $$
@@ -647,6 +651,8 @@ DECLARE
     h1 bigint; i1 bigint;
     dummy text;
 BEGIN
+    SET LOCAL debug_parallel_query = off;
+
     SELECT c.reltoastrelid, i.indexrelid
       INTO toast_rel, toast_idx
       FROM pg_class c
@@ -679,12 +685,12 @@ FROM measure_toast_io('tab_tier_direct', 'SELECT encode(substring(val, 1, 500), 
      measure_toast_io('tab_tier_oid',    'SELECT encode(substring(val, 1, 500), ''hex'') FROM tab_tier_oid WHERE id = 2') o,
      measure_toast_io('tab_tier_oid8',   'SELECT encode(substring(val, 1, 500), ''hex'') FROM tab_tier_oid8 WHERE id = 2') o8;
 
--- Tier 3 (320KB tree DAG, 161 chunks) 100B middle slice at offset 150,000:
+-- Tier 3 (320KB tree DAG, 161 chunks) 100B middle slice at offset 150,100:
 -- Direct traverses root -> internal -> 1 leaf chunk = 3 heap blocks + 0 index blocks
 SELECT d.heap_io AS d_h, d.idx_io AS d_i, o.heap_io AS o_h, (o.idx_io > 0) AS o_idx, o8.heap_io AS o8_h, (o8.idx_io > 0) AS o8_idx
-FROM measure_toast_io('tab_tier_direct', 'SELECT encode(substring(val, 150000, 100), ''hex'') FROM tab_tier_direct WHERE id = 3') d,
-     measure_toast_io('tab_tier_oid',    'SELECT encode(substring(val, 150000, 100), ''hex'') FROM tab_tier_oid WHERE id = 3') o,
-     measure_toast_io('tab_tier_oid8',   'SELECT encode(substring(val, 150000, 100), ''hex'') FROM tab_tier_oid8 WHERE id = 3') o8;
+FROM measure_toast_io('tab_tier_direct', 'SELECT encode(substring(val, 150100, 100), ''hex'') FROM tab_tier_direct WHERE id = 3') d,
+     measure_toast_io('tab_tier_oid',    'SELECT encode(substring(val, 150100, 100), ''hex'') FROM tab_tier_oid WHERE id = 3') o,
+     measure_toast_io('tab_tier_oid8',   'SELECT encode(substring(val, 150100, 100), ''hex'') FROM tab_tier_oid8 WHERE id = 3') o8;
 
 DROP FUNCTION measure_toast_io(regclass, text);
 DROP TABLE tab_tier_oid, tab_tier_oid8, tab_tier_direct;

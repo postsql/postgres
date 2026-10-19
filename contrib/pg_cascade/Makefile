@@ -12,7 +12,7 @@ PGFILEDESC = "pg_cascade - multi-stage cascade and fused Avro+Zstd encoding cont
 REGRESS = pg_cascade
 EXTRA_INSTALL = contrib/pg_avro contrib/pg_zstd contrib/pg_lz4
 
-SHLIB_LINK += $(filter -ldl -lm, $(LIBS))
+SHLIB_LINK += $(filter -lzstd -llz4 -ldl -lm, $(LIBS))
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

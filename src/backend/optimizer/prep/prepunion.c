@@ -1767,7 +1767,7 @@ generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
 	{
 		SortGroupClause *sgc = (SortGroupClause *) lfirst(lg);
 		Index		ref = sgc->tleSortGroupRef;
-		TargetEntry *tle;
+		TargetEntry *tle PG_USED_FOR_ASSERTS_ONLY;
 
 		Assert(ref > 0 && ref <= list_length(targetlist));
 		tle = list_nth(targetlist, ref - 1);

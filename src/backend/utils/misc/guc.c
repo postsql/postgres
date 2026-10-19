@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/objectaccess.h"
@@ -3602,7 +3603,8 @@ set_config_with_handle(const char *name, config_handle *handle,
 	/* Disallow non-LOCAL changes to GUC_LOCAL_ONLY values */
 	if ((record->flags & GUC_LOCAL_ONLY) &&
 		source != PGC_S_DEFAULT &&
-		action != GUC_ACTION_LOCAL)
+		action != GUC_ACTION_LOCAL &&
+		!InitializingParallelWorker)
 	{
 		ereport(elevel,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

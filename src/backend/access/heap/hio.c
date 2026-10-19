@@ -783,6 +783,7 @@ loop:
 		static Oid	last_probe_relid = InvalidOid;
 		static TransactionId last_probe_xid = InvalidTransactionId;
 		static uint64 last_probe_delete_count = 0;
+		static BlockNumber last_probe_prune_hand = 0;
 		static BlockNumber unprunable_probes = 0;
 		static bool rel_exhausted = false;
 		static bool saw_inprogress_delete = false;
@@ -794,20 +795,27 @@ loop:
 			last_probe_relid = RelationGetRelid(relation);
 			last_probe_xid = cur_xid;
 			last_probe_delete_count = direct_toast_delete_count;
+			last_probe_prune_hand = 0;
 			unprunable_probes = 0;
 			rel_exhausted = false;
 			saw_inprogress_delete = false;
 		}
-		else if (!TransactionIdIsValid(cur_xid) || cur_xid != last_probe_xid)
+		else
 		{
-			last_probe_xid = cur_xid;
-			if (direct_toast_delete_count != last_probe_delete_count ||
-				saw_inprogress_delete)
+			if (relation->rd_toast_prune_hand == 0 && last_probe_prune_hand != 0)
+				relation->rd_toast_prune_hand = last_probe_prune_hand;
+
+			if (!TransactionIdIsValid(cur_xid) || cur_xid != last_probe_xid)
 			{
-				last_probe_delete_count = direct_toast_delete_count;
-				unprunable_probes = 0;
-				rel_exhausted = false;
-				saw_inprogress_delete = false;
+				last_probe_xid = cur_xid;
+				if (direct_toast_delete_count != last_probe_delete_count ||
+					saw_inprogress_delete)
+				{
+					last_probe_delete_count = direct_toast_delete_count;
+					unprunable_probes = 0;
+					rel_exhausted = false;
+					saw_inprogress_delete = false;
+				}
 			}
 		}
 
@@ -829,6 +837,7 @@ loop:
 				if (relation->rd_toast_prune_hand >= nblocks)
 					relation->rd_toast_prune_hand = 0;
 				probeBlk = relation->rd_toast_prune_hand++;
+				last_probe_prune_hand = relation->rd_toast_prune_hand;
 
 				probeBuf = ReadBuffer(relation, probeBlk);
 				probePage = BufferGetPage(probeBuf);

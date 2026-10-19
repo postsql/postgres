@@ -424,7 +424,14 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 		 * don't have to worry about that here.
 		 */
 		if (record_free_space)
-			RecordPageWithFreeSpace(relation, BufferGetBlockNumber(buffer), freespace);
+		{
+			BlockNumber blkno = BufferGetBlockNumber(buffer);
+
+			RecordPageWithFreeSpace(relation, blkno, freespace);
+			if (relation->rd_rel->relkind == RELKIND_TOASTVALUE &&
+				RelationGetDirectToastSelfPrune(relation))
+				FreeSpaceMapVacuumRange(relation, blkno, blkno + 1);
+		}
 	}
 }
 

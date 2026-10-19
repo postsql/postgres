@@ -22,4 +22,4 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
-SHLIB_LINK += $(filter -ldl -lm, $(LIBS))
+SHLIB_LINK += $(filter -lzstd -ldl -lm, $(LIBS))

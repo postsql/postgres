@@ -12,7 +12,9 @@ endif
 
 pg_cascade = shared_module('pg_cascade',
   pg_cascade_sources,
-  kwargs: contrib_mod_args,
+  kwargs: contrib_mod_args + {
+    'dependencies': contrib_mod_args['dependencies'] + [zstd, lz4],
+  },
 )
 contrib_targets += pg_cascade
 
