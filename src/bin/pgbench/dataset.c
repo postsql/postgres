@@ -45,10 +45,12 @@ typedef struct CopyDatasetSpec
 {
 	char	   *dataset_name;
 	char	   *table_spec;
+	bool		from_config;
 } CopyDatasetSpec;
 
 static CopyDatasetSpec copy_specs[MAX_COPY_SPECS];
 int			num_copy_dataset_specs = 0;
+bool		dataset_loading_from_config = false;
 
 static PgBenchReservoir reservoirs[MAX_RESERVOIRS];
 static int	num_reservoirs = 0;
@@ -324,6 +326,7 @@ registerDatasetEx(const char *name, DatasetFormat format,
 	int			fd;
 	struct stat st;
 	PgBenchDataset *ds;
+	PgBenchDataset *existing;
 	uint8	   *buf = NULL;
 	bool		mmapped = false;
 	int			ds_idx;
@@ -333,11 +336,16 @@ registerDatasetEx(const char *name, DatasetFormat format,
 	if (filepath == NULL || *filepath == '\0')
 		pg_fatal("dataset \"%s\": file path cannot be empty", name);
 
-	if (findDataset(name) != NULL)
-		pg_fatal("duplicate dataset name \"%s\"", name);
-
-	if (num_datasets >= MAX_DATASETS)
+	existing = findDataset(name);
+	if (existing != NULL)
+	{
+		if (!existing->from_config && !dataset_loading_from_config)
+			pg_fatal("duplicate dataset name \"%s\"", name);
+	}
+	else if (num_datasets >= MAX_DATASETS)
+	{
 		pg_fatal("too many datasets registered (maximum %d)", MAX_DATASETS);
+	}
 
 	if (!atexit_registered)
 	{
@@ -411,14 +419,37 @@ registerDatasetEx(const char *name, DatasetFormat format,
 	}
 	close(fd);
 
-	ds_idx = num_datasets++;
-	ds = &datasets[ds_idx];
+	if (existing != NULL)
+	{
+		ds_idx = existing->index;
+		ds = existing;
+		if (ds->raw_data != NULL)
+		{
+#ifndef WIN32
+			if (ds->is_mmapped)
+				(void) munmap(unconstify(uint8 *, ds->raw_data), ds->raw_size);
+			else
+#endif
+				pg_free(unconstify(uint8 *, ds->raw_data));
+			ds->raw_data = NULL;
+		}
+		pg_free(ds->row_offsets);
+		pg_free(ds->name);
+		pg_free(ds->filepath);
+	}
+	else
+	{
+		ds_idx = num_datasets++;
+		ds = &datasets[ds_idx];
+	}
+
 	memset(ds, 0, sizeof(PgBenchDataset));
 	ds->name = pg_strdup(name);
 	ds->filepath = pg_strdup(filepath);
 	ds->format = format;
 	ds->index = ds_idx;
 	ds->force_header = force_header;
+	ds->from_config = dataset_loading_from_config;
 	ds->raw_data = buf;
 	ds->raw_size = (size_t) st.st_size;
 	ds->is_mmapped = mmapped;
@@ -683,8 +714,12 @@ parseVectorBaseSpec(const char *spec)
 
 		if (second_colon != NULL)
 		{
+			char	   *off_str = pnstrdup(colon + 1, second_colon - (colon + 1));
+
 			table = pnstrdup(spec, colon - spec);
-			offset = strtoint64(colon + 1, false, NULL);
+			if (!strtoint64(off_str, false, &offset))
+				pg_fatal("invalid offset in --vector-base specification: \"%s\"", spec);
+			pg_free(off_str);
 			filepath = pg_strdup(second_colon + 1);
 		}
 		else
@@ -694,7 +729,9 @@ parseVectorBaseSpec(const char *spec)
 			if (is_an_int(part1))
 			{
 				table = pg_strdup("vecbench_items");
-				offset = strtoint64(part1, false, NULL);
+				if (!strtoint64(part1, false, &offset))
+					pg_fatal("invalid offset in --vector-base specification: \"%s\"", spec);
+				pg_free(part1);
 			}
 			else
 			{
@@ -718,7 +755,12 @@ parseVectorBaseSpec(const char *spec)
 		if (ds != NULL)
 			ds->id_offset = offset;
 	}
-	registerCopyDatasetSpec(psprintf("base:%s", table));
+	{
+		char	   *copy_spec = psprintf("base:%s", table);
+
+		registerCopyDatasetSpec(copy_spec);
+		pg_free(copy_spec);
+	}
 
 	pg_free(table);
 	pg_free(filepath);
@@ -747,8 +789,12 @@ parseGroundTruthTableSpec(const char *spec)
 
 		if (second_colon != NULL)
 		{
+			char	   *off_str = pnstrdup(colon + 1, second_colon - (colon + 1));
+
 			table = pnstrdup(spec, colon - spec);
-			offset = strtoint64(colon + 1, false, NULL);
+			if (!strtoint64(off_str, false, &offset))
+				pg_fatal("invalid offset in --ground-truth-table specification: \"%s\"", spec);
+			pg_free(off_str);
 			filepath = pg_strdup(second_colon + 1);
 		}
 		else
@@ -758,7 +804,9 @@ parseGroundTruthTableSpec(const char *spec)
 			if (is_an_int(part1))
 			{
 				table = pg_strdup("vecbench_ground_truth");
-				offset = strtoint64(part1, false, NULL);
+				if (!strtoint64(part1, false, &offset))
+					pg_fatal("invalid offset in --ground-truth-table specification: \"%s\"", spec);
+				pg_free(part1);
 			}
 			else
 			{
@@ -782,7 +830,12 @@ parseGroundTruthTableSpec(const char *spec)
 		if (ds != NULL)
 			ds->id_offset = offset;
 	}
-	registerCopyDatasetSpec(psprintf("ground_truth:%s", table));
+	{
+		char	   *copy_spec = psprintf("ground_truth:%s", table);
+
+		registerCopyDatasetSpec(copy_spec);
+		pg_free(copy_spec);
+	}
 
 	pg_free(table);
 	pg_free(filepath);
@@ -806,16 +859,30 @@ registerCopyDatasetSpec(const char *spec)
 		pg_fatal("invalid --copy-dataset specification \"%s\" (expected <dataset>:<table>[(cols)])",
 				 spec);
 
-	if (num_copy_dataset_specs >= MAX_COPY_SPECS)
-		pg_fatal("too many --copy-dataset specifications (maximum %d)", MAX_COPY_SPECS);
-
 	ds_name = pg_malloc((colon - spec) + 1);
 	memcpy(ds_name, spec, colon - spec);
 	ds_name[colon - spec] = '\0';
 	table_spec = colon + 1;
 
+	for (int i = 0; i < num_copy_dataset_specs; i++)
+	{
+		if (strcmp(copy_specs[i].dataset_name, ds_name) == 0 &&
+			(copy_specs[i].from_config || dataset_loading_from_config))
+		{
+			pg_free(ds_name);
+			pg_free(copy_specs[i].table_spec);
+			copy_specs[i].table_spec = pg_strdup(table_spec);
+			copy_specs[i].from_config = dataset_loading_from_config;
+			return;
+		}
+	}
+
+	if (num_copy_dataset_specs >= MAX_COPY_SPECS)
+		pg_fatal("too many --copy-dataset specifications (maximum %d)", MAX_COPY_SPECS);
+
 	copy_specs[num_copy_dataset_specs].dataset_name = ds_name;
 	copy_specs[num_copy_dataset_specs].table_spec = pg_strdup(table_spec);
+	copy_specs[num_copy_dataset_specs].from_config = dataset_loading_from_config;
 	num_copy_dataset_specs++;
 }
 
@@ -2425,8 +2492,21 @@ registerReservoir(const char *name, uint64 capacity)
 		pg_fatal("reservoir \"%s\": invalid capacity " UINT64_FORMAT " (must be 1..100000000)",
 				 name, capacity);
 
-	if (findReservoir(name) != NULL)
+	res = findReservoir(name);
+	if (res != NULL)
+	{
+		if (res->from_config)
+		{
+			pg_free(res->slots);
+			res->capacity = capacity;
+			res->slots = pg_malloc0_array(int64, capacity);
+			res->from_config = false;
+			__atomic_store_n(&res->write_idx, 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&res->valid_count, 0, __ATOMIC_RELAXED);
+			return;
+		}
 		pg_fatal("duplicate reservoir name \"%s\"", name);
+	}
 	if (num_reservoirs >= MAX_RESERVOIRS)
 		pg_fatal("too many reservoirs registered (maximum %d)", MAX_RESERVOIRS);
 
@@ -2441,6 +2521,7 @@ registerReservoir(const char *name, uint64 capacity)
 	res->name = pg_strdup(name);
 	res->capacity = capacity;
 	res->slots = pg_malloc0_array(int64, capacity);
+	res->from_config = false;
 	__atomic_store_n(&res->write_idx, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&res->valid_count, 0, __ATOMIC_RELAXED);
 }
@@ -2684,5 +2765,89 @@ handle_cmd_reservoir_sample(CState *st, Command *cmd, pg_time_usec_t *now)
 	}
 
 	return CSTATE_END_COMMAND;
+}
+
+int
+getNumDatasets(void)
+{
+	return num_datasets;
+}
+
+const PgBenchDataset *
+getDatasetByIndex(int idx)
+{
+	if (idx < 0 || idx >= num_datasets)
+		return NULL;
+	return &datasets[idx];
+}
+
+bool
+getCopyDatasetSpecByIndex(int idx, const char **dataset_name,
+						  const char **table_spec)
+{
+	if (idx < 0 || idx >= num_copy_dataset_specs)
+		return false;
+	if (dataset_name != NULL)
+		*dataset_name = copy_specs[idx].dataset_name;
+	if (table_spec != NULL)
+		*table_spec = copy_specs[idx].table_spec;
+	return true;
+}
+
+void
+resetPhaseBarriers(void)
+{
+	lockCausalClock();
+	for (int s = 0; s < MAX_BARRIER_SLOTS; s++)
+	{
+		causal_clock.barrier_arrived[s] = 0;
+		causal_clock.barrier_done[s] = 0;
+	}
+	unlockCausalClock();
+}
+
+void
+registerOrUpdateReservoir(const char *name, uint64 capacity)
+{
+	PgBenchReservoir *res;
+
+	if (name == NULL || *name == '\0')
+		pg_fatal("reservoir name cannot be empty");
+	if (capacity == 0)
+		pg_fatal("reservoir \"%s\" capacity must be > 0", name);
+
+	res = findReservoir(name);
+	if (res != NULL)
+	{
+		if (res->capacity != capacity)
+		{
+			pg_free(res->slots);
+			res->capacity = capacity;
+			res->slots = pg_malloc0_array(int64, capacity);
+			__atomic_store_n(&res->write_idx, 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&res->valid_count, 0, __ATOMIC_RELAXED);
+		}
+		res->from_config = true;
+		return;
+	}
+
+	registerReservoir(name, capacity);
+	res = findReservoir(name);
+	if (res != NULL)
+		res->from_config = true;
+}
+
+int
+getNumReservoirs(void)
+{
+	return num_reservoirs;
+}
+
+const PgBenchReservoir *
+getReservoirByIndex(int idx)
+{
+	if (idx < 0 || idx >= num_reservoirs)
+		return NULL;
+	return &reservoirs[idx];
 }
 
