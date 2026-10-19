@@ -113,6 +113,27 @@ CREATE INDEX pgbench_fin_transfers_dst_ts_idx
 CREATE INDEX pgbench_fin_loans_borrower_idx
     ON pgbench_fin_loans (borrower_id, acct_id);
 
+CREATE INDEX pgbench_graph_forum_members_person_idx
+    ON pgbench_graph_forum_members (person_id, forum_id);
+
+CREATE INDEX pgbench_fin_sign_ins_acct_idx
+    ON pgbench_fin_sign_ins (acct_id, medium_id, created_ts);
+
+CREATE INDEX pgbench_graph_persons_city_idx
+    ON pgbench_graph_persons (city_id, id);
+
+CREATE INDEX pgbench_graph_places_part_of_idx
+    ON pgbench_graph_places (part_of_id, type, id);
+
+CREATE INDEX pgbench_graph_messages_created_ts_idx
+    ON pgbench_graph_messages (created_ts DESC, id);
+
+CREATE INDEX pgbench_graph_forums_moderator_idx
+    ON pgbench_graph_forums (moderator_id, id);
+
+CREATE INDEX pgbench_graph_tags_tagclass_idx
+    ON pgbench_graph_tags (tagclass_id, id);
+
 ANALYZE pgbench_graph_places;
 ANALYZE pgbench_graph_tags;
 ANALYZE pgbench_graph_persons;

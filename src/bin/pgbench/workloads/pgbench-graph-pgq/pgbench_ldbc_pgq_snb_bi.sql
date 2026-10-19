@@ -112,18 +112,18 @@ SELECT count(*) AS bi4_rows
 
 \validate_result (:bi4_rows >= 0) true
 
--- BI-9: Top Thread Initiators via WITH RECURSIVE + GRAPH_TABLE reply-tree expansion
+-- BI-9: Top Thread Initiators via WITH RECURSIVE ... UNION DISTINCT ON (msg_id) + GRAPH_TABLE reply-tree expansion
 WITH RECURSIVE thread_tree AS (
-    SELECT g.root_post_id,
-           g.root_author_id,
+    SELECT g.root_post_id AS root_post_id,
+           g.root_author_id AS root_author_id,
            g.root_post_id AS msg_id
       FROM GRAPH_TABLE (snb_graph
           MATCH (post IS Message WHERE post.parent_message_id IS NULL AND post.created_ts >= :window1_start AND post.created_ts <= :cutoff_ts)-[IS hasCreator]->(p IS Person)
           COLUMNS (post.id AS root_post_id, p.id AS root_author_id)
       ) g
-    UNION ALL
-    SELECT tt.root_post_id,
-           tt.root_author_id,
+    UNION DISTINCT ON (msg_id)
+    SELECT tt.root_post_id AS root_post_id,
+           tt.root_author_id AS root_author_id,
            g.reply_id AS msg_id
       FROM thread_tree tt,
            GRAPH_TABLE (snb_graph
@@ -144,43 +144,49 @@ SELECT count(*) AS bi9_rows
 
 \validate_result (:bi9_rows >= 1) true
 
--- BI-11: Friend Triangles within a Country via multi-pattern GRAPH_TABLE
+-- BI-11: Friend Triangles within a Country via GRAPH_TABLE
 SELECT count(*) AS bi11_triangles
   FROM GRAPH_TABLE (snb_graph
-      MATCH (p1 IS Person)-[IS knows]->(p2 IS Person)-[IS knows]->(p3 IS Person)-[IS knows]->(p1 IS Person),
-            (p1 IS Person)-[IS isLocatedIn]->(c1 IS Place)-[IS isPartOf]->(country IS Place),
-            (p2 IS Person)-[IS isLocatedIn]->(c2 IS Place)-[IS isPartOf]->(country IS Place),
-            (p3 IS Person)-[IS isLocatedIn]->(c3 IS Place)-[IS isPartOf]->(country IS Place)
+      MATCH (p1 IS Person)-[IS knows]->(p2 IS Person)-[IS knows]->(p3 IS Person)-[IS knows]->(p1 IS Person)
       WHERE p1.id < p2.id AND p2.id < p3.id
-      COLUMNS (1 AS one)
-  ) \gset
+      COLUMNS (p1.city_id AS c1_id, p2.city_id AS c2_id, p3.city_id AS c3_id)
+  ) tri
+  JOIN GRAPH_TABLE (snb_graph
+      MATCH (c1 IS Place)-[IS isPartOf]->(country IS Place)
+      COLUMNS (c1.id AS city_id, country.id AS country_id)
+  ) l1 ON l1.city_id = tri.c1_id
+  JOIN GRAPH_TABLE (snb_graph
+      MATCH (c2 IS Place)-[IS isPartOf]->(country IS Place)
+      COLUMNS (c2.id AS city_id, country.id AS country_id)
+  ) l2 ON l2.city_id = tri.c2_id AND l2.country_id = l1.country_id
+  JOIN GRAPH_TABLE (snb_graph
+      MATCH (c3 IS Place)-[IS isPartOf]->(country IS Place)
+      COLUMNS (c3.id AS city_id, country.id AS country_id)
+  ) l3 ON l3.city_id = tri.c3_id AND l3.country_id = l1.country_id \gset
 
 \validate_result (:bi11_triangles >= 0) true
 
--- BI-19: Interaction-Weighted Shortest Path Between Two Cities via GRAPH_TABLE step
+-- BI-19: Interaction-Weighted Shortest Path Between Two Cities via UNION DISTINCT ON (start_id, curr_id ORDER BY total_weight ASC)
 WITH RECURSIVE city_paths AS (
-    SELECT g.start_id,
+    SELECT g.start_id AS start_id,
            g.start_id AS curr_id,
            0.0::float8 AS total_weight,
-           0 AS hops,
-           ARRAY[g.start_id] AS visited
+           0 AS hops
       FROM GRAPH_TABLE (snb_graph
           MATCH (p IS Person WHERE p.city_id = :city1_id)
           COLUMNS (p.id AS start_id)
       ) g
-    UNION ALL
-    SELECT cp.start_id,
+    UNION DISTINCT ON (start_id, curr_id ORDER BY total_weight ASC)
+    SELECT cp.start_id AS start_id,
            g.dst_id AS curr_id,
-           cp.total_weight + g.weight,
-           cp.hops + 1,
-           cp.visited || g.dst_id
+           cp.total_weight + g.weight AS total_weight,
+           cp.hops + 1 AS hops
       FROM city_paths cp,
            GRAPH_TABLE (snb_graph
                MATCH (src IS Person WHERE src.id = cp.curr_id)-[k IS knows]->(dst IS Person)
                COLUMNS (dst.id AS dst_id, k.weight AS weight)
            ) g
      WHERE cp.hops < 3
-       AND NOT (g.dst_id = ANY(cp.visited))
 )
 SELECT COALESCE(min(cp.total_weight), 0.0) AS bi19_min_weight
   FROM city_paths cp,
@@ -216,11 +222,11 @@ VALUES (:bi_post_id, 1 + (:client_id % 100)),
        (:bi_reply_id, 2 + (:client_id % 99))
 ON CONFLICT DO NOTHING;
 
--- Delete temporary reply sub-thread in micro-batch cleanup using GRAPH_TABLE step
+-- Delete temporary reply sub-thread in micro-batch cleanup using GRAPH_TABLE step + UNION DISTINCT ON (id)
 WITH RECURSIVE del_tree AS (
     SELECT :bi_reply_id::bigint AS id
-    UNION ALL
-    SELECT g.child_id
+    UNION DISTINCT ON (id)
+    SELECT g.child_id AS id
       FROM del_tree dt,
            GRAPH_TABLE (snb_graph
                MATCH (child IS Message)-[IS replyOf]->(parent IS Message WHERE parent.id = dt.id)

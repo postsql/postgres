@@ -38,14 +38,14 @@ CREATE SEQUENCE pgbench_fin_loan_seq START WITH 100000;
 
 -- 1. LDBC SNB Static / Dictionary Entities
 CREATE TABLE pgbench_graph_places (
-    id integer NOT NULL,
+    id bigint NOT NULL,
     name text NOT NULL,
     type text NOT NULL,
-    part_of_id integer
+    part_of_id bigint
 );
 
 CREATE TABLE pgbench_graph_tags (
-    id integer NOT NULL,
+    id bigint NOT NULL,
     name text NOT NULL,
     tagclass_id integer NOT NULL
 );
@@ -56,7 +56,7 @@ CREATE TABLE pgbench_graph_persons (
     first_name text NOT NULL,
     last_name text NOT NULL,
     gender text NOT NULL DEFAULT 'female',
-    city_id integer NOT NULL,
+    city_id bigint NOT NULL,
     company_id integer NOT NULL DEFAULT 1,
     university_id integer NOT NULL DEFAULT 1,
     created_ts bigint NOT NULL
@@ -71,7 +71,7 @@ CREATE TABLE pgbench_graph_knows (
 
 CREATE TABLE pgbench_graph_person_tags (
     person_id bigint NOT NULL,
-    tag_id integer NOT NULL
+    tag_id bigint NOT NULL
 );
 
 CREATE TABLE pgbench_graph_forums (
@@ -92,7 +92,7 @@ CREATE TABLE pgbench_graph_messages (
     creator_id bigint NOT NULL,
     forum_id bigint,
     parent_message_id bigint,
-    country_id integer NOT NULL DEFAULT 1,
+    country_id bigint NOT NULL DEFAULT 1,
     content text NOT NULL,
     length integer NOT NULL DEFAULT 24,
     created_ts bigint NOT NULL
@@ -106,7 +106,7 @@ CREATE TABLE pgbench_graph_likes (
 
 CREATE TABLE pgbench_graph_message_tags (
     message_id bigint NOT NULL,
-    tag_id integer NOT NULL
+    tag_id bigint NOT NULL
 );
 
 -- 3. LDBC FinBench Financial Graph Entities & Multi-Edges
