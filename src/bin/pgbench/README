@@ -39,9 +39,11 @@ organized into modular subsystems with clear ownership boundaries:
       schema & table bootstrap, buffered COPY ... FROM STDIN batch streaming,
       and SQL run inspection/comparison SRFs (pgbench_show_run(),
       pgbench_compare_runs()).
-  - viewer/ (viewer/README.md, pgbench_viewer.py, pgbench_chart.wasm, bottle.py)
+  - viewer/ (pgbench_viewer.py, bottle.py, README.md, html/, css/, wasm/, src/)
       Standalone zero-dependency web telemetry viewer & SQL Data Explorer built
-      with bottle.py, Water.css, and a 439-byte WebAssembly charting kernel.
+      with bottle.py, modular SimpleTemplate (html/*.html.stpl) views, Water.css
+      (css/), and a 439-byte WebAssembly charting kernel (wasm/pgbench_chart.wasm,
+      with build-time sources in src/).
   - src/common/pgbench_funcs.c / src/include/common/pgbench_funcs.h
       Frontend/backend-agnostic random distributions, hashes, permutations,
       and data generators shared between pgbench and contrib/pgbench.
@@ -178,10 +180,12 @@ Direct Database Telemetry (--log-db) & Web Viewer (logdb.c, viewer/)
   `pgbench_progress_log`, `pgbench_agg_log`, `pgbench_tx_log`), two views
   (`pgbench_runs_v`, `pgbench_live_progress_v`), and 5 overloaded Set-Returning
   Functions (`pgbench_show_run` and `pgbench_compare_runs`).
-- `src/bin/pgbench/viewer/` provides a standalone `bottle.py` + `Water.css` +
-  439-byte WebAssembly (`pgbench_chart.wasm`) web viewer (`pgbench_viewer.py`)
-  featuring single-JSON-from-DB benchmark views, a live running benchmark
-  monitor (`/live`), and a Python metatemplate SQL Data Explorer (`/explorer`).
+- `src/bin/pgbench/viewer/` provides a standalone `bottle.py` + `Water.css`
+  (`css/`) + modular `SimpleTemplate` (`html/*.html.stpl`) + 439-byte
+  WebAssembly (`wasm/pgbench_chart.wasm`, built from `src/`) web viewer
+  (`pgbench_viewer.py`) featuring single-JSON-from-DB benchmark views, a live
+  running benchmark monitor (`/live`), and a two-stage Bottle metatemplate SQL
+  Data Explorer (`/explorer`).
   See `src/bin/pgbench/viewer/README.md` for usage, CLI flags, and architecture.
 
 How to Add a New Built-in Function or Meta-Command
