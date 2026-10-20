@@ -563,17 +563,12 @@ DECLARE
 BEGIN
     FOR attempt IN 1..5 LOOP
         FOR w IN 1..500 LOOP
+            PERFORM pg_stat_clear_snapshot();
             EXIT WHEN NOT EXISTS (
                 SELECT 1 FROM pg_stat_activity
                 WHERE pid <> pg_backend_pid()
                   AND backend_type = 'autovacuum worker'
             );
-            IF w = 500 THEN
-                PERFORM pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE pid <> pg_backend_pid()
-                  AND backend_type = 'autovacuum worker';
-            END IF;
             PERFORM pg_sleep(0.01);
         END LOOP;
 
@@ -759,6 +754,7 @@ DECLARE
 BEGIN
     FOR iter IN 1..10 LOOP
         FOR w IN 1..500 LOOP
+            PERFORM pg_stat_clear_snapshot();
             EXIT WHEN NOT EXISTS (
                 SELECT 1 FROM pg_stat_activity
                 WHERE pid <> pg_backend_pid()
@@ -767,13 +763,6 @@ BEGIN
                        OR backend_xid IS NOT NULL
                        OR backend_xmin IS NOT NULL)
             );
-            IF w = 500 THEN
-                PERFORM pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE pid <> pg_backend_pid()
-                  AND datname = current_database()
-                  AND backend_type = 'autovacuum worker';
-            END IF;
             COMMIT;
             PERFORM pg_sleep(0.01);
         END LOOP;
@@ -824,6 +813,7 @@ BEGIN
 
     FOR iter IN 2..6 LOOP
         FOR w IN 1..500 LOOP
+            PERFORM pg_stat_clear_snapshot();
             EXIT WHEN NOT EXISTS (
                 SELECT 1 FROM pg_stat_activity
                 WHERE pid <> pg_backend_pid()
@@ -832,13 +822,6 @@ BEGIN
                        OR backend_xid IS NOT NULL
                        OR backend_xmin IS NOT NULL)
             );
-            IF w = 500 THEN
-                PERFORM pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE pid <> pg_backend_pid()
-                  AND datname = current_database()
-                  AND backend_type = 'autovacuum worker';
-            END IF;
             COMMIT;
             PERFORM pg_sleep(0.01);
         END LOOP;

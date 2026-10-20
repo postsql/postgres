@@ -10,7 +10,8 @@
 SELECT
     COALESCE(substring(':num_workers' FROM '^[0-9]+$')::int, 1) AS num_workers,
     COALESCE(substring(':items_per_scale' FROM '^[0-9]+$')::int, 200) AS items_per_scale,
-    COALESCE(substring(':dim' FROM '^[0-9]+$')::int, 8) AS dim
+    COALESCE(substring(':dim' FROM '^[0-9]+$')::int, 8) AS dim,
+    COALESCE(substring(':cluster_seed' FROM '^-?[0-9]+$')::bigint, 42) AS cluster_seed
 \gset
 
 SELECT pgbench.setseed((:random_seed + :client_id)::bigint);
@@ -28,6 +29,6 @@ SELECT i,
            'rating', round((3.0 + ((i % 21) * 0.1))::numeric, 1),
            'in_stock', ((i % 5) != 0)
        ),
-       pgbench_vec_parse(pgbench.clustered_vector(:dim, 10, 0.15, :random_seed, (i % 10)::int)),
+       pgbench_vec_parse(pgbench.clustered_vector(:dim, 10, 0.15, :cluster_seed, (i % 10)::int)),
        pgbench_vec_parse(pgbench.random_unit_vector(:dim))
   FROM generate_series(:client_id + 1, :items_per_scale * :scale, :num_workers) AS i;

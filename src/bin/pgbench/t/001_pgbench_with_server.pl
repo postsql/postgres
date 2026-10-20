@@ -3093,7 +3093,7 @@ is($node->safe_psql('wl_pgbench_vec', 'SELECT count(*) FROM pgbench_vec_ground_t
 
 my $vecbench_phase2_json = $node->basedir . '/001_pgbench_vecbench_phase2_report.json';
 $node->pgbench(
-	"-n -d wl_pgbench_vec -c 2 -j 2 -t 15 -s 1 --reservoir=vec_ids:256 "
+	"-n -d wl_pgbench_vec -c 2 -j 2 -t 25 -s 1 --reservoir=vec_ids:256 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_search.sql\@30 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_filtered.sql\@25 "
 	  . "-f $wl_dir/pgbench-vec/pgbench_vec_postfiltered.sql\@20 "
@@ -3104,7 +3104,7 @@ $node->pgbench(
 	  . "--sla total:p95<=60s --json-report=$vecbench_phase2_json",
 	0,
 	[
-		qr{processed: 30/30},
+		qr{processed: 50/50},
 		qr{number of failed transactions: 0 \(0\.000%\)},
 		qr{SLA total:r_unfiltered:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},
 		qr{SLA total:r_prefilter:recall >= 0\.8000: actual = (?:0\.\d+|1\.0000) \[PASS\]},

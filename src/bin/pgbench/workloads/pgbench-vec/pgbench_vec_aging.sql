@@ -41,7 +41,7 @@
 \elif :op_roll <= 75
     -- Vector Drift Update
     \set drift_id random(1, 200 * :scale)
-    \set drifted_vec planted_vector(:dim, :drift_id, 0.25, :random_seed)
+    \set drifted_vec planted_vector(:dim, :drift_id, 0.25, 42)
 
     UPDATE pgbench_vec_items
        SET embedding = pgbench_vec_parse(:drifted_vec)
@@ -59,7 +59,7 @@
 
 -- 2. Approximate Top-K Search with Aging Recall Telemetry
 \set qcat random(0, 9)
-\set qvec clustered_vector(:dim, 10, 0.25, :random_seed, :qcat)
+\set qvec clustered_vector(:dim, 10, 0.25, 42, :qcat)
 
 SELECT id
   FROM pgbench_vec_items
