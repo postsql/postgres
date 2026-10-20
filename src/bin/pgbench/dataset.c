@@ -60,8 +60,10 @@ static int	num_reservoirs = 0;
 
 typedef struct PgBenchCausalClock
 {
-	int64		channel_watermarks[PGBENCH_MAX_WATERMARK_CHANNELS] __attribute__((aligned(64)));
-	int64		global_virtual_time_us __attribute__((aligned(64)));
+	int64		channel_watermarks[PGBENCH_MAX_WATERMARK_CHANNELS];
+	char		pad0[64];
+	int64		global_virtual_time_us;
+	char		pad1[56];
 	int64		active_writer_ts[PGBENCH_MAX_WATERMARK_CHANNELS][MAX_WRITER_SLOTS];
 	int64		max_committed_ts[PGBENCH_MAX_WATERMARK_CHANNELS];
 	bool		writer_slots_initialized;

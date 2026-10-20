@@ -230,12 +230,67 @@ ensureTablePersistence(PGconn *conn, const char *table_name, bool want_unlogged)
 	PQclear(res);
 }
 
+#ifdef WIN32
+static FILE *
+open_temp_json_stream(char *tmppath, size_t tmppath_sz)
+{
+	static unsigned int seq = 0;
+	const char *tmpdir = getenv("TMP");
+
+	if (tmpdir == NULL || tmpdir[0] == '\0')
+		tmpdir = getenv("TEMP");
+	if (tmpdir == NULL || tmpdir[0] == '\0')
+		tmpdir = ".";
+
+	snprintf(tmppath, tmppath_sz, "%s/pgbench_json_%d_%u.tmp",
+			 tmpdir, (int) getpid(), ++seq);
+	return fopen(tmppath, "w+b");
+}
+
+static char *
+finish_temp_json_stream(FILE *fp, const char *tmppath)
+{
+	long		sz;
+	char	   *buf;
+	size_t		nread;
+
+	fflush(fp);
+	if (fseek(fp, 0, SEEK_END) != 0 || (sz = ftell(fp)) < 0 ||
+		fseek(fp, 0, SEEK_SET) != 0)
+	{
+		fclose(fp);
+		unlink(tmppath);
+		pg_fatal("could not seek temporary stream: %m");
+	}
+	buf = pg_malloc((size_t) sz + 1);
+	nread = fread(buf, 1, (size_t) sz, fp);
+	buf[nread] = '\0';
+	fclose(fp);
+	unlink(tmppath);
+	if (nread == 0)
+	{
+		pg_free(buf);
+		return pg_strdup("{}");
+	}
+	return buf;
+}
+#endif
+
 /*
  * Serialize configuration JSON object to a heap-allocated string.
  */
 static char *
 serializeConfigJsonToString(void)
 {
+#ifdef WIN32
+	char		tmppath[MAXPGPATH];
+	FILE	   *fp = open_temp_json_stream(tmppath, sizeof(tmppath));
+
+	if (fp == NULL)
+		pg_fatal("could not open temporary file \"%s\": %m", tmppath);
+	writeConfigJsonObject(fp, 0, false);
+	return finish_temp_json_stream(fp, tmppath);
+#else
 	char	   *buf = NULL;
 	size_t		len = 0;
 	FILE	   *fp = open_memstream(&buf, &len);
@@ -245,6 +300,7 @@ serializeConfigJsonToString(void)
 	writeConfigJsonObject(fp, 0, false);
 	fclose(fp);
 	return buf ? buf : pg_strdup("{}");
+#endif
 }
 
 /*
@@ -254,6 +310,15 @@ static char *
 serializeReportJsonToString(StatsData *total, double bench_duration,
 							double tpmc, double qphh)
 {
+#ifdef WIN32
+	char		tmppath[MAXPGPATH];
+	FILE	   *fp = open_temp_json_stream(tmppath, sizeof(tmppath));
+
+	if (fp == NULL)
+		pg_fatal("could not open temporary file \"%s\": %m", tmppath);
+	writeReportJsonObject(fp, total, bench_duration, tpmc, qphh);
+	return finish_temp_json_stream(fp, tmppath);
+#else
 	char	   *buf = NULL;
 	size_t		len = 0;
 	FILE	   *fp = open_memstream(&buf, &len);
@@ -263,6 +328,7 @@ serializeReportJsonToString(StatsData *total, double bench_duration,
 	writeReportJsonObject(fp, total, bench_duration, tpmc, qphh);
 	fclose(fp);
 	return buf ? buf : pg_strdup("{}");
+#endif
 }
 
 static void

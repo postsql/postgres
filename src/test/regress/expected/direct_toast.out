@@ -675,17 +675,18 @@ DECLARE
     idx_oid8_sz bigint;
     idx_direct_sz bigint;
 BEGIN
+    PERFORM pg_current_xact_id();
     lsn0 := pg_current_wal_insert_lsn();
     INSERT INTO tab_sup_oid
-    SELECT g, repeat(md5(g::text), 320) FROM generate_series(1, 100) g;
+    SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
     lsn1 := pg_current_wal_insert_lsn();
 
     INSERT INTO tab_sup_oid8
-    SELECT g, repeat(md5(g::text), 320) FROM generate_series(1, 100) g;
+    SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
     lsn2 := pg_current_wal_insert_lsn();
 
     INSERT INTO tab_sup_direct
-    SELECT g, repeat(md5(g::text), 320) FROM generate_series(1, 100) g;
+    SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
     lsn3 := pg_current_wal_insert_lsn();
 
     wal_oid := pg_wal_lsn_diff(lsn1, lsn0);

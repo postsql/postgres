@@ -9,7 +9,7 @@
 \set k 5
 \set k_oversample 60
 \set cat random(0, 9)
-\set qvec random_unit_vector(:dim)
+\set qvec clustered_vector(:dim, 10, 0.35, :random_seed, :cat)
 
 -- Approximate / Index candidate oversampling + relational post-filter
 WITH raw_candidates AS (

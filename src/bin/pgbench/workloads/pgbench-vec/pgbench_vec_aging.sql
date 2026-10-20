@@ -58,7 +58,8 @@
 \endif
 
 -- 2. Approximate Top-K Search with Aging Recall Telemetry
-\set qvec random_unit_vector(:dim)
+\set qcat random(0, 9)
+\set qvec clustered_vector(:dim, 10, 0.25, :random_seed, :qcat)
 
 SELECT id
   FROM pgbench_vec_items

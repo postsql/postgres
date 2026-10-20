@@ -707,7 +707,7 @@ avro_compile_schema_cstr(MemoryContext mcxt, const char *schema_cstr)
 	{
 		JsonbIterator *it = JsonbIteratorInit(&jb->root);
 		JsonbValue	v;
-		JsonbIteratorToken tok;
+		JsonbIteratorToken tok PG_USED_FOR_ASSERTS_ONLY;
 
 		tok = JsonbIteratorNext(&it, &v, true);
 		Assert(tok == WJB_BEGIN_ARRAY);
@@ -1100,7 +1100,7 @@ avro_encode_jsonb_datum(StringInfo buf, AvroSchemaNode *schema, Jsonb *jb)
 	{
 		JsonbIterator *it = JsonbIteratorInit(&jb->root);
 		JsonbValue	tmp;
-		JsonbIteratorToken tok;
+		JsonbIteratorToken tok PG_USED_FOR_ASSERTS_ONLY;
 
 		tok = JsonbIteratorNext(&it, &tmp, true);
 		Assert(tok == WJB_BEGIN_ARRAY);
@@ -2513,7 +2513,7 @@ avro_decode_root_to_jsonb(AvroSchemaNode *w_schema, AvroSchemaNode *r_schema,
 	{
 		JsonbIterator *it = JsonbIteratorInit(&jb->root);
 		JsonbValue	v;
-		JsonbIteratorToken tok;
+		JsonbIteratorToken tok PG_USED_FOR_ASSERTS_ONLY;
 
 		tok = JsonbIteratorNext(&it, &v, true);
 		Assert(tok == WJB_BEGIN_ARRAY);

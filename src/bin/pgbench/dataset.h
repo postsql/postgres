@@ -135,8 +135,11 @@ typedef struct PgBenchReservoir
 	uint64		capacity;
 	int64	   *slots;
 	bool		from_config;
-	uint64		write_idx __attribute__((aligned(64)));
-	uint64		valid_count __attribute__((aligned(64)));
+	char		pad0[64];
+	uint64		write_idx;
+	char		pad1[56];
+	uint64		valid_count;
+	char		pad2[56];
 } PgBenchReservoir;
 
 extern void parseReservoirSpec(const char *spec);

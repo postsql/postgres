@@ -442,4 +442,140 @@ pg_noreturn extern void syntax_error(const char *source, int lineno, const char 
 									 const char *command, const char *msg,
 									 const char *more, int column);
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_ReadWriteBarrier)
+#pragma intrinsic(_InterlockedCompareExchange64)
+#ifdef _WIN64
+#pragma intrinsic(_InterlockedExchange64)
+#pragma intrinsic(_InterlockedExchangeAdd64)
+#endif
+
+#define __ATOMIC_RELAXED 0
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_RELEASE 3
+#define __ATOMIC_ACQ_REL 4
+#define __ATOMIC_SEQ_CST 5
+
+static inline int64
+pgbench_msvc_load_64(const volatile int64 *ptr)
+{
+#ifdef _WIN64
+	int64		val = *ptr;
+
+	_ReadWriteBarrier();
+	return val;
+#else
+	return _InterlockedCompareExchange64((volatile __int64 *) ptr, 0, 0);
+#endif
+}
+
+static inline int32
+pgbench_msvc_load_32(const volatile int32 *ptr)
+{
+	int32		val = *ptr;
+
+	_ReadWriteBarrier();
+	return val;
+}
+
+static inline uint8
+pgbench_msvc_load_8(const volatile uint8 *ptr)
+{
+	uint8		val = *ptr;
+
+	_ReadWriteBarrier();
+	return val;
+}
+
+static inline void
+pgbench_msvc_store_64(volatile int64 *ptr, int64 val)
+{
+#ifdef _WIN64
+	_InterlockedExchange64((volatile __int64 *) ptr, (__int64) val);
+#else
+	__int64		old;
+
+	do
+	{
+		old = *ptr;
+	} while (_InterlockedCompareExchange64((volatile __int64 *) ptr, (__int64) val, old) != old);
+#endif
+}
+
+static inline void
+pgbench_msvc_store_32(volatile int32 *ptr, int32 val)
+{
+	InterlockedExchange((volatile LONG *) ptr, (LONG) val);
+}
+
+static inline uint64
+pgbench_msvc_fetch_add_64(volatile int64 *ptr, int64 val)
+{
+#ifdef _WIN64
+	return (uint64) _InterlockedExchangeAdd64((volatile __int64 *) ptr, (__int64) val);
+#else
+	__int64		old;
+
+	do
+	{
+		old = *ptr;
+	} while (_InterlockedCompareExchange64((volatile __int64 *) ptr, old + (__int64) val, old) != old);
+	return (uint64) old;
+#endif
+}
+
+static inline int32
+pgbench_msvc_fetch_add_32(volatile int32 *ptr, int32 val)
+{
+	return (int32) InterlockedExchangeAdd((volatile LONG *) ptr, (LONG) val);
+}
+
+static inline bool
+pgbench_msvc_cas_32(volatile int32 *ptr, int32 *expected, int32 desired)
+{
+	int32		old = (int32) InterlockedCompareExchange((volatile LONG *) ptr,
+														 (LONG) desired,
+														 (LONG) *expected);
+
+	if (old == *expected)
+		return true;
+	*expected = old;
+	return false;
+}
+
+#define __atomic_load_n(ptr, memorder) \
+	(sizeof(*(ptr)) == 8 ? pgbench_msvc_load_64((const volatile int64 *) (ptr)) : \
+	 sizeof(*(ptr)) == 4 ? pgbench_msvc_load_32((const volatile int32 *) (ptr)) : \
+	 pgbench_msvc_load_8((const volatile uint8 *) (ptr)))
+
+#define __atomic_store_n(ptr, val, memorder) \
+	do { \
+		if (sizeof(*(ptr)) == 8) \
+			pgbench_msvc_store_64((volatile int64 *) (ptr), (int64) (val)); \
+		else \
+			pgbench_msvc_store_32((volatile int32 *) (ptr), (int32) (val)); \
+	} while (0)
+
+#define __atomic_fetch_add(ptr, val, memorder) \
+	(sizeof(*(ptr)) == 8 ? \
+	 pgbench_msvc_fetch_add_64((volatile int64 *) (ptr), (int64) (val)) : \
+	 (uint64) pgbench_msvc_fetch_add_32((volatile int32 *) (ptr), (int32) (val)))
+
+#define __atomic_fetch_sub(ptr, val, memorder) \
+	(sizeof(*(ptr)) == 8 ? \
+	 pgbench_msvc_fetch_add_64((volatile int64 *) (ptr), -((int64) (val))) : \
+	 (uint64) pgbench_msvc_fetch_add_32((volatile int32 *) (ptr), -((int32) (val))))
+
+#define __atomic_compare_exchange_n(ptr, expected, desired, weak, succ, fail) \
+	pgbench_msvc_cas_32((volatile int32 *) (ptr), (int32 *) (expected), (int32) (desired))
+
+#define __atomic_test_and_set(ptr, memorder) \
+	(InterlockedExchange((volatile LONG *) (ptr), 1) != 0)
+
+#define __atomic_clear(ptr, memorder) \
+	((void) InterlockedExchange((volatile LONG *) (ptr), 0))
+
+#endif							/* _MSC_VER */
+
 #endif							/* PGBENCH_H */
