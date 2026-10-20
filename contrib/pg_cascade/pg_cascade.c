@@ -19,6 +19,7 @@
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_encoding_context.h"
 #include "catalog/pg_encoding_type.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
@@ -66,6 +67,22 @@ typedef struct CascadeState
 
 static int	cascade_active_depth = 0;
 
+static const char *
+get_cascade_context_name(Oid ctx_id)
+{
+	HeapTuple	tup;
+	char	   *name;
+
+	if (!OidIsValid(ctx_id))
+		return "<unknown>";
+	tup = SearchSysCache1(ENCODINGCONTEXTOID, ObjectIdGetDatum(ctx_id));
+	if (!HeapTupleIsValid(tup))
+		return psprintf("%u", ctx_id);
+	name = pstrdup(NameStr(((Form_pg_encoding_context) GETSTRUCT(tup))->ectxname));
+	ReleaseSysCache(tup);
+	return name;
+}
+
 static Oid
 resolve_cascade_stage_token(const char *token, Oid owner_ctx_id)
 {
@@ -74,8 +91,8 @@ resolve_cascade_stage_token(const char *token, Oid owner_ctx_id)
 	if (*token == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("empty stage name in \"stages\" option for encoding context %u",
-						owner_ctx_id)));
+				 errmsg("empty stage name in \"stages\" option for encoding context \"%s\"",
+						get_cascade_context_name(owner_ctx_id))));
 
 	for (const char *c = token; *c != '\0'; c++)
 	{
@@ -111,8 +128,8 @@ validate_cascade_stage_graph(Oid root_ctx_id, EncodingContext curr_ectx, int dep
 	if (depth >= MAX_ENCODING_CONTEXT_DEPTH)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cascade encoding context %u exceeds maximum pipeline depth (%d)",
-						root_ctx_id, MAX_ENCODING_CONTEXT_DEPTH)));
+				 errmsg("cascade encoding context \"%s\" exceeds maximum pipeline depth (%d)",
+						get_cascade_context_name(root_ctx_id), MAX_ENCODING_CONTEXT_DEPTH)));
 
 	for (EncodingContext walk = curr_ectx; walk != NULL; walk = walk->parent)
 	{
@@ -122,8 +139,8 @@ validate_cascade_stage_graph(Oid root_ctx_id, EncodingContext curr_ectx, int dep
 		if (walk->context_id == root_ctx_id)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("circular stage reference detected in cascade encoding context %u",
-							root_ctx_id)));
+					 errmsg("circular stage reference detected in cascade encoding context \"%s\"",
+							get_cascade_context_name(root_ctx_id))));
 
 		sub_stages = EncodingContextGetOption(walk, "stages");
 		if (sub_stages != NULL)
@@ -156,8 +173,8 @@ validate_cascade_stage_graph(Oid root_ctx_id, EncodingContext curr_ectx, int dep
 					pfree(raw);
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-							 errmsg("circular stage reference detected in cascade encoding context %u",
-									root_ctx_id)));
+							 errmsg("circular stage reference detected in cascade encoding context \"%s\"",
+									get_cascade_context_name(root_ctx_id))));
 				}
 
 				sub_ectx = GetEncodingContext(sub_oid);
@@ -191,8 +208,8 @@ get_cascade_state(EncodingContext ectx, bool for_decode)
 	if (stages_opt == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cascade encoding context %u requires a \"stages\" option in WITH (...)",
-						ectx->context_id),
+				 errmsg("cascade encoding context \"%s\" requires a \"stages\" option in WITH (...)",
+						get_cascade_context_name(ectx->context_id)),
 				 errhint("Specify WITH (stages = 'stage1_ctx,stage2_ctx').")));
 
 	raw = pstrdup(stages_opt);
@@ -224,16 +241,16 @@ get_cascade_state(EncodingContext ectx, bool for_decode)
 		if (nstages >= MAX_ENCODING_CONTEXT_DEPTH)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("cascade encoding context %u exceeds maximum pipeline depth (%d)",
-							ectx->context_id, MAX_ENCODING_CONTEXT_DEPTH)));
+					 errmsg("cascade encoding context \"%s\" exceeds maximum pipeline depth (%d)",
+							get_cascade_context_name(ectx->context_id), MAX_ENCODING_CONTEXT_DEPTH)));
 
 		stage_oid = resolve_cascade_stage_token(token, ectx->context_id);
 
 		if (stage_oid == ectx->context_id)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("circular stage reference detected in cascade encoding context %u",
-							ectx->context_id)));
+					 errmsg("circular stage reference detected in cascade encoding context \"%s\"",
+							get_cascade_context_name(ectx->context_id))));
 
 		stage_ectx = GetEncodingContext(stage_oid);
 		validate_cascade_stage_graph(ectx->context_id, stage_ectx, 1);
@@ -250,8 +267,8 @@ get_cascade_state(EncodingContext ectx, bool for_decode)
 	if (nstages == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cascade encoding context %u requires at least one stage in \"stages\" option",
-						ectx->context_id)));
+				 errmsg("cascade encoding context \"%s\" requires at least one stage in \"stages\" option",
+						get_cascade_context_name(ectx->context_id))));
 
 	state = (CascadeState *) MemoryContextAllocZero(ectx->mcxt, sizeof(CascadeState));
 	state->nstages = nstages;
@@ -286,8 +303,8 @@ pg_cascade_context_encode(PG_FUNCTION_ARGS)
 	if (cascade_active_depth >= MAX_ENCODING_CONTEXT_DEPTH)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cascade encoding context %u exceeds maximum pipeline depth (%d)",
-						ectx->context_id, MAX_ENCODING_CONTEXT_DEPTH)));
+				 errmsg("cascade encoding context \"%s\" exceeds maximum pipeline depth (%d)",
+						get_cascade_context_name(ectx->context_id), MAX_ENCODING_CONTEXT_DEPTH)));
 
 	cstate = get_cascade_state(ectx, false);
 
@@ -355,8 +372,8 @@ pg_cascade_context_decode(PG_FUNCTION_ARGS)
 	if (cascade_active_depth >= MAX_ENCODING_CONTEXT_DEPTH)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cascade encoding context %u exceeds maximum pipeline depth (%d)",
-						ectx->context_id, MAX_ENCODING_CONTEXT_DEPTH)));
+				 errmsg("cascade encoding context \"%s\" exceeds maximum pipeline depth (%d)",
+						get_cascade_context_name(ectx->context_id), MAX_ENCODING_CONTEXT_DEPTH)));
 
 	cstate = get_cascade_state(ectx, true);
 

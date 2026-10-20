@@ -29,6 +29,7 @@
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
+#include "storage/procarray.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -302,11 +303,37 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 	/*
 	 * Check whether prune_xid indicates that there may be dead rows that can
 	 * be cleaned up.
+	 *
+	 * When direct_toast_self_prune is enabled on a TOAST relation, a
+	 * concurrent transaction in another database can hold back
+	 * GetSnapshotData()'s global RecentXmin, keeping
+	 * GlobalVisDataRels.definitely_needed from advancing across commits in
+	 * this database.  Refresh the per-database horizon at most once per
+	 * transaction before giving up on pruning a committed TOAST delete.
 	 */
 	vistest = GlobalVisTestFor(relation);
 
 	if (!GlobalVisTestIsRemovableXid(vistest, prune_xid, true))
-		return;
+	{
+		if (!rel_read_only &&
+			relation->rd_rel->relkind == RELKIND_TOASTVALUE &&
+			RelationGetDirectToastSelfPrune(relation))
+		{
+			static TransactionId last_vis_refresh_xid = InvalidTransactionId;
+			TransactionId cur_xid = GetCurrentTransactionIdIfAny();
+
+			if (prune_xid != cur_xid &&
+				(!TransactionIdIsValid(cur_xid) || cur_xid != last_vis_refresh_xid))
+			{
+				last_vis_refresh_xid = cur_xid;
+				(void) GetOldestNonRemovableTransactionId(relation);
+			}
+			if (!GlobalVisTestIsRemovableXid(vistest, prune_xid, false))
+				return;
+		}
+		else
+			return;
+	}
 
 	/*
 	 * We prune when a previous UPDATE failed to find enough space on the page

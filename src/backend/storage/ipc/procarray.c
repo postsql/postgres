@@ -322,6 +322,10 @@ static GlobalVisState GlobalVisTempRels;
  * times accurate horizons are recomputed. See GlobalVisTestShouldUpdate().
  */
 static TransactionId ComputeXidHorizonsResultLastXmin;
+static TransactionId ComputeXidHorizonsResultLastDataXmin;
+static TransactionId MyProcDataXmin = InvalidTransactionId;
+static TransactionId RecentDataXmin = InvalidTransactionId;
+static TransactionId LastSnapshotDataXmin = InvalidTransactionId;
 
 #ifdef XIDCACHE_DEBUG
 
@@ -1798,8 +1802,24 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 			(statusFlags & PROC_AFFECTS_ALL_HORIZONS) ||
 			in_recovery)
 		{
+			TransactionId data_xmin = xmin;
+
+			if (proc == MyProc &&
+				TransactionIdIsValid(MyProcDataXmin) &&
+				MyDatabaseId != InvalidOid &&
+				!(statusFlags & PROC_AFFECTS_ALL_HORIZONS) &&
+				!in_recovery)
+			{
+				TransactionId my_xmin = UINT32_ACCESS_ONCE(proc->xmin);
+
+				if (TransactionIdIsValid(my_xmin) &&
+					TransactionIdPrecedes(my_xmin, MyProcDataXmin))
+					my_xmin = MyProcDataXmin;
+				data_xmin = TransactionIdOlder(my_xmin, xid);
+			}
+
 			h->data_oldest_nonremovable =
-				TransactionIdOlder(h->data_oldest_nonremovable, xmin);
+				TransactionIdOlder(h->data_oldest_nonremovable, data_xmin);
 		}
 	}
 
@@ -2065,9 +2085,15 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	 * xmin.
 	 */
 	if (!TransactionIdIsValid(MyProc->xmin))
+	{
 		MyProc->xmin = TransactionXmin = snapshot->xmin;
+		MyProcDataXmin = TransactionIdIsValid(LastSnapshotDataXmin) ?
+			LastSnapshotDataXmin : snapshot->xmin;
+	}
 
 	RecentXmin = snapshot->xmin;
+	RecentDataXmin = TransactionIdIsValid(LastSnapshotDataXmin) ?
+		LastSnapshotDataXmin : snapshot->xmin;
 	Assert(TransactionIdPrecedesOrEquals(TransactionXmin, RecentXmin));
 
 	snapshot->curcid = GetCurrentCommandId(false);
@@ -2116,6 +2142,7 @@ GetSnapshotData(Snapshot snapshot)
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId *other_xids = ProcGlobal->xids;
 	TransactionId xmin;
+	TransactionId data_xmin;
 	TransactionId xmax;
 	int			count = 0;
 	int			subcount = 0;
@@ -2198,10 +2225,14 @@ GetSnapshotData(Snapshot snapshot)
 
 	/* initialize xmin calculation with xmax */
 	xmin = xmax;
+	data_xmin = xmax;
 
 	/* take own xid into account, saves a check inside the loop */
 	if (TransactionIdIsNormal(myxid) && NormalTransactionIdPrecedes(myxid, xmin))
+	{
 		xmin = myxid;
+		data_xmin = myxid;
+	}
 
 	snapshot->takenDuringRecovery = RecoveryInProgress();
 
@@ -2266,6 +2297,16 @@ GetSnapshotData(Snapshot snapshot)
 
 			if (NormalTransactionIdPrecedes(xid, xmin))
 				xmin = xid;
+
+			if (NormalTransactionIdPrecedes(xid, data_xmin))
+			{
+				PGPROC	   *proc = &allProcs[pgprocnos[pgxactoff]];
+
+				if (proc->databaseId == MyDatabaseId ||
+					MyDatabaseId == InvalidOid ||
+					(statusFlags & PROC_AFFECTS_ALL_HORIZONS))
+					data_xmin = xid;
+			}
 
 			/* Add XID to snapshot. */
 			xip[count++] = xid;
@@ -2343,6 +2384,7 @@ GetSnapshotData(Snapshot snapshot)
 		 */
 		subcount = KnownAssignedXidsGetAndSetXmin(snapshot->subxip, &xmin,
 												  xmax);
+		data_xmin = xmin;
 
 		if (TransactionIdPrecedesOrEquals(xmin, procArray->lastOverflowedXid))
 			suboverflowed = true;
@@ -2357,8 +2399,12 @@ GetSnapshotData(Snapshot snapshot)
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
 
+	LastSnapshotDataXmin = data_xmin;
 	if (!TransactionIdIsValid(MyProc->xmin))
+	{
 		MyProc->xmin = TransactionXmin = xmin;
+		MyProcDataXmin = data_xmin;
+	}
 
 	LWLockRelease(ProcArrayLock);
 
@@ -2379,13 +2425,14 @@ GetSnapshotData(Snapshot snapshot)
 
 		/* Check whether there's a replication slot requiring an older xmin. */
 		def_vis_xid_data =
-			TransactionIdOlder(xmin, replication_slot_xmin);
+			TransactionIdOlder(data_xmin, replication_slot_xmin);
 
 		/*
-		 * Rows in non-shared, non-catalog tables possibly could be vacuumed
-		 * if older than this xid.
+		 * Rows in shared tables possibly could be vacuumed if older than
+		 * this xid.
 		 */
-		def_vis_xid = def_vis_xid_data;
+		def_vis_xid =
+			TransactionIdOlder(xmin, replication_slot_xmin);
 
 		/*
 		 * Check whether there's a replication slot requiring an older catalog
@@ -2443,6 +2490,7 @@ GetSnapshotData(Snapshot snapshot)
 	}
 
 	RecentXmin = xmin;
+	RecentDataXmin = data_xmin;
 	Assert(TransactionIdPrecedesOrEquals(TransactionXmin, RecentXmin));
 
 	snapshot->xmin = xmin;
@@ -2541,6 +2589,7 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
 		 * we don't check that.)
 		 */
 		MyProc->xmin = TransactionXmin = xmin;
+		MyProcDataXmin = xmin;
 
 		result = true;
 		break;
@@ -2594,6 +2643,7 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
 		 * value is interpreted by vacuum.
 		 */
 		MyProc->xmin = TransactionXmin = xmin;
+		MyProcDataXmin = xmin;
 		MyProc->statusFlags = (MyProc->statusFlags & ~PROC_XMIN_FLAGS) |
 			(proc->statusFlags & PROC_XMIN_FLAGS);
 		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
@@ -4188,6 +4238,10 @@ GlobalVisTestShouldUpdate(GlobalVisState *state)
 		return false;
 
 	/* does the last snapshot built have a different xmin? */
+	if (state == &GlobalVisDataRels &&
+		TransactionIdIsValid(RecentDataXmin) &&
+		RecentDataXmin != ComputeXidHorizonsResultLastDataXmin)
+		return true;
 	return RecentXmin != ComputeXidHorizonsResultLastXmin;
 }
 
@@ -4224,6 +4278,7 @@ GlobalVisUpdateApply(ComputeXidHorizonsResult *horizons)
 	GlobalVisTempRels.definitely_needed = GlobalVisTempRels.maybe_needed;
 
 	ComputeXidHorizonsResultLastXmin = RecentXmin;
+	ComputeXidHorizonsResultLastDataXmin = RecentDataXmin;
 }
 
 /*

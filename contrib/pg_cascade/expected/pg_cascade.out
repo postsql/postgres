@@ -160,7 +160,7 @@ SELECT pg_encode_datum(
     (SELECT oid FROM pg_encoding_context WHERE ectxname = 'bad_cascade_no_stages_ctx'),
     '{}'::jsonb
 );
-ERROR:  cascade encoding context 16423 requires a "stages" option in WITH (...)
+ERROR:  cascade encoding context "bad_cascade_no_stages_ctx" requires a "stages" option in WITH (...)
 HINT:  Specify WITH (stages = 'stage1_ctx,stage2_ctx').
 DROP ENCODING CONTEXT bad_cascade_no_stages_ctx;
 CREATE ENCODING CONTEXT bad_cascade_empty_stage_ctx TYPE cascade FOR TYPE jsonb WITH (
@@ -170,7 +170,7 @@ SELECT pg_encode_datum(
     (SELECT oid FROM pg_encoding_context WHERE ectxname = 'bad_cascade_empty_stage_ctx'),
     '{}'::jsonb
 );
-ERROR:  empty stage name in "stages" option for encoding context 16424
+ERROR:  empty stage name in "stages" option for encoding context "bad_cascade_empty_stage_ctx"
 DROP ENCODING CONTEXT bad_cascade_empty_stage_ctx;
 CREATE ENCODING CONTEXT bad_cascade_self_ctx TYPE cascade FOR TYPE jsonb WITH (
     stages = 'bad_cascade_self_ctx'
@@ -179,7 +179,7 @@ SELECT pg_encode_datum(
     (SELECT oid FROM pg_encoding_context WHERE ectxname = 'bad_cascade_self_ctx'),
     '{}'::jsonb
 );
-ERROR:  circular stage reference detected in cascade encoding context 16425
+ERROR:  circular stage reference detected in cascade encoding context "bad_cascade_self_ctx"
 DROP ENCODING CONTEXT bad_cascade_self_ctx;
 -- 4. Single-Stage Fused Handler (TYPE = 'avro_zstd')
 SELECT pg_create_encoding_context(
@@ -360,7 +360,7 @@ EXCEPTION WHEN invalid_object_definition THEN
     RAISE NOTICE 'caught expected indirect cycle error: %', regexp_replace(SQLERRM, '[0-9]+', 'OID', 'g');
 END;
 $$;
-NOTICE:  caught expected indirect cycle error: circular stage reference detected in cascade encoding context OID
+NOTICE:  caught expected indirect cycle error: circular stage reference detected in cascade encoding context "bad_cascade_cycle_a"
 DROP ENCODING CONTEXT bad_cascade_cycle_a;
 DROP ENCODING CONTEXT bad_cascade_cycle_b;
 -- Cascade context without outer FOR TYPE (inherits target type and whole-datum from Stage 0)

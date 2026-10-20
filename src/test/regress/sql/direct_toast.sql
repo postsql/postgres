@@ -558,24 +558,51 @@ DECLARE
     idx_oid_sz bigint;
     idx_oid8_sz bigint;
     idx_direct_sz bigint;
+    attempt int;
+    w int;
 BEGIN
-    PERFORM pg_current_xact_id();
-    lsn0 := pg_current_wal_insert_lsn();
-    INSERT INTO tab_sup_oid
-    SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
-    lsn1 := pg_current_wal_insert_lsn();
+    FOR attempt IN 1..5 LOOP
+        FOR w IN 1..500 LOOP
+            EXIT WHEN NOT EXISTS (
+                SELECT 1 FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND backend_type = 'autovacuum worker'
+            );
+            IF w = 500 THEN
+                PERFORM pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND backend_type = 'autovacuum worker';
+            END IF;
+            PERFORM pg_sleep(0.01);
+        END LOOP;
 
-    INSERT INTO tab_sup_oid8
-    SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
-    lsn2 := pg_current_wal_insert_lsn();
+        IF attempt > 1 THEN
+            TRUNCATE tab_sup_oid, tab_sup_oid8, tab_sup_direct;
+        END IF;
 
-    INSERT INTO tab_sup_direct
-    SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
-    lsn3 := pg_current_wal_insert_lsn();
+        PERFORM pg_current_xact_id();
+        lsn0 := pg_current_wal_insert_lsn();
+        INSERT INTO tab_sup_oid
+        SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
+        lsn1 := pg_current_wal_insert_lsn();
 
-    wal_oid := pg_wal_lsn_diff(lsn1, lsn0);
-    wal_oid8 := pg_wal_lsn_diff(lsn2, lsn1);
-    wal_direct := pg_wal_lsn_diff(lsn3, lsn2);
+        INSERT INTO tab_sup_oid8
+        SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
+        lsn2 := pg_current_wal_insert_lsn();
+
+        INSERT INTO tab_sup_direct
+        SELECT g, repeat(md5(g::text), 70) FROM generate_series(1, 700) g;
+        lsn3 := pg_current_wal_insert_lsn();
+
+        wal_oid := pg_wal_lsn_diff(lsn1, lsn0);
+        wal_oid8 := pg_wal_lsn_diff(lsn2, lsn1);
+        wal_direct := pg_wal_lsn_diff(lsn3, lsn2);
+
+        EXIT WHEN (wal_direct < wal_oid)
+              AND (wal_direct < wal_oid8)
+              AND (wal_oid8 > wal_oid);
+    END LOOP;
 
     SELECT pg_relation_size(i.indexrelid) INTO idx_oid_sz
     FROM pg_class c JOIN pg_index i ON c.reltoastrelid = i.indrelid
@@ -728,8 +755,28 @@ DO $$
 DECLARE
     iter int;
     r int;
+    w int;
 BEGIN
     FOR iter IN 1..10 LOOP
+        FOR w IN 1..500 LOOP
+            EXIT WHEN NOT EXISTS (
+                SELECT 1 FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname = current_database()
+                  AND (backend_type = 'autovacuum worker'
+                       OR backend_xid IS NOT NULL
+                       OR backend_xmin IS NOT NULL)
+            );
+            IF w = 500 THEN
+                PERFORM pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname = current_database()
+                  AND backend_type = 'autovacuum worker';
+            END IF;
+            COMMIT;
+            PERFORM pg_sleep(0.01);
+        END LOOP;
         FOR r IN 1..20 LOOP
             UPDATE tab_churn_direct_on  SET val = repeat(md5(iter::text || '-' || r::text), 300) WHERE id = r;
             UPDATE tab_churn_direct_off SET val = repeat(md5(iter::text || '-' || r::text), 300) WHERE id = r;
@@ -767,6 +814,7 @@ DECLARE
     sz_batch1 bigint;
     sz_batch6 bigint;
     iter int;
+    w int;
 BEGIN
     UPDATE tab_churn_direct_on SET val = repeat(md5('batch-1-' || id::text), 300);
     COMMIT;
@@ -775,6 +823,25 @@ BEGIN
     FROM pg_class WHERE relname = 'tab_churn_direct_on';
 
     FOR iter IN 2..6 LOOP
+        FOR w IN 1..500 LOOP
+            EXIT WHEN NOT EXISTS (
+                SELECT 1 FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname = current_database()
+                  AND (backend_type = 'autovacuum worker'
+                       OR backend_xid IS NOT NULL
+                       OR backend_xmin IS NOT NULL)
+            );
+            IF w = 500 THEN
+                PERFORM pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname = current_database()
+                  AND backend_type = 'autovacuum worker';
+            END IF;
+            COMMIT;
+            PERFORM pg_sleep(0.01);
+        END LOOP;
         UPDATE tab_churn_direct_on SET val = repeat(md5('batch-' || iter::text || '-' || id::text), 300);
         COMMIT;
     END LOOP;

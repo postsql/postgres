@@ -474,6 +474,39 @@ registerDataset(const char *name, DatasetFormat format, const char *filepath)
 }
 
 /*
+ * Return true if 'colon' is a Windows drive-letter colon at the start of a
+ * path component (e.g. "C:/..." or "D:\...").
+ */
+static bool
+is_windows_drive_colon(const char *start, const char *colon)
+{
+	return (colon == start + 1 &&
+			isalpha((unsigned char) start[0]) &&
+			(colon[1] == '/' || colon[1] == '\\'));
+}
+
+/*
+ * Find the next ':' delimiter in 'start' that is not a Windows drive-letter
+ * colon at the start of a path (or after a path separator).
+ */
+static const char *
+find_spec_colon(const char *start)
+{
+	for (const char *p = start; *p != '\0'; p++)
+	{
+		if (*p == '/' || *p == '\\')
+			return NULL;
+		if (*p == ':')
+		{
+			if (is_windows_drive_colon(start, p))
+				return NULL;
+			return p;
+		}
+	}
+	return NULL;
+}
+
+/*
  * Parse a "--dataset=<name>[:<format>][:header]=<path>" or
  * "--dataset=<name>:<format>[:header]:<path>" or
  * "--dataset=<name>=<path>" or "--dataset=<name>:<path>" specification.
@@ -515,10 +548,12 @@ parseDatasetSpec(const char *spec)
 	{
 		if (*p == ':' || *p == '=')
 		{
+			if (*p == ':' && is_windows_drive_colon(rest, p))
+				break;
 			sep2 = p;
 			break;
 		}
-		if (*p == '/')
+		if (*p == '/' || *p == '\\')
 			break;
 	}
 
@@ -576,10 +611,12 @@ parseDatasetSpec(const char *spec)
 			{
 				if (*p == ':' || *p == '=')
 				{
+					if (*p == ':' && is_windows_drive_colon(filepath, p))
+						break;
 					sep3 = p;
 					break;
 				}
-				if (*p == '/')
+				if (*p == '/' || *p == '\\')
 					break;
 			}
 			if (sep3 != NULL && (sep3 - filepath) == 6 &&
@@ -610,7 +647,9 @@ parseDatasetSpec(const char *spec)
 			char	   *last_colon = strrchr(fp_copy, ':');
 
 			if (last_colon == NULL || last_colon == fp_copy ||
-				strchr(last_colon, '/') != NULL)
+				is_windows_drive_colon(fp_copy, last_colon) ||
+				strchr(last_colon, '/') != NULL ||
+				strchr(last_colon, '\\') != NULL)
 				break;
 
 			if (pg_strcasecmp(last_colon + 1, "header") == 0)
@@ -709,10 +748,10 @@ parseVectorBaseSpec(const char *spec)
 	if (spec == NULL || *spec == '\0')
 		pg_fatal("invalid --vector-base specification: empty string");
 
-	colon = strchr(spec, ':');
+	colon = find_spec_colon(spec);
 	if (colon != NULL)
 	{
-		const char *second_colon = strchr(colon + 1, ':');
+		const char *second_colon = find_spec_colon(colon + 1);
 
 		if (second_colon != NULL)
 		{
@@ -784,10 +823,10 @@ parseGroundTruthTableSpec(const char *spec)
 	if (spec == NULL || *spec == '\0')
 		pg_fatal("invalid --ground-truth-table specification: empty string");
 
-	colon = strchr(spec, ':');
+	colon = find_spec_colon(spec);
 	if (colon != NULL)
 	{
-		const char *second_colon = strchr(colon + 1, ':');
+		const char *second_colon = find_spec_colon(colon + 1);
 
 		if (second_colon != NULL)
 		{
