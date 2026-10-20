@@ -1,6 +1,6 @@
 # `pgbench` Telemetry & Reporting Viewer (`src/bin/pgbench/viewer`)
 
-A zero-dependency web application (`pgbench_viewer.py`) built with [`bottle.py`](file://bottle.py), [`Water.css`](https://watercss.kognise.dev/) (`css/water.css`), modular `SimpleTemplate` (`stpl`) templates (`html/*.html.stpl`), and a 439-byte WebAssembly layout/projection kernel (`wasm/pgbench_chart.wasm`, with non-runtime build sources in `src/`). It renders historical benchmark runs, multi-run comparisons, live streaming telemetry, and interactive SQL explorations directly from a PostgreSQL `--log-db` telemetry database.
+A zero-dependency web application (`pgbench_viewer.py`) built with [`bottle.py`](bottle.py), [`Water.css`](https://watercss.kognise.dev/) (`css/water.css`), modular `SimpleTemplate` (`stpl`) templates (`html/*.html.stpl`), and a 439-byte WebAssembly layout/projection kernel (`wasm/pgbench_chart.wasm`, with non-runtime build sources in `src/`). It renders historical benchmark runs, multi-run comparisons, live streaming telemetry, and interactive SQL explorations directly from a PostgreSQL `--log-db` telemetry database.
 
 ---
 
@@ -18,7 +18,7 @@ A zero-dependency web application (`pgbench_viewer.py`) built with [`bottle.py`]
    - `/live` queries `<schema>.pgbench_live_progress_v` and committed stream batches in real time and polls `/api/payload?mode=live` to update KPI cards and WASM charts in place.
 4. **Two-Stage Bottle Metatemplate SQL Data Explorer (Phase 2)**:
    - The `/explorer` tab wraps arbitrary read-only `SELECT` / `WITH` / `TABLE` / `VALUES` queries in a single PostgreSQL JSONB envelope (`{schema, generated_at, row_count, rows}`).
-   - `generate_explorer_stpl_metatemplate()` inspects the returned column names and runtime JSON types (`run_link`, `badge`, `meter_pct`, `meter_ratio`, `metric_num`, `num`, `json`, `text`) and expands the Stage-1 metatemplate [`html/explorer_table_meta.html.stpl`](file://html/explorer_table_meta.html.stpl) (using custom delimiter syntax `<@ @> @ {| |}`) into a Stage-2 `bottle.SimpleTemplate` (`stpl`) string that is both inspectable in `<details>` and rendered to HTML.
+   - `generate_explorer_stpl_metatemplate()` inspects the returned column names and runtime JSON types (`run_link`, `badge`, `meter_pct`, `meter_ratio`, `metric_num`, `num`, `json`, `text`) and expands the Stage-1 metatemplate [`html/explorer_table_meta.html.stpl`](html/explorer_table_meta.html.stpl) (using custom delimiter syntax `<@ @> @ {| |}`) into a Stage-2 `bottle.SimpleTemplate` (`stpl`) string that is both inspectable in `<details>` and rendered to HTML.
 5. **Minimalistic WebAssembly Diagram Kernel (`wasm/pgbench_chart.wasm`)**:
    - A 439-byte WebAssembly binary module assembled reproducibly via `python3 src/build_wasm.py` (with source in `src/pgbench_chart.wat` and `src/pgbench_chart.c`) exports `memory` (2 pages) and 4 `f64` array kernels:
      - `series_min(ptr, n) -> f64`
