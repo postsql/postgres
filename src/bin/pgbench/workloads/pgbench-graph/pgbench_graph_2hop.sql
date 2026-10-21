@@ -1,5 +1,17 @@
+/*
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * DISCLAIMER: This workload is an independent engineering benchmark designed
+ * for database performance research and regression testing. While modeled
+ * after graph traversal patterns published by the Graph Data Council (LDBC),
+ * this is NOT an LDBC Benchmark, is NOT an implementation of an LDBC Benchmark,
+ * and these results are NOT LDBC Benchmark Results.
+ * LDBC, LDBC Benchmark, and LDBC Benchmark Results are registered trademarks
+ * of the Graph Data Council. Distributed under CC-BY 4.0 attribution terms.
+ */
+
 --
--- pgbench-graph: 2-Hop Friend-of-Friend Discovery & Scoring (LDBC IC-1 / IC-9 style)
+-- pgbench-graph: 2-Hop Friend-of-Friend Discovery & Scoring (2-Hop Friend-of-Friend style)
 --
 
 \if reservoir_count('persons') >= 0

@@ -313,4 +313,46 @@ RETURNS double precision
 AS 'MODULE_PATHNAME', 'pgbench_vector_distance_text'
 LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
+CREATE FUNCTION community_correlated_edge(
+    src_id bigint,
+    num_vertices bigint,
+    num_communities bigint DEFAULT 32,
+    homophily_prob double precision DEFAULT 0.70,
+    seed bigint DEFAULT 0
+)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pgbench_community_correlated_edge_sql'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
+CREATE FUNCTION pgbench_community_correlated_edge(
+    src_id bigint,
+    num_vertices bigint,
+    num_communities bigint DEFAULT 32,
+    homophily_prob double precision DEFAULT 0.70,
+    seed bigint DEFAULT 0
+)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pgbench_community_correlated_edge_sql'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+CREATE FUNCTION burst_timestamp(
+    base_ts_us bigint,
+    span_us bigint,
+    num_spikes bigint DEFAULT 16,
+    spike_prob double precision DEFAULT 0.35,
+    seed bigint DEFAULT 0
+)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pgbench_burst_timestamp_sql'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+CREATE FUNCTION pgbench_burst_timestamp(
+    base_ts_us bigint,
+    span_us bigint,
+    num_spikes bigint DEFAULT 16,
+    spike_prob double precision DEFAULT 0.35,
+    seed bigint DEFAULT 0
+)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pgbench_burst_timestamp_sql'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
