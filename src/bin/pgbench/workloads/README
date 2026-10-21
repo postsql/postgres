@@ -126,7 +126,7 @@ Ready-to-run `.pgbench.json` files provided:
   * workloads/pgbench-graph/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
   * workloads/pgbench-graph-sql-ud/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
   * workloads/pgbench-graph-pgq/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
-
+  * workloads/pgbench-graph-plpgq/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
 
 
 0. pgbench-banking (workloads/pgbench-banking/)
