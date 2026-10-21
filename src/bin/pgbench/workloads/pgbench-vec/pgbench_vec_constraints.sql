@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * DISCLAIMER: This workload is an independent engineering benchmark inspired
+ * by the filtered vector search methodologies described in "VecBench: A
+ * Controllable Benchmark for Filtered Vector Search" (Zhang et al., ACM SIGMOD).
+ * It is not the official VecBench software suite and does not publish official
+ * VecBench leaderboard ratings.
+ */
+
 --
 -- pgbench-vec (Vector Search & Hybrid RAG Benchmark Workload Suite)
 -- Constraints, Indexes, and Statistics
@@ -11,7 +21,16 @@ ALTER TABLE pgbench_vec_items
 CREATE INDEX pgbench_vec_items_category_idx
     ON pgbench_vec_items (category);
 
+CREATE INDEX pgbench_vec_items_price_idx
+    ON pgbench_vec_items (price);
+
+CREATE INDEX pgbench_vec_items_active_idx
+    ON pgbench_vec_items (is_active);
+
 CREATE INDEX pgbench_vec_items_tags_gin_idx
     ON pgbench_vec_items USING gin (tags);
+
+CREATE INDEX pgbench_vec_items_metadata_gin_idx
+    ON pgbench_vec_items USING gin (metadata);
 
 ANALYZE pgbench_vec_items;

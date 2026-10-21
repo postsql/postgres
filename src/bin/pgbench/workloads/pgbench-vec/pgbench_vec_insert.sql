@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * DISCLAIMER: This workload is an independent engineering benchmark inspired
+ * by the filtered vector search methodologies described in "VecBench: A
+ * Controllable Benchmark for Filtered Vector Search" (Zhang et al., ACM SIGMOD).
+ * It is not the official VecBench software suite and does not publish official
+ * VecBench leaderboard ratings.
+ */
+
 --
 -- pgbench-vec: Streaming Vector Upsert & Causal Watermark Advancement
 --

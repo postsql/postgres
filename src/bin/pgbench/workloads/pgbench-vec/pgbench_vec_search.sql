@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * DISCLAIMER: This workload is an independent engineering benchmark inspired
+ * by the filtered vector search methodologies described in "VecBench: A
+ * Controllable Benchmark for Filtered Vector Search" (Zhang et al., ACM SIGMOD).
+ * It is not the official VecBench software suite and does not publish official
+ * VecBench leaderboard ratings.
+ */
+
 --
 -- pgbench-vec: Top-K Vector Similarity Search with Recall@K Telemetry
 --
@@ -25,4 +35,4 @@ SELECT id
  LIMIT :k
 \gset_col ground_truth
 
-\record_recall retrieved ground_truth :k
+\record_recall name=r_unfiltered retrieved ground_truth :k
