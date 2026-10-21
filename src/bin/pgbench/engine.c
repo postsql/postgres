@@ -24,6 +24,7 @@
 #include "common/pg_prng.h"
 #include "common/pgbench_funcs.h"
 #include "common/string.h"
+#include "config.h"
 #include "dataset.h"
 #include "engine.h"
 #include "fe_utils/string_utils.h"
@@ -152,6 +153,14 @@ void
 initRandomState(pg_prng_state *state)
 {
 	pg_prng_seed(state, pg_prng_uint64(&base_random_sequence));
+}
+
+void
+resetEngineRunState(void)
+{
+	__atomic_store_n(&aborted_clients_count, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&active_sessions_count, 0, __ATOMIC_RELEASE);
+	timer_exceeded = false;
 }
 
 /*
@@ -2841,7 +2850,7 @@ printResults(StatsData *total,
 				const char *desc = sql_script[i].desc;
 
 				if (strstr(desc, "analytics") != NULL || strstr(desc, "tpch") != NULL ||
-					strstr(desc, "qph") != NULL || strstr(desc, "qphh") != NULL ||
+					strstr(desc, "qph") != NULL || strstr(desc, "qph") != NULL ||
 					strstr(desc, "pgbench-analytics") != NULL || strstr(desc, "pgbench_analytics") != NULL ||
 					strstr(desc, "pgbench-h") != NULL || strstr(desc, "pgbench_h") != NULL)
 				{
@@ -3166,14 +3175,9 @@ printResults(StatsData *total,
 						 json_report_file);
 
 			fprintf(jfp, "{\n");
-			fprintf(jfp, "  \"configuration\": {\n");
-			fprintf(jfp, "    \"scale\": %d,\n", scale);
-			fprintf(jfp, "    \"clients\": %d,\n", nclients);
-			fprintf(jfp, "    \"threads\": %d,\n", nthreads);
-			fprintf(jfp, "    \"duration_sec\": %d,\n", duration);
-			fprintf(jfp, "    \"transactions_per_client\": %d,\n", nxacts);
-			fprintf(jfp, "    \"query_mode\": \"%s\"\n", QUERYMODE[querymode]);
-			fprintf(jfp, "  },\n");
+			fprintf(jfp, "  \"configuration\": ");
+			writeConfigJsonObject(jfp, 2, false);
+			fprintf(jfp, ",\n");
 
 			fprintf(jfp, "  \"overall\": {\n");
 			fprintf(jfp, "    \"transactions_processed\": " INT64_FORMAT ",\n", total->cnt);
@@ -3325,6 +3329,28 @@ printResults(StatsData *total,
 				fprintf(jfp, "      \"clients\": %d,\n", grp->nclients);
 				fprintf(jfp, "      \"threads\": %d,\n", grp->nthreads);
 				fprintf(jfp, "      \"sequential\": %s,\n", grp->sequential ? "true" : "false");
+				fprintf(jfp, "      \"rate\": %.6f,\n", grp->rate);
+				fprintf(jfp, "      \"scripts\": [\n");
+				for (int s = 0; s < grp->num_scripts; s++)
+				{
+					int			sidx = grp->script_indices[s];
+
+					fprintf(jfp, "        { ");
+					if (sql_script[sidx].builtin_name != NULL)
+					{
+						fprintf(jfp, "\"builtin\": ");
+						fprintJsonString(jfp, sql_script[sidx].builtin_name);
+					}
+					else
+					{
+						fprintf(jfp, "\"file\": ");
+						fprintJsonString(jfp, sql_script[sidx].desc);
+					}
+					fprintf(jfp, ", \"weight\": %d }%s\n",
+							sql_script[sidx].weight,
+							(s + 1 < grp->num_scripts) ? "," : "");
+				}
+				fprintf(jfp, "      ],\n");
 				fprintf(jfp, "      \"transactions_processed\": " INT64_FORMAT ",\n", gs->cnt);
 				fprintf(jfp, "      \"transactions_failed\": " INT64_FORMAT ",\n", getFailures(gs));
 				fprintf(jfp, "      \"expected_rollbacks\": " INT64_FORMAT ",\n", gs->expected_rollbacks);
@@ -3359,6 +3385,12 @@ printResults(StatsData *total,
 				fprintf(jfp, "      \"name\": ");
 				fprintJsonString(jfp, sql_script[i].desc);
 				fprintf(jfp, ",\n");
+				if (sql_script[i].builtin_name != NULL)
+				{
+					fprintf(jfp, "      \"builtin\": ");
+					fprintJsonString(jfp, sql_script[i].builtin_name);
+					fprintf(jfp, ",\n");
+				}
 				fprintf(jfp, "      \"weight\": %d,\n", sql_script[i].weight);
 				fprintf(jfp, "      \"transactions_processed\": " INT64_FORMAT ",\n", ss->cnt);
 				fprintf(jfp, "      \"transactions_failed\": " INT64_FORMAT ",\n", getFailures(ss));
@@ -3390,6 +3422,12 @@ printResults(StatsData *total,
 				SlaRule    *rule = &sla_rules[k];
 
 				fprintf(jfp, "    {\n");
+				if (rule->raw_spec != NULL)
+				{
+					fprintf(jfp, "      \"spec\": ");
+					fprintJsonString(jfp, rule->raw_spec);
+					fprintf(jfp, ",\n");
+				}
 				fprintf(jfp, "      \"target\": ");
 				fprintJsonString(jfp, rule->target);
 				fprintf(jfp, ",\n");

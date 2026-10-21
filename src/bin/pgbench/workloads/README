@@ -93,6 +93,42 @@ overrides (such as -D items_per_scale=100 -D cust_per_dist=20) can be supplied
 to both <suite>_init.sql and the transaction scripts.
 
 
+JSON/JSONC Workload Configuration Files (--config & --dump-config)
+------------------------------------------------------------------
+
+Every workload suite directory also includes ready-to-run `.pgbench.json`
+configuration files that encapsulate multi-stage initialization (`init_steps`),
+scripts and weights, client groups (`groups`), shared reservoirs (`reservoirs`),
+variables, and SLA compliance rules (`sla`).
+
+  * Multi-stage initialization in a single command (works from any directory):
+      pgbench --config=workloads/pgbench-order/pgbench_order.pgbench.json -i
+
+  * Execute the workload with optional CLI overrides:
+      pgbench --config=workloads/pgbench-order/pgbench_order.pgbench.json \
+              -c 16 -j 4 -T 60 --json-report=pgbench_order_results.json
+
+  * Replay any prior `--json-report` output directly:
+      pgbench --config=pgbench_order_results.json -T 30
+
+  * Export effective configuration (combining `--config` and CLI flags):
+      pgbench --config=workloads/pgbench-order/pgbench_order.pgbench.json \
+              -c 32 -j 8 --dump-config=custom_order.pgbench.json
+
+Ready-to-run `.pgbench.json` files provided:
+  * workloads/pgbench-banking/pgbench_banking.pgbench.json
+  * workloads/pgbench-order/pgbench_order.pgbench.json
+  * workloads/pgbench-brokerage/pgbench_brokerage.pgbench.json
+  * workloads/pgbench-analytics/pgbench_analytics.pgbench.json
+  * workloads/pgbench-retail/pgbench_retail.pgbench.json
+  * workloads/pgbench-htap/pgbench_htap.pgbench.json
+  * workloads/pgbench-vec/{vec_hybrid,vec_aging}.pgbench.json
+  * workloads/pgbench-graph/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
+  * workloads/pgbench-graph-sql-ud/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
+  * workloads/pgbench-graph-pgq/{subgraph,social_interactive,social_bi,financial,algorithms}.pgbench.json
+
+
+
 0. pgbench-banking (workloads/pgbench-banking/)
 -----------------------------------
 
