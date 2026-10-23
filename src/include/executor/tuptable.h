@@ -108,10 +108,18 @@
 #define TTS_FIXED(slot) (((slot)->tts_flags & TTS_FLAG_FIXED) != 0)
 
 /*
+ * true = tuple's ROW IDENTITY column is stored at its physical home (0 bytes
+ * on disk, elided via t_bits = 0) and should not be indexed in rowid_idx.
+ */
+#define			TTS_FLAG_ROWID_AT_HOME	(1 << 5)
+#define TTS_IS_ROWID_AT_HOME(slot) \
+	(((slot)->tts_flags & TTS_FLAG_ROWID_AT_HOME) != 0)
+
+/*
  * Defines which of the above flags should never be set in tts_flags when the
  * TupleTableSlot is created.
  */
-#define			TTS_FLAGS_TRANSIENT (TTS_FLAG_EMPTY|TTS_FLAG_SHOULDFREE)
+#define			TTS_FLAGS_TRANSIENT (TTS_FLAG_EMPTY|TTS_FLAG_SHOULDFREE|TTS_FLAG_ROWID_AT_HOME)
 
 struct TupleTableSlotOps;
 typedef struct TupleTableSlotOps TupleTableSlotOps;

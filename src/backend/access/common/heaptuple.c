@@ -460,6 +460,11 @@ heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc)
 	 * values, such as catalog relations and indexes.
 	 */
 	Assert(!tupleDesc || attnum <= tupleDesc->natts);
+	if (tupleDesc && attnum > 0 &&
+		attnum - 1 == tupleDesc->td_rowidentity_attno &&
+		ItemPointerIsValid(&tup->t_self))
+		return false;
+
 	if (attnum > (int) HeapTupleHeaderGetNatts(tup->t_data))
 	{
 		if (tupleDesc &&
@@ -693,6 +698,7 @@ heap_copytuple(HeapTuple tuple)
 	newTuple = (HeapTuple) palloc(HEAPTUPLESIZE + tuple->t_len);
 	newTuple->t_len = tuple->t_len;
 	newTuple->t_self = tuple->t_self;
+	newTuple->t_rootoff = tuple->t_rootoff;
 	newTuple->t_tableOid = tuple->t_tableOid;
 	newTuple->t_data = (HeapTupleHeader) ((char *) newTuple + HEAPTUPLESIZE);
 	memcpy(newTuple->t_data, tuple->t_data, tuple->t_len);
@@ -719,6 +725,7 @@ heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest)
 
 	dest->t_len = src->t_len;
 	dest->t_self = src->t_self;
+	dest->t_rootoff = src->t_rootoff;
 	dest->t_tableOid = src->t_tableOid;
 	dest->t_data = (HeapTupleHeader) palloc(src->t_len);
 	memcpy(dest->t_data, src->t_data, src->t_len);
@@ -763,6 +770,32 @@ expand_tuple(HeapTuple *targetHeapTuple,
 		   || (!targetHeapTuple && targetMinimalTuple));
 
 	Assert(sourceNatts < natts);
+
+	if (unlikely(tupleDesc->td_rowidentity_attno >= 0 &&
+				 ItemPointerIsValid(&sourceTuple->t_self) &&
+				 HeapTupleHeaderRowIdIsAtHome(sourceTHeader,
+											  tupleDesc->td_rowidentity_attno)))
+	{
+		Datum	   *values = palloc_array(Datum, natts);
+		bool	   *isnull = palloc_array(bool, natts);
+
+		heap_deform_tuple(sourceTuple, tupleDesc, values, isnull);
+		if (targetHeapTuple)
+		{
+			*targetHeapTuple = heap_form_tuple(tupleDesc, values, isnull);
+			(*targetHeapTuple)->t_tableOid = sourceTuple->t_tableOid;
+			(*targetHeapTuple)->t_self = sourceTuple->t_self;
+			(*targetHeapTuple)->t_rootoff = sourceTuple->t_rootoff;
+			(*targetHeapTuple)->t_data->t_ctid = sourceTHeader->t_ctid;
+		}
+		else
+		{
+			*targetMinimalTuple = heap_form_minimal_tuple(tupleDesc, values, isnull, 0);
+		}
+		pfree(values);
+		pfree(isnull);
+		return;
+	}
 
 	sourceNullLen = (hasNulls ? BITMAPLEN(sourceNatts) : 0);
 
@@ -856,6 +889,7 @@ expand_tuple(HeapTuple *targetHeapTuple,
 		(*targetHeapTuple)->t_len = len;
 		(*targetHeapTuple)->t_tableOid = sourceTuple->t_tableOid;
 		(*targetHeapTuple)->t_self = sourceTuple->t_self;
+		(*targetHeapTuple)->t_rootoff = sourceTuple->t_rootoff;
 
 		targetTHeader->t_infomask = sourceTHeader->t_infomask;
 		targetTHeader->t_hoff = hoff;
@@ -989,6 +1023,39 @@ Datum
 heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
 {
 	HeapTupleHeader td;
+
+	if (unlikely(tupleDesc->td_rowidentity_attno >= 0 &&
+				 ItemPointerIsValid(&tuple->t_self) &&
+				 HeapTupleHeaderRowIdIsAtHome(tuple->t_data,
+											  tupleDesc->td_rowidentity_attno)))
+	{
+		int			natts = tupleDesc->natts;
+		Datum	   *values = palloc_array(Datum, natts);
+		bool	   *isnull = palloc_array(bool, natts);
+		HeapTuple	mat_tup;
+		Datum		res;
+
+		heap_deform_tuple(tuple, tupleDesc, values, isnull);
+		mat_tup = heap_form_tuple(tupleDesc, values, isnull);
+		pfree(values);
+		pfree(isnull);
+
+		if (HeapTupleHasExternal(mat_tup))
+			res = toast_flatten_tuple_to_datum(mat_tup->t_data,
+											   mat_tup->t_len,
+											   tupleDesc);
+		else
+		{
+			td = (HeapTupleHeader) palloc(mat_tup->t_len);
+			memcpy(td, mat_tup->t_data, mat_tup->t_len);
+			HeapTupleHeaderSetDatumLength(td, mat_tup->t_len);
+			HeapTupleHeaderSetTypeId(td, tupleDesc->tdtypeid);
+			HeapTupleHeaderSetTypMod(td, tupleDesc->tdtypmod);
+			res = PointerGetDatum(td);
+		}
+		heap_freetuple(mat_tup);
+		return res;
+	}
 
 	/*
 	 * If the tuple contains any external TOAST pointers, we have to inline
@@ -1165,6 +1232,7 @@ heap_modify_tuple(HeapTuple tuple,
 	 */
 	newTuple->t_data->t_ctid = tuple->t_data->t_ctid;
 	newTuple->t_self = tuple->t_self;
+	newTuple->t_rootoff = tuple->t_rootoff;
 	newTuple->t_tableOid = tuple->t_tableOid;
 
 	return newTuple;
@@ -1228,6 +1296,7 @@ heap_modify_tuple_by_cols(HeapTuple tuple,
 	 */
 	newTuple->t_data->t_ctid = tuple->t_data->t_ctid;
 	newTuple->t_self = tuple->t_self;
+	newTuple->t_rootoff = tuple->t_rootoff;
 	newTuple->t_tableOid = tuple->t_tableOid;
 
 	return newTuple;
@@ -1363,6 +1432,17 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 	 */
 	for (; attnum < tdesc_natts; attnum++)
 		values[attnum] = getmissingattr(tupleDesc, attnum + 1, &isnull[attnum]);
+
+	if (unlikely(tupleDesc->td_rowidentity_attno >= 0 &&
+				 tupleDesc->td_rowidentity_attno < tdesc_natts &&
+				 isnull[tupleDesc->td_rowidentity_attno] &&
+				 ItemPointerIsValid(&tuple->t_self)))
+	{
+		int			rowid_attno = tupleDesc->td_rowidentity_attno;
+
+		values[rowid_attno] = Int64GetDatum(HeapTupleGetRowIdentity(tuple, tupleDesc));
+		isnull[rowid_attno] = false;
+	}
 }
 
 /*

@@ -22,15 +22,25 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/skey.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
+#include "access/tableam_indexscan.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/nodeTidscan.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "storage/bufmgr.h"
+#include "storage/bufpage.h"
+#include "storage/itemid.h"
 #include "utils/array.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 
@@ -45,18 +55,349 @@
 	 IsA((node), Var) && \
 	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber)
 
+static inline bool
+IsRowIdentityVarNode(Node *node, AttrNumber rowid_attnum)
+{
+	return (rowid_attnum > 0 &&
+			node != NULL &&
+			IsA(node, Var) &&
+			((Var *) node)->varattno == rowid_attnum);
+}
+
 /* one element in tss_tidexprs */
 typedef struct TidExpr
 {
 	ExprState  *exprstate;		/* ExprState for a TID-yielding subexpr */
 	bool		isarray;		/* if true, it yields tid[] not just tid */
 	CurrentOfExpr *cexpr;		/* alternatively, we can have CURRENT OF */
+	bool		is_rowidentity; /* if true, expr yields int8/int4/int2 rowid */
+	Oid			elemtype;		/* type OID of expression or array element */
 } TidExpr;
 
 static void TidExprListCreate(TidScanState *tidstate);
 static void TidListEval(TidScanState *tidstate);
 static int	itemptr_comparator(const void *a, const void *b);
 static TupleTableSlot *TidNext(TidScanState *node);
+
+static inline int64
+DatumGetRowId(Datum d, Oid elemtype)
+{
+	switch (elemtype)
+	{
+		case INT8OID:
+			return DatumGetInt64(d);
+		case INT4OID:
+			return (int64) DatumGetInt32(d);
+		case INT2OID:
+			return (int64) DatumGetInt16(d);
+		default:
+			elog(ERROR, "unsupported row identity comparison type: %u", elemtype);
+			return 0;
+	}
+}
+
+static inline void
+TidListAppend(ItemPointerData **tidList, int *numTids, int *numAllocTids,
+			  ItemPointer tid)
+{
+	if (*numTids >= *numAllocTids)
+	{
+		*numAllocTids = (*numAllocTids > 0) ? (*numAllocTids * 2) : 8;
+		*tidList = repalloc_array(*tidList, ItemPointerData, *numAllocTids);
+	}
+	(*tidList)[(*numTids)++] = *tid;
+}
+
+/*
+ * Probe the partial B-Tree index (rd_rowidindex) for an off-root tuple with
+ * the specified 64-bit rowid, and append any visible tuple's physical TID to
+ * *tidList.
+ */
+static bool
+RowIdProbeIndex(Relation rel, Relation *idxrel_p, Snapshot snapshot,
+				int64 rowid, ItemPointerData **tidList,
+				int *numTids, int *numAllocTids)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	Relation	idxrel;
+	ScanKeyData skey;
+	IndexScanDesc iscan;
+	bool		found = false;
+
+	if (rowid_attno < 0)
+		return false;
+
+	idxrel = *idxrel_p;
+	if (idxrel == NULL)
+	{
+		Oid			idxoid = RelationGetRowIdIndex(rel);
+
+		if (!OidIsValid(idxoid))
+			return false;
+		idxrel = index_open(idxoid, AccessShareLock);
+		*idxrel_p = idxrel;
+	}
+
+	/*
+	 * Fast path: if the partial B-Tree index has <= 1 block (metapage only),
+	 * zero off-page tuples exist in this relation!
+	 */
+	if (RelationGetNumberOfBlocks(idxrel) <= 1)
+		return false;
+
+	ScanKeyInit(&skey,
+				1,
+				BTEqualStrategyNumber,
+				F_INT8EQ,
+				Int64GetDatum(rowid));
+
+	iscan = index_beginscan(rel, idxrel, false, snapshot, NULL, 1, 0, SO_NONE);
+	index_rescan(iscan, &skey, 1, NULL, 0);
+
+	while (tableam_index_getnext_tid(iscan, ForwardScanDirection))
+	{
+		ItemPointerData heaptid = iscan->xs_heaptid;
+		Buffer		buf;
+		HeapTupleData heapTuple;
+		bool		all_dead = false;
+
+		buf = ReadBuffer(rel, ItemPointerGetBlockNumber(&heaptid));
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+		if (heap_hot_search_buffer(&heaptid, rel, buf, snapshot,
+								   &heapTuple, &all_dead, true))
+		{
+			bool		isnull = false;
+			Datum		val;
+
+			/*
+			 * Verify the visible tuple in this HOT chain is indeed an
+			 * off-root tuple carrying the target rowid (and not a home tuple
+			 * after the slot was recycled).
+			 */
+			if (!HeapTupleHeaderRowIdIsAtHome(heapTuple.t_data, rowid_attno))
+			{
+				val = fastgetattr(&heapTuple, rowid_attno + 1, tupdesc, &isnull);
+				if (!isnull && DatumGetInt64(val) == rowid)
+				{
+					TidListAppend(tidList, numTids, numAllocTids, &heapTuple.t_self);
+					found = true;
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	index_endscan(iscan);
+	return found;
+}
+
+/*
+ * Resolve a 64-bit row identity key to the physical TID(s) of any matching
+ * visible tuple in 'rel', using the two-mode adaptive lookup strategy:
+ *   - Mode 1 (Heap-First): Pin B_0 and walk the HOT chain at O_0. If O_0 is
+ *     LP_UNUSED or a dead local DELETE chain, return 0 rows in 0 index reads.
+ *     Only probe rd_rowidindex when O_0 is LP_REDIRECT_OFFPAGE_* or a chain
+ *     that moved off-root / was repatriated after our snapshot.
+ *   - Mode 2 (Cached-Tiny-Index-First when B_0 is cold): When rd_rowidindex
+ *     is non-empty and tiny (<= 64 blocks) and PrefetchBuffer reports B_0 is
+ *     not in shared_buffers, probe rd_rowidindex while B_0 is prefetched.
+ */
+static void
+RowIdResolveToTid(Relation rel, Relation *idxrel_p, BlockNumber nblocks,
+				  Snapshot snapshot, int64 rowid,
+				  ItemPointerData **tidList, int *numTids, int *numAllocTids)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	BlockNumber blkno;
+	OffsetNumber rootoff;
+	Buffer		buf;
+	Page		page;
+	OffsetNumber maxoff;
+	ItemId		rootlp;
+	OffsetNumber curoff;
+	TransactionId prev_xmax;
+	bool		need_index_probe = false;
+	bool		already_probed_index = false;
+
+	if (rowid <= 0 || rowid_attno < 0)
+		return;
+
+	/*
+	 * Extended keys (bit 62 set) or keys belonging to another partition
+	 * cannot reside at a local home TID; probe the partial index directly.
+	 */
+	if (RowIdIsExtended(rowid) ||
+		RowIdGetPartitionId(rowid, tupdesc->td_partition_bits) != tupdesc->td_partition_prefix)
+	{
+		(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+							   tidList, numTids, numAllocTids);
+		return;
+	}
+
+	blkno = RowIdGetBlockNumber(rowid, tupdesc->td_partition_bits);
+	rootoff = RowIdGetOffsetNumber(rowid);
+
+	if (rootoff < FirstOffsetNumber || rootoff > MaxHeapTuplesPerPage)
+	{
+		(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+							   tidList, numTids, numAllocTids);
+		return;
+	}
+
+	if (blkno >= nblocks)
+	{
+		(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+							   tidList, numTids, numAllocTids);
+		return;
+	}
+
+	/*
+	 * Mode 2 check: if rd_rowidindex is non-empty and tiny (2..64 blocks),
+	 * check if B_0 is in shared_buffers via PrefetchBuffer.
+	 */
+	if (*idxrel_p == NULL && OidIsValid(RelationGetRowIdIndex(rel)))
+		*idxrel_p = index_open(RelationGetRowIdIndex(rel), AccessShareLock);
+
+	if (*idxrel_p != NULL)
+	{
+		BlockNumber idx_nblocks = RelationGetNumberOfBlocks(*idxrel_p);
+
+		if (idx_nblocks > 1 && idx_nblocks <= 64)
+		{
+			PrefetchBufferResult pf = PrefetchBuffer(rel, MAIN_FORKNUM, blkno);
+
+			if (!BufferIsValid(pf.recent_buffer))
+			{
+				if (RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+									tidList, numTids, numAllocTids))
+					return;
+				already_probed_index = true;
+			}
+		}
+	}
+
+	/*
+	 * Mode 1: Pin home block B_0 and inspect line pointer O_0.
+	 */
+	buf = ReadBuffer(rel, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	maxoff = PageGetMaxOffsetNumber(page);
+
+	if (rootoff > maxoff)
+	{
+		UnlockReleaseBuffer(buf);
+		if (!already_probed_index)
+			(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+								   tidList, numTids, numAllocTids);
+		return;
+	}
+
+	rootlp = PageGetItemId(page, rootoff);
+
+	/*
+	 * If O_0 is LP_UNUSED or LP_DEAD, check RowIdProbeIndex in case the row
+	 * was moved off-home by CLUSTER / VACUUM FULL or inserted via OVERRIDING
+	 * SYSTEM VALUE without anchoring O_0 (RowIdProbeIndex is a 0-I/O no-op
+	 * when rd_rowidindex has <= 1 block).
+	 */
+	if (!ItemIdIsUsed(rootlp) || ItemIdIsDead(rootlp))
+	{
+		UnlockReleaseBuffer(buf);
+		if (!already_probed_index)
+			(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+								   tidList, numTids, numAllocTids);
+		return;
+	}
+
+	if (ItemIdIsRedirected(rootlp))
+	{
+		OffsetNumber redir = ItemIdGetRedirect(rootlp);
+
+		if (OffsetNumberIsOffpageRedirect(redir))
+		{
+			UnlockReleaseBuffer(buf);
+			if (redir != LP_REDIRECT_OFFPAGE_PART && !already_probed_index)
+				(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+									   tidList, numTids, numAllocTids);
+			return;
+		}
+		curoff = redir;
+	}
+	else
+	{
+		curoff = rootoff;
+	}
+
+	/*
+	 * Walk the local HOT chain rooted at rootoff on page B_0.
+	 */
+	prev_xmax = InvalidTransactionId;
+	for (;;)
+	{
+		ItemId		lp;
+		HeapTupleData htup;
+		bool		valid;
+
+		if (curoff < FirstOffsetNumber || curoff > maxoff)
+			break;
+
+		lp = PageGetItemId(page, curoff);
+		if (!ItemIdIsNormal(lp))
+			break;
+
+		htup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		htup.t_len = ItemIdGetLength(lp);
+		htup.t_tableOid = RelationGetRelid(rel);
+		ItemPointerSet(&htup.t_self, blkno, curoff);
+		htup.t_rootoff = rootoff;
+
+		if (prev_xmax != InvalidTransactionId &&
+			!TransactionIdEquals(prev_xmax, HeapTupleHeaderGetXmin(htup.t_data)))
+			break;
+
+		if (!HeapTupleHeaderRowIdIsAtHome(htup.t_data, rowid_attno))
+		{
+			need_index_probe = true;
+			break;
+		}
+
+		valid = HeapTupleSatisfiesVisibility(&htup, snapshot, buf);
+		if (valid)
+		{
+			TidListAppend(tidList, numTids, numAllocTids, &htup.t_self);
+			UnlockReleaseBuffer(buf);
+			return;
+		}
+
+		if ((htup.t_data->t_infomask & HEAP_UPDATED) != 0)
+			need_index_probe = true;
+
+		if (HeapTupleHeaderIsHotUpdated(htup.t_data))
+		{
+			curoff = ItemPointerGetOffsetNumber(&htup.t_data->t_ctid);
+			prev_xmax = HeapTupleHeaderGetUpdateXid(htup.t_data);
+			continue;
+		}
+
+		if (!ItemPointerEquals(&htup.t_self, &htup.t_data->t_ctid) &&
+			!HeapTupleHeaderIndicatesMovedPartitions(htup.t_data))
+		{
+			need_index_probe = true;
+		}
+		break;
+	}
+
+	UnlockReleaseBuffer(buf);
+
+	if (need_index_probe && !already_probed_index)
+		(void) RowIdProbeIndex(rel, idxrel_p, snapshot, rowid,
+							   tidList, numTids, numAllocTids);
+}
 
 
 /*
@@ -70,6 +411,8 @@ static void
 TidExprListCreate(TidScanState *tidstate)
 {
 	TidScan    *node = (TidScan *) tidstate->ss.ps.plan;
+	Relation	rel = tidstate->ss.ss_currentRelation;
+	AttrNumber	rowid_attnum = RelationGetDescr(rel)->td_rowidentity_attno + 1;
 	ListCell   *l;
 
 	tidstate->tss_tidexprs = NIL;
@@ -88,11 +431,31 @@ TidExprListCreate(TidScanState *tidstate)
 			arg1 = get_leftop(expr);
 			arg2 = get_rightop(expr);
 			if (IsCTIDVar(arg1))
+			{
 				tidexpr->exprstate = ExecInitExpr((Expr *) arg2,
 												  &tidstate->ss.ps);
+				tidexpr->is_rowidentity = false;
+			}
 			else if (IsCTIDVar(arg2))
+			{
 				tidexpr->exprstate = ExecInitExpr((Expr *) arg1,
 												  &tidstate->ss.ps);
+				tidexpr->is_rowidentity = false;
+			}
+			else if (IsRowIdentityVarNode(arg1, rowid_attnum))
+			{
+				tidexpr->exprstate = ExecInitExpr((Expr *) arg2,
+												  &tidstate->ss.ps);
+				tidexpr->is_rowidentity = true;
+				tidexpr->elemtype = exprType(arg2);
+			}
+			else if (IsRowIdentityVarNode(arg2, rowid_attnum))
+			{
+				tidexpr->exprstate = ExecInitExpr((Expr *) arg1,
+												  &tidstate->ss.ps);
+				tidexpr->is_rowidentity = true;
+				tidexpr->elemtype = exprType(arg1);
+			}
 			else
 				elog(ERROR, "could not identify CTID variable");
 			tidexpr->isarray = false;
@@ -100,10 +463,23 @@ TidExprListCreate(TidScanState *tidstate)
 		else if (expr && IsA(expr, ScalarArrayOpExpr))
 		{
 			ScalarArrayOpExpr *saex = (ScalarArrayOpExpr *) expr;
+			Node	   *arg1 = linitial(saex->args);
+			Expr	   *arg2 = lsecond(saex->args);
 
-			Assert(IsCTIDVar(linitial(saex->args)));
-			tidexpr->exprstate = ExecInitExpr(lsecond(saex->args),
-											  &tidstate->ss.ps);
+			if (IsCTIDVar(arg1))
+			{
+				tidexpr->is_rowidentity = false;
+				tidexpr->elemtype = TIDOID;
+			}
+			else if (IsRowIdentityVarNode(arg1, rowid_attnum))
+			{
+				tidexpr->is_rowidentity = true;
+				tidexpr->elemtype = get_element_type(exprType((Node *) arg2));
+			}
+			else
+				elog(ERROR, "could not identify CTID variable");
+
+			tidexpr->exprstate = ExecInitExpr(arg2, &tidstate->ss.ps);
 			tidexpr->isarray = true;
 		}
 		else if (expr && IsA(expr, CurrentOfExpr))
@@ -134,7 +510,11 @@ static void
 TidListEval(TidScanState *tidstate)
 {
 	ExprContext *econtext = tidstate->ss.ps.ps_ExprContext;
+	Relation	rel = tidstate->ss.ss_currentRelation;
+	Snapshot	snapshot = tidstate->ss.ps.state->es_snapshot;
 	TableScanDesc scan;
+	Relation	rowid_idxrel = NULL;
+	BlockNumber nblocks = InvalidBlockNumber;
 	ItemPointerData *tidList;
 	int			numAllocTids;
 	int			numTids;
@@ -147,8 +527,7 @@ TidListEval(TidScanState *tidstate)
 	 */
 	if (tidstate->ss.ss_currentScanDesc == NULL)
 		tidstate->ss.ss_currentScanDesc =
-			table_beginscan_tid(tidstate->ss.ss_currentRelation,
-								tidstate->ss.ps.state->es_snapshot);
+			table_beginscan_tid(rel, snapshot);
 	scan = tidstate->ss.ss_currentScanDesc;
 
 	/*
@@ -165,6 +544,88 @@ TidListEval(TidScanState *tidstate)
 		TidExpr    *tidexpr = (TidExpr *) lfirst(l);
 		ItemPointer itemptr;
 		bool		isNull;
+
+		if (tidexpr->is_rowidentity)
+		{
+			if (nblocks == InvalidBlockNumber)
+				nblocks = RelationGetNumberOfBlocks(rel);
+
+			if (tidexpr->exprstate && !tidexpr->isarray)
+			{
+				Datum		d;
+
+				d = ExecEvalExprSwitchContext(tidexpr->exprstate,
+											  econtext,
+											  &isNull);
+				if (isNull)
+					continue;
+
+				RowIdResolveToTid(rel, &rowid_idxrel, nblocks, snapshot,
+								  DatumGetRowId(d, tidexpr->elemtype),
+								  &tidList, &numTids, &numAllocTids);
+			}
+			else if (tidexpr->exprstate && tidexpr->isarray)
+			{
+				Datum		arraydatum;
+				ArrayType  *itemarray;
+				Datum	   *ipdatums;
+				bool	   *ipnulls;
+				int			ndatums;
+				int			i;
+				TupleDesc	tupdesc = RelationGetDescr(rel);
+
+				arraydatum = ExecEvalExprSwitchContext(tidexpr->exprstate,
+													   econtext,
+													   &isNull);
+				if (isNull)
+					continue;
+				itemarray = DatumGetArrayTypeP(arraydatum);
+				{
+					int16		elmlen = (tidexpr->elemtype == INT8OID) ? 8 :
+						((tidexpr->elemtype == INT4OID) ? 4 : 2);
+					char		elmalign = (tidexpr->elemtype == INT8OID) ? TYPALIGN_DOUBLE :
+						((tidexpr->elemtype == INT4OID) ? TYPALIGN_INT : TYPALIGN_SHORT);
+
+					deconstruct_array(itemarray, tidexpr->elemtype,
+									  elmlen, true, elmalign,
+									  &ipdatums, &ipnulls, &ndatums);
+				}
+
+				/* Issue async prefetches for batch array lookups */
+				if (ndatums > 1)
+				{
+					for (i = 0; i < ndatums; i++)
+					{
+						int64		rowid;
+
+						if (ipnulls[i])
+							continue;
+						rowid = DatumGetRowId(ipdatums[i], tidexpr->elemtype);
+						if (rowid > 0 && !RowIdIsExtended(rowid) &&
+							RowIdGetPartitionId(rowid, tupdesc->td_partition_bits) == tupdesc->td_partition_prefix)
+						{
+							BlockNumber blkno = RowIdGetBlockNumber(rowid, tupdesc->td_partition_bits);
+
+							if (blkno < nblocks)
+								(void) PrefetchBuffer(rel, MAIN_FORKNUM, blkno);
+						}
+					}
+				}
+
+				for (i = 0; i < ndatums; i++)
+				{
+					if (ipnulls[i])
+						continue;
+
+					RowIdResolveToTid(rel, &rowid_idxrel, nblocks, snapshot,
+									  DatumGetRowId(ipdatums[i], tidexpr->elemtype),
+									  &tidList, &numTids, &numAllocTids);
+				}
+				pfree(ipdatums);
+				pfree(ipnulls);
+			}
+			continue;
+		}
 
 		if (tidexpr->exprstate && !tidexpr->isarray)
 		{
@@ -246,6 +707,9 @@ TidListEval(TidScanState *tidstate)
 			}
 		}
 	}
+
+	if (rowid_idxrel != NULL)
+		index_close(rowid_idxrel, AccessShareLock);
 
 	/*
 	 * Sort the array of TIDs into order, and eliminate duplicates.
@@ -396,10 +860,24 @@ static bool
 TidRecheck(TidScanState *node, TupleTableSlot *slot)
 {
 	ItemPointer match;
+	ListCell   *l;
 
 	/* WHERE CURRENT OF always intends to resolve to the latest tuple */
 	if (node->tss_isCurrentOf)
 		return true;
+
+	/*
+	 * A GENERATED ALWAYS AS ROW IDENTITY value is immutable across UPDATEs,
+	 * so the updated version of a qualifying tuple in EvalPlanQual still has
+	 * the same row identity even though its physical ctid changed.
+	 */
+	foreach(l, node->tss_tidexprs)
+	{
+		TidExpr    *tidexpr = (TidExpr *) lfirst(l);
+
+		if (tidexpr->is_rowidentity)
+			return true;
+	}
 
 	if (node->tss_TidList == NULL)
 		TidListEval(node);

@@ -3067,7 +3067,8 @@ ri_check_fastpath_index(RI_ConstraintInfo *riinfo, Relation fk_rel,
 	 * could reach here.  Restrict the fast path to btree; other access
 	 * methods fall back to SPI.
 	 */
-	if (idx_rel->rd_rel->relam != BTREE_AM_OID)
+	if (idx_rel->rd_rel->relam != BTREE_AM_OID ||
+		RelationGetRowIdIndex(pk_rel) == RelationGetRelid(idx_rel))
 	{
 		riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
 		return false;

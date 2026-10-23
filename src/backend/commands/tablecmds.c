@@ -535,7 +535,9 @@ static ObjectAddress ATExecAddIdentity(Relation rel, const char *colName,
 									   Node *def, LOCKMODE lockmode, bool recurse, bool recursing);
 static ObjectAddress ATExecSetIdentity(Relation rel, const char *colName,
 									   Node *def, LOCKMODE lockmode, bool recurse, bool recursing);
-static ObjectAddress ATExecDropIdentity(Relation rel, const char *colName, bool missing_ok, LOCKMODE lockmode,
+static ObjectAddress ATExecDropIdentity(List **wqueue, AlteredTableInfo *tab,
+										Relation rel, const char *colName,
+										bool missing_ok, LOCKMODE lockmode,
 										bool recurse, bool recursing);
 static ObjectAddress ATExecSetExpression(AlteredTableInfo *tab, Relation rel, const char *colName,
 										 Node *newExpr, LOCKMODE lockmode);
@@ -757,6 +759,422 @@ static void ATDetachCheckNoForeignKeyRefs(Relation partition);
 static char GetAttributeCompression(Oid atttypid, const char *compression);
 static char GetAttributeStorage(Oid atttypid, const char *storagemode);
 
+
+/*
+ * Find the root partitioned table OID for a partition hierarchy, and return
+ * its configured partition_id_bits (default 14) and the next unused
+ * partition_id across all leaf partitions.
+ */
+static void
+GetRowIdPartitionHierarchyInfo(Oid parentId, Oid excludeRelid,
+							   int *part_bits_p, int *next_part_id_p,
+							   Bitmapset **used_part_ids_p)
+{
+	Oid			rootId = parentId;
+	List	   *ancestors = get_partition_ancestors(parentId);
+	Relation	rootRel;
+	int			part_bits = 14;
+	List	   *inhoids;
+	List	   *excludeOids = NIL;
+	ListCell   *lc;
+	Bitmapset  *used_ids = NULL;
+	int			cand;
+
+	if (ancestors != NIL)
+		rootId = llast_oid(ancestors);
+
+	rootRel = relation_open(rootId, AccessShareLock);
+	if (rootRel->rd_options != NULL)
+	{
+		StdRdOptions *opts = (StdRdOptions *) rootRel->rd_options;
+		int			pbits = StdRdOptionsGetPartitionIdBits(opts, -1);
+
+		if (pbits > 0)
+			part_bits = pbits;
+	}
+	else if (rootRel->rd_att && rootRel->rd_att->td_partition_bits > 0)
+	{
+		part_bits = rootRel->rd_att->td_partition_bits;
+	}
+	relation_close(rootRel, AccessShareLock);
+
+	if (OidIsValid(excludeRelid))
+		excludeOids = find_all_inheritors(excludeRelid, NoLock, NULL);
+
+	inhoids = find_all_inheritors(rootId, NoLock, NULL);
+	foreach(lc, inhoids)
+	{
+		Oid			childOid = lfirst_oid(lc);
+		Relation	childRel;
+
+		if (childOid == rootId || list_member_oid(excludeOids, childOid))
+			continue;
+
+		childRel = relation_open(childOid, AccessShareLock);
+		if (childRel->rd_options != NULL)
+		{
+			StdRdOptions *copts = (StdRdOptions *) childRel->rd_options;
+
+			if (copts->partition_id >= 0)
+				used_ids = bms_add_member(used_ids, copts->partition_id);
+		}
+		relation_close(childRel, AccessShareLock);
+	}
+	list_free(excludeOids);
+
+	cand = 1;
+	while (bms_is_member(cand, used_ids))
+		cand++;
+
+	*part_bits_p = part_bits;
+	*next_part_id_p = cand;
+	if (used_part_ids_p)
+		*used_part_ids_p = used_ids;
+	else
+		bms_free(used_ids);
+}
+
+/*
+ * Ensure a partition of a table with a GENERATED ALWAYS AS ROW IDENTITY
+ * column has valid partition_id and partition_id_bits in its reloptions.
+ */
+static Datum
+AssignPartitionRowIdReloptions(Oid parentId, char relkind, List *stmt_options,
+							   Datum reloptions)
+{
+	const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
+	int			part_bits = 14;
+	int			next_part_id = 1;
+	Bitmapset  *used_ids = NULL;
+	bool		has_part_id = false;
+	bool		has_part_bits = false;
+	int			explicit_part_id = -1;
+	List	   *new_opts = list_copy(stmt_options);
+	ListCell   *lc;
+
+	GetRowIdPartitionHierarchyInfo(parentId, InvalidOid,
+								   &part_bits, &next_part_id, &used_ids);
+
+	foreach(lc, stmt_options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "partition_id") == 0)
+		{
+			has_part_id = true;
+			explicit_part_id = defGetInt32(def);
+		}
+		else if (strcmp(def->defname, "partition_id_bits") == 0 ||
+				 strcmp(def->defname, "partition_bits") == 0)
+		{
+			has_part_bits = true;
+			part_bits = defGetInt32(def);
+		}
+	}
+
+	if (relkind == RELKIND_RELATION)
+	{
+		int			chosen_id = has_part_id ? explicit_part_id : next_part_id;
+
+		if (part_bits <= 0 || chosen_id < 0 || (uint64) chosen_id >= (UINT64CONST(1) << part_bits))
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("partition_id %d is out of range for partition_id_bits %d",
+							chosen_id, part_bits)));
+		if (bms_is_member(chosen_id, used_ids))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("partition_id %d is already in use by another partition",
+							chosen_id)));
+
+		if (!has_part_id)
+			new_opts = lappend(new_opts,
+							   makeDefElem("partition_id",
+										   (Node *) makeInteger(chosen_id), -1));
+	}
+
+	if (!has_part_bits)
+		new_opts = lappend(new_opts,
+						   makeDefElem("partition_id_bits",
+									   (Node *) makeInteger(part_bits), -1));
+
+	bms_free(used_ids);
+
+	reloptions = transformRelOptions((Datum) 0, new_opts, NULL, validnsps,
+									 true, false);
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+		(void) partitioned_table_reloptions(reloptions, true);
+	else
+		(void) heap_reloptions(relkind, reloptions, true);
+
+	return reloptions;
+}
+
+/*
+ * When a non-empty leaf relation's partition prefix or partition_id_bits
+ * changes (e.g. during ALTER TABLE ... ATTACH PARTITION), update any inline
+ * off-home rowid values that still carry the relation's old local partition
+ * prefix and rebuild the relation's indexes so rowid_idx and any user indexes
+ * on the row identity column stay consistent with synthesized home keys.
+ */
+static void
+RewriteAttachedPartitionRowIds(Relation rel,
+							   uint8 old_bits, uint64 old_prefix,
+							   uint8 new_bits, uint64 new_prefix)
+{
+	BlockNumber nblocks;
+	BlockNumber blkno;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	ReindexParams reindex_params = {0};
+
+	if (rel->rd_rel->relkind != RELKIND_RELATION ||
+		rowid_attno < 0 ||
+		(old_bits == new_bits && old_prefix == new_prefix))
+		return;
+
+	nblocks = RelationGetNumberOfBlocks(rel);
+	if (nblocks == 0)
+		return;
+
+	for (blkno = 0; blkno < nblocks; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber offnum;
+		bool		page_modified = false;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+
+		if (PageIsNew(page) || PageIsEmpty(page))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum = OffsetNumberNext(offnum))
+		{
+			ItemId		lp = PageGetItemId(page, offnum);
+			HeapTupleHeader htup;
+			char	   *tp;
+			uint8	   *bp;
+			bool		hasnull;
+			long		off = 0;
+			int64		old_rowid;
+			int64		new_rowid;
+
+			if (!ItemIdIsNormal(lp))
+				continue;
+
+			htup = (HeapTupleHeader) PageGetItem(page, lp);
+			if (HeapTupleHeaderRowIdIsAtHome(htup, rowid_attno))
+				continue;
+
+			tp = (char *) htup + htup->t_hoff;
+			bp = htup->t_bits;
+			hasnull = ((htup->t_infomask & HEAP_HASNULL) != 0);
+
+			for (int i = 0; i < rowid_attno; i++)
+			{
+				CompactAttribute *att = TupleDescCompactAttr(tupdesc, i);
+
+				if (hasnull && att_isnull(i, bp))
+					continue;
+
+				if (att->attlen == -1)
+					off = att_pointer_alignby(off, att->attalignby, -1, tp + off);
+				else
+					off = att_nominal_alignby(off, att->attalignby);
+
+				off = att_addlength_pointer(off, att->attlen, tp + off);
+			}
+			off = att_nominal_alignby(off, TupleDescCompactAttr(tupdesc, rowid_attno)->attalignby);
+
+			memcpy(&old_rowid, tp + off, sizeof(int64));
+			new_rowid = old_rowid;
+
+			if (!RowIdIsExtended(old_rowid) &&
+				RowIdGetPartitionId(old_rowid, old_bits) == old_prefix)
+			{
+				BlockNumber home_blk = RowIdGetBlockNumber(old_rowid, old_bits);
+				OffsetNumber home_off = RowIdGetOffsetNumber(old_rowid);
+
+				new_rowid = RowIdEncodeHomeKey(new_prefix, home_blk, home_off);
+			}
+			else if (old_rowid > 0 && (old_rowid & ROWID_EXTENDED_FLAG) != 0)
+			{
+				uint8		old_shift = RowIdGetBlockShift(old_bits);
+				uint64		old_mask = (~UINT64CONST(0) << (48 - old_shift)) & ~ROWID_EXTENDED_FLAG;
+
+				if (((uint64) old_rowid & old_mask) == old_prefix)
+				{
+					uint8		new_shift = RowIdGetBlockShift(new_bits);
+					uint64		new_mask = (~UINT64CONST(0) << (48 - new_shift)) & ~ROWID_EXTENDED_FLAG;
+
+					new_rowid = (int64) ((((uint64) old_rowid) & ~old_mask & ~new_mask) | new_prefix);
+				}
+			}
+
+			if (new_rowid != old_rowid)
+			{
+				if (!page_modified)
+				{
+					START_CRIT_SECTION();
+					page_modified = true;
+				}
+				memcpy(tp + off, &new_rowid, sizeof(int64));
+			}
+		}
+
+		if (page_modified)
+		{
+			MarkBufferDirty(buf);
+			if (RelationNeedsWAL(rel))
+				log_newpage_buffer(buf, true);
+			END_CRIT_SECTION();
+		}
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	reindex_relation(NULL, RelationGetRelid(rel), 0, &reindex_params);
+}
+
+/*
+ * Update pg_class.reloptions on an existing partition relation (and any
+ * sub-partitions if it is a partitioned table) to ensure partition_id and
+ * partition_id_bits are populated.
+ */
+static void
+EnsurePartitionRowIdReloptions(Relation partrel, Oid parentId)
+{
+	const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
+	int			part_bits = 14;
+	int			next_part_id = 1;
+	Bitmapset  *used_ids = NULL;
+	List	   *inhoids;
+	ListCell   *lc;
+
+	GetRowIdPartitionHierarchyInfo(parentId, RelationGetRelid(partrel),
+								   &part_bits, &next_part_id, &used_ids);
+
+	inhoids = find_all_inheritors(RelationGetRelid(partrel), AccessExclusiveLock, NULL);
+	foreach(lc, inhoids)
+	{
+		Oid			childOid = lfirst_oid(lc);
+		Relation	childrel;
+		Relation	pgclass;
+		HeapTuple	tuple;
+		HeapTuple	newtuple;
+		Datum		old_opts;
+		Datum		new_opts_datum;
+		bool		isnull;
+		List	   *defs = NIL;
+		StdRdOptions *cur_opts;
+		int			chosen_id = -1;
+		int			cand;
+		uint8		old_bits;
+		uint64		old_prefix;
+		Datum		values[Natts_pg_class];
+		bool		nulls[Natts_pg_class];
+		bool		replaces[Natts_pg_class];
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (childOid == RelationGetRelid(partrel))
+			childrel = partrel;
+		else
+			childrel = table_open(childOid, NoLock);
+
+		old_bits = childrel->rd_att ? childrel->rd_att->td_partition_bits : 0;
+		old_prefix = childrel->rd_att ? childrel->rd_att->td_partition_prefix : 0;
+		cur_opts = (StdRdOptions *) childrel->rd_options;
+
+		cand = 1;
+		while (bms_is_member(cand, used_ids))
+			cand++;
+
+		if (childrel->rd_rel->relkind == RELKIND_RELATION)
+		{
+			if (cur_opts && cur_opts->partition_id >= 0)
+			{
+				if (part_bits <= 0 || (uint64) cur_opts->partition_id >= (UINT64CONST(1) << part_bits))
+					ereport(ERROR,
+							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							 errmsg("partition_id %d is out of range for partition_id_bits %d",
+									cur_opts->partition_id, part_bits)));
+			}
+
+			if (cur_opts && cur_opts->partition_id >= 0 &&
+				!bms_is_member(cur_opts->partition_id, used_ids))
+				chosen_id = cur_opts->partition_id;
+			else
+				chosen_id = cand;
+
+			if (part_bits <= 0 || chosen_id < 0 || (uint64) chosen_id >= (UINT64CONST(1) << part_bits))
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						 errmsg("partition_id %d is out of range for partition_id_bits %d",
+								chosen_id, part_bits)));
+
+			used_ids = bms_add_member(used_ids, chosen_id);
+
+			defs = lappend(defs,
+						   makeDefElem("partition_id",
+									   (Node *) makeInteger(chosen_id), -1));
+		}
+
+		defs = lappend(defs,
+					   makeDefElem("partition_id_bits",
+								   (Node *) makeInteger(part_bits), -1));
+
+		pgclass = table_open(RelationRelationId, RowExclusiveLock);
+		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(childOid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for relation %u", childOid);
+
+		old_opts = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &isnull);
+		new_opts_datum = transformRelOptions(isnull ? (Datum) 0 : old_opts,
+											 defs, NULL, validnsps, true, false);
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, false, sizeof(nulls));
+		memset(replaces, false, sizeof(replaces));
+		replaces[Anum_pg_class_reloptions - 1] = true;
+		values[Anum_pg_class_reloptions - 1] = new_opts_datum;
+
+		newtuple = heap_modify_tuple(tuple, RelationGetDescr(pgclass),
+									 values, nulls, replaces);
+		CatalogTupleUpdate(pgclass, &newtuple->t_self, newtuple);
+		heap_freetuple(newtuple);
+		heap_freetuple(tuple);
+		table_close(pgclass, RowExclusiveLock);
+
+		CommandCounterIncrement();
+
+		if (childrel->rd_rel->relkind == RELKIND_RELATION &&
+			childrel->rd_att && childrel->rd_att->td_rowidentity_attno >= 0)
+		{
+			uint8		new_bits = (uint8) part_bits;
+			uint64		new_prefix = RowIdComputePartitionPrefix((uint32) chosen_id, new_bits);
+
+			RewriteAttachedPartitionRowIds(childrel,
+										   old_bits, old_prefix,
+										   new_bits, new_prefix);
+		}
+
+		if (childrel != partrel)
+			table_close(childrel, NoLock);
+	}
+
+	bms_free(used_ids);
+}
 
 /* ----------------------------------------------------------------
  *		DefineRelation
@@ -1051,6 +1469,34 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 
 	TupleDescFinalize(descriptor);
+
+	if (stmt->partbound != NULL && descriptor->td_rowidentity_attno >= 0)
+	{
+		Assert(list_length(inheritOids) == 1);
+		reloptions = AssignPartitionRowIdReloptions(linitial_oid(inheritOids),
+													relkind,
+													stmt->options,
+													reloptions);
+	}
+	else if (descriptor->td_rowidentity_attno >= 0 && reloptions != (Datum) 0)
+	{
+		StdRdOptions *opts = (StdRdOptions *) default_reloptions(reloptions, false,
+																 relkind == RELKIND_PARTITIONED_TABLE ?
+																 RELOPT_KIND_PARTITIONED : RELOPT_KIND_HEAP);
+
+		if (opts != NULL && opts->partition_id >= 0)
+		{
+			int			pbits = StdRdOptionsGetPartitionIdBits(opts, 14);
+
+			if (pbits == 0 || (uint64) opts->partition_id >= (UINT64CONST(1) << pbits))
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						 errmsg("partition_id %d is out of range for partition_id_bits %d",
+								opts->partition_id, pbits)));
+		}
+		if (opts != NULL)
+			pfree(opts);
+	}
 
 	/*
 	 * For relations with table AM and partitioned tables, select access
@@ -5477,7 +5923,7 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 			address = ATExecSetIdentity(rel, cmd->name, cmd->def, lockmode, cmd->recurse, false);
 			break;
 		case AT_DropIdentity:
-			address = ATExecDropIdentity(rel, cmd->name, cmd->missing_ok, lockmode, cmd->recurse, false);
+			address = ATExecDropIdentity(wqueue, tab, rel, cmd->name, cmd->missing_ok, lockmode, cmd->recurse, false);
 			break;
 		case AT_DropNotNull:	/* ALTER COLUMN DROP NOT NULL */
 			address = ATExecDropNotNull(rel, cmd->name, cmd->recurse, lockmode);
@@ -7319,7 +7765,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	Form_pg_attribute attribute;
 	int			newattnum;
 	char		relkind;
-	Expr	   *defval;
+	Expr	   *defval = NULL;
 	List	   *children;
 	ListCell   *child;
 	AlterTableCmd *childcmd;
@@ -7561,7 +8007,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		 * For an identity column, we can't use build_column_default(),
 		 * because the sequence ownership isn't set yet.  So do it manually.
 		 */
-		if (colDef->identity)
+		if (colDef->identity && colDef->identity != ATTRIBUTE_IDENTITY_ROW)
 		{
 			NextValueExpr *nve = makeNode(NextValueExpr);
 
@@ -7570,7 +8016,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 			defval = (Expr *) nve;
 		}
-		else
+		else if (colDef->identity != ATTRIBUTE_IDENTITY_ROW)
 			defval = (Expr *) build_column_default(rel, attribute->attnum);
 
 		/* Build CoerceToDomain(NULL) expression if needed */
@@ -7659,7 +8105,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			}
 		}
 
-		if (!has_missing)
+		if (!has_missing && colDef->identity != ATTRIBUTE_IDENTITY_ROW)
 		{
 			/*
 			 * If the new column is NOT NULL, and there is no missing value,
@@ -7667,6 +8113,15 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			 */
 			tab->verify_new_notnull |= colDef->is_not_null;
 		}
+	}
+
+	if (colDef->identity == ATTRIBUTE_IDENTITY_ROW &&
+		rel->rd_rel->relispartition)
+	{
+		Oid			parentId = get_partition_parent(myrelid, false);
+
+		if (OidIsValid(parentId))
+			EnsurePartitionRowIdReloptions(rel, parentId);
 	}
 
 	/*
@@ -7966,6 +8421,7 @@ set_attnotnull(List **wqueue, Relation rel, AttrNumber attnum,
 		 * ALTER TABLE phase 3 test for it.
 		 */
 		if (queue_validation && wqueue &&
+			attr->attidentity != ATTRIBUTE_IDENTITY_ROW &&
 			!NotNullImpliedByRelConstraints(rel, attr))
 		{
 			AlteredTableInfo *tab;
@@ -8531,6 +8987,12 @@ ATExecSetIdentity(Relation rel, const char *colName, Node *def,
 				 errmsg("column \"%s\" of relation \"%s\" is not an identity column",
 						colName, RelationGetRelationName(rel))));
 
+	if (attTup->attidentity == ATTRIBUTE_IDENTITY_ROW)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot alter row identity column \"%s\" of relation \"%s\"",
+						colName, RelationGetRelationName(rel))));
+
 	if (generatedEl)
 	{
 		attTup->attidentity = defGetInt32(generatedEl);
@@ -8578,7 +9040,8 @@ ATExecSetIdentity(Relation rel, const char *colName, Node *def,
  * Return the address of the affected column.
  */
 static ObjectAddress
-ATExecDropIdentity(Relation rel, const char *colName, bool missing_ok, LOCKMODE lockmode,
+ATExecDropIdentity(List **wqueue, AlteredTableInfo *tab,
+				   Relation rel, const char *colName, bool missing_ok, LOCKMODE lockmode,
 				   bool recurse, bool recursing)
 {
 	HeapTuple	tuple;
@@ -8589,6 +9052,7 @@ ATExecDropIdentity(Relation rel, const char *colName, bool missing_ok, LOCKMODE 
 	Oid			seqid;
 	ObjectAddress seqaddress;
 	bool		ispartitioned;
+	char		old_identity;
 
 	ispartitioned = (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 	if (ispartitioned && !recurse)
@@ -8637,8 +9101,21 @@ ATExecDropIdentity(Relation rel, const char *colName, bool missing_ok, LOCKMODE 
 		}
 	}
 
+	old_identity = attTup->attidentity;
+	seqid = (old_identity == ATTRIBUTE_IDENTITY_ROW) ?
+		RelationGetRowIdIndex(rel) : InvalidOid;
+
 	attTup->attidentity = '\0';
 	CatalogTupleUpdate(attrelation, &tuple->t_self, tuple);
+
+	/*
+	 * If dropping ROW IDENTITY from a relation with physical storage, force a
+	 * table rewrite so that elided home-slot values are synthesized via
+	 * tab->oldDesc and materialized inline in the rewritten heap.
+	 */
+	if (old_identity == ATTRIBUTE_IDENTITY_ROW &&
+		tab != NULL && RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		tab->rewrite |= AT_REWRITE_DEFAULT_VAL;
 
 	InvokeObjectPostAlterHook(RelationRelationId,
 							  RelationGetRelid(rel),
@@ -8648,6 +9125,13 @@ ATExecDropIdentity(Relation rel, const char *colName, bool missing_ok, LOCKMODE 
 	heap_freetuple(tuple);
 
 	table_close(attrelation, RowExclusiveLock);
+
+	if (old_identity == ATTRIBUTE_IDENTITY_ROW && OidIsValid(seqid))
+	{
+		deleteDependencyRecordsForClass(RelationRelationId, seqid,
+										RelationRelationId, DEPENDENCY_INTERNAL);
+		CommandCounterIncrement();
+	}
 
 	/*
 	 * Recurse to drop the identity from column in partitions.  Identity is
@@ -8663,24 +9147,40 @@ ATExecDropIdentity(Relation rel, const char *colName, bool missing_ok, LOCKMODE 
 		foreach(lc, children)
 		{
 			Relation	childrel;
+			AlteredTableInfo *childtab = NULL;
 
 			childrel = table_open(lfirst_oid(lc), NoLock);
-			ATExecDropIdentity(childrel, colName, false, lockmode, recurse, true);
+			if (wqueue != NULL)
+				childtab = ATGetQueueEntry(wqueue, childrel);
+			ATExecDropIdentity(wqueue, childtab, childrel, colName, false, lockmode, recurse, true);
 			table_close(childrel, NoLock);
 		}
 	}
 
 	if (!recursing)
 	{
-		/* drop the internal sequence */
-		seqid = getIdentitySequence(rel, attnum, false);
-		deleteDependencyRecordsForClass(RelationRelationId, seqid,
-										RelationRelationId, DEPENDENCY_INTERNAL);
-		CommandCounterIncrement();
-		seqaddress.classId = RelationRelationId;
-		seqaddress.objectId = seqid;
-		seqaddress.objectSubId = 0;
-		performDeletion(&seqaddress, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+		if (old_identity == ATTRIBUTE_IDENTITY_ROW)
+		{
+			if (OidIsValid(seqid))
+			{
+				seqaddress.classId = RelationRelationId;
+				seqaddress.objectId = seqid;
+				seqaddress.objectSubId = 0;
+				performDeletion(&seqaddress, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+			}
+		}
+		else
+		{
+			/* drop the internal sequence */
+			seqid = getIdentitySequence(rel, attnum, false);
+			deleteDependencyRecordsForClass(RelationRelationId, seqid,
+											RelationRelationId, DEPENDENCY_INTERNAL);
+			CommandCounterIncrement();
+			seqaddress.classId = RelationRelationId;
+			seqaddress.objectId = seqid;
+			seqaddress.objectSubId = 0;
+			performDeletion(&seqaddress, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+		}
 	}
 
 	return address;
@@ -14029,7 +14529,8 @@ transformFkeyCheckAttrs(Relation pkrel,
 		if (indexStruct->indnkeyatts == numattrs &&
 			(with_period ? indexStruct->indisexclusion : indexStruct->indisunique) &&
 			indexStruct->indisvalid &&
-			heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL) &&
+			(heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL) ||
+			 indexoid == pkrel->rd_rowidindex) &&
 			heap_attisnull(indexTuple, Anum_pg_index_indexprs, NULL))
 		{
 			Datum		indclassDatum;
@@ -18261,7 +18762,21 @@ MergeAttributesIntoExisting(Relation child_rel, Relation parent_rel, bool ispart
 			 * a partitioned table and inherit identity column.
 			 */
 			if (ispartition)
+			{
+				if (parent_att->attidentity == ATTRIBUTE_IDENTITY_ROW &&
+					child_att->attidentity != ATTRIBUTE_IDENTITY_ROW)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("column \"%s\" in child table must be a row identity column",
+									parent_attname)));
+				if (child_att->attidentity == ATTRIBUTE_IDENTITY_ROW &&
+					parent_att->attidentity != ATTRIBUTE_IDENTITY_ROW)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("column \"%s\" in child table must not be a row identity column",
+									parent_attname)));
 				child_att->attidentity = parent_att->attidentity;
+			}
 
 			/*
 			 * OK, bump the child column's inheritance count.  (If we fail
@@ -21168,7 +21683,9 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 		if (attribute->attisdropped)
 			continue;
 
-		if (attribute->attidentity)
+		if (attribute->attidentity &&
+			(attribute->attidentity != ATTRIBUTE_IDENTITY_ROW ||
+			 rel->rd_att->td_rowidentity_attno < 0))
 			ereport(ERROR,
 					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					errmsg("table \"%s\" being attached contains an identity column \"%s\"",
@@ -21213,6 +21730,9 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 
 	/* Update the pg_class entry. */
 	StorePartitionBound(attachrel, rel, cmd->bound);
+
+	if (rel->rd_att && rel->rd_att->td_rowidentity_attno >= 0)
+		EnsurePartitionRowIdReloptions(attachrel, RelationGetRelid(rel));
 
 	/* Ensure there exists a correct set of indexes in the partition. */
 	AttachPartitionEnsureIndexes(wqueue, rel, attachrel);
@@ -22127,8 +22647,9 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 	{
 		Form_pg_attribute attr = TupleDescAttr(partRel->rd_att, attno);
 
-		if (!attr->attisdropped && attr->attidentity)
-			ATExecDropIdentity(partRel, NameStr(attr->attname), false,
+		if (!attr->attisdropped && attr->attidentity &&
+			attr->attidentity != ATTRIBUTE_IDENTITY_ROW)
+			ATExecDropIdentity(NULL, NULL, partRel, NameStr(attr->attname), false,
 							   AccessExclusiveLock, true, true);
 	}
 

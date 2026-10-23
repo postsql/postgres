@@ -246,7 +246,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * still needs to insert into "invalid" indexes, if they're marked
 			 * indisready.
 			 */
-			if (!index->indisvalid)
+			if (!index->indisvalid || indexoid == relation->rd_rowidindex)
 			{
 				index_close(indexRelation, NoLock);
 				continue;

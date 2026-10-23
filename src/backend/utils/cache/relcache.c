@@ -517,6 +517,38 @@ RelationParseRelOptions(Relation relation, HeapTuple tuple)
 		memcpy(relation->rd_options, options, VARSIZE(options));
 		pfree(options);
 	}
+
+	if (relation->rd_att != NULL &&
+		relation->rd_att->td_rowidentity_attno >= 0 &&
+		(relation->rd_rel->relkind == RELKIND_RELATION ||
+		 relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE))
+	{
+		StdRdOptions *opts = (StdRdOptions *) relation->rd_options;
+		int			part_bits = 0;
+		int			part_id = 0;
+
+		if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			relation->rd_rel->relispartition)
+		{
+			part_bits = 14;
+			part_id = 0;
+		}
+
+		if (opts != NULL)
+		{
+			part_bits = StdRdOptionsGetPartitionIdBits(opts, part_bits);
+			if (opts->partition_id >= 0)
+			{
+				part_id = opts->partition_id;
+				if (part_bits == 0 && part_id > 0)
+					part_bits = 14;
+			}
+		}
+
+		relation->rd_att->td_partition_bits = (uint8) part_bits;
+		relation->rd_att->td_partition_prefix =
+			RowIdComputePartitionPrefix((uint32) part_id, (uint8) part_bits);
+	}
 }
 
 /*
@@ -2740,7 +2772,12 @@ RelationRebuildRelation(Relation relation)
 		memcpy(relation->rd_rel, newrel->rd_rel, CLASS_TUPLE_SIZE);
 		/* preserve old tupledesc, rules, policies if no logical change */
 		if (keep_tupdesc)
+		{
+			newrel->rd_att->td_rowidentity_attno = relation->rd_att->td_rowidentity_attno;
+			newrel->rd_att->td_partition_bits = relation->rd_att->td_partition_bits;
+			newrel->rd_att->td_partition_prefix = relation->rd_att->td_partition_prefix;
 			SWAPFIELD(TupleDesc, rd_att);
+		}
 		if (keep_rules)
 		{
 			SWAPFIELD(RuleLock *, rd_rules);
@@ -4846,6 +4883,7 @@ RelationGetIndexList(Relation relation)
 	char		replident = relation->rd_rel->relreplident;
 	Oid			pkeyIndex = InvalidOid;
 	Oid			candidateIndex = InvalidOid;
+	Oid			rowidIndex = InvalidOid;
 	bool		pkdeferrable = false;
 	MemoryContext oldcxt;
 
@@ -4886,6 +4924,24 @@ RelationGetIndexList(Relation relation)
 
 		/* add index's OID to result list */
 		result = lappend_oid(result, index->indexrelid);
+
+		/*
+		 * Identify the backing partial B-Tree index for a GENERATED ALWAYS AS
+		 * ROW IDENTITY column: a valid, immediate, unique partial index on
+		 * the row identity column alone.
+		 */
+		if (relation->rd_att &&
+			relation->rd_att->td_rowidentity_attno >= 0 &&
+			index->indisunique &&
+			index->indimmediate &&
+			(index->indisvalid ||
+			 relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE) &&
+			index->indnatts == 1 &&
+			index->indkey.values[0] == relation->rd_att->td_rowidentity_attno + 1 &&
+			!heap_attisnull(htup, Anum_pg_index_indpred, NULL))
+		{
+			rowidIndex = index->indexrelid;
+		}
 
 		/*
 		 * Non-unique or predicate indexes aren't interesting for either oid
@@ -4938,6 +4994,7 @@ RelationGetIndexList(Relation relation)
 	oldlist = relation->rd_indexlist;
 	relation->rd_indexlist = list_copy(result);
 	relation->rd_pkindex = pkeyIndex;
+	relation->rd_rowidindex = rowidIndex;
 	relation->rd_ispkdeferrable = pkdeferrable;
 	if (replident == REPLICA_IDENTITY_DEFAULT && OidIsValid(pkeyIndex) && !pkdeferrable)
 		relation->rd_replidindex = pkeyIndex;
@@ -5091,6 +5148,27 @@ RelationGetReplicaIndex(Relation relation)
 	}
 
 	return relation->rd_replidindex;
+}
+
+/*
+ * RelationGetRowIdIndex -- get OID of the relation's row identity partial index
+ *
+ * Returns InvalidOid if there is no such index.
+ */
+Oid
+RelationGetRowIdIndex(Relation relation)
+{
+	List	   *ilist;
+
+	if (!relation->rd_indexvalid)
+	{
+		/* RelationGetIndexList does the heavy lifting. */
+		ilist = RelationGetIndexList(relation);
+		list_free(ilist);
+		Assert(relation->rd_indexvalid);
+	}
+
+	return relation->rd_rowidindex;
 }
 
 /*
@@ -5353,6 +5431,7 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
 	List	   *newindexoidlist;
 	Oid			relpkindex;
 	Oid			relreplindex;
+	Oid			relrowidindex;
 	ListCell   *l;
 	MemoryContext oldcxt;
 
@@ -5399,6 +5478,7 @@ restart:
 	 */
 	relpkindex = relation->rd_pkindex;
 	relreplindex = relation->rd_replidindex;
+	relrowidindex = relation->rd_rowidindex;
 
 	/*
 	 * For each index, add referenced attributes to indexattrs.
@@ -5428,6 +5508,13 @@ restart:
 		bool		isPK;		/* primary key */
 		bool		isIDKey;	/* replica identity index */
 		Bitmapset **attrs;
+
+		/*
+		 * The backing partial B-Tree index on a GENERATED ALWAYS AS ROW
+		 * IDENTITY column never blocks same-page HOT updates.
+		 */
+		if (OidIsValid(relrowidindex) && indexOid == relrowidindex)
+			continue;
 
 		indexDesc = index_open(indexOid, AccessShareLock);
 
@@ -5531,7 +5618,8 @@ restart:
 	newindexoidlist = RelationGetIndexList(relation);
 	if (equal(indexoidlist, newindexoidlist) &&
 		relpkindex == relation->rd_pkindex &&
-		relreplindex == relation->rd_replidindex)
+		relreplindex == relation->rd_replidindex &&
+		relrowidindex == relation->rd_rowidindex)
 	{
 		/* Still the same index set, so proceed */
 		list_free(newindexoidlist);
@@ -6557,6 +6645,7 @@ load_relcache_init_file(bool shared)
 		rel->rd_indexlist = NIL;
 		rel->rd_pkindex = InvalidOid;
 		rel->rd_replidindex = InvalidOid;
+		rel->rd_rowidindex = InvalidOid;
 		rel->rd_attrsvalid = false;
 		rel->rd_keyattr = NULL;
 		rel->rd_pkattr = NULL;

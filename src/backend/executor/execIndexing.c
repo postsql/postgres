@@ -376,8 +376,25 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 		if ((flags & EIIT_ONLY_SUMMARIZING) && !indexInfo->ii_Summarizing)
 			continue;
 
+		/*
+		 * Dedicated partial index for ROW IDENTITY: only index tuples that
+		 * are NOT at their physical home (P_0, B_0, O_0).  Bypass its
+		 * planner-guard catalog indpred ("WHERE col IS NULL").
+		 */
+		if (heapRelation->rd_att->td_rowidentity_attno >= 0 &&
+			(RelationGetRelid(indexRelation) == RelationGetRowIdIndex(heapRelation) ||
+			 (indexInfo->ii_Unique &&
+			  indexInfo->ii_NumIndexKeyAttrs == 1 &&
+			  indexInfo->ii_IndexAttrNumbers[0] == (AttrNumber) (heapRelation->rd_att->td_rowidentity_attno + 1) &&
+			  list_length(indexInfo->ii_Predicate) == 1 &&
+			  IsA(linitial(indexInfo->ii_Predicate), NullTest) &&
+			  ((NullTest *) linitial(indexInfo->ii_Predicate))->nulltesttype == IS_NULL)))
+		{
+			if (TTS_IS_ROWID_AT_HOME(slot))
+				continue;
+		}
 		/* Check for partial index */
-		if (indexInfo->ii_Predicate != NIL)
+		else if (indexInfo->ii_Predicate != NIL)
 		{
 			ExprState  *predicate;
 
@@ -612,8 +629,20 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 
 		checkedIndex = true;
 
+		if (heapRelation->rd_att->td_rowidentity_attno >= 0 &&
+			(RelationGetRelid(indexRelation) == RelationGetRowIdIndex(heapRelation) ||
+			 (indexInfo->ii_Unique &&
+			  indexInfo->ii_NumIndexKeyAttrs == 1 &&
+			  indexInfo->ii_IndexAttrNumbers[0] == (AttrNumber) (heapRelation->rd_att->td_rowidentity_attno + 1) &&
+			  list_length(indexInfo->ii_Predicate) == 1 &&
+			  IsA(linitial(indexInfo->ii_Predicate), NullTest) &&
+			  ((NullTest *) linitial(indexInfo->ii_Predicate))->nulltesttype == IS_NULL)))
+		{
+			if (TTS_IS_ROWID_AT_HOME(slot))
+				continue;
+		}
 		/* Check for partial index */
-		if (indexInfo->ii_Predicate != NIL)
+		else if (indexInfo->ii_Predicate != NIL)
 		{
 			ExprState  *predicate;
 

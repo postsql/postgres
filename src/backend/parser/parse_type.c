@@ -190,6 +190,10 @@ LookupTypeNameExtended(ParseState *pstate,
 		{
 			/* Unqualified type name, so search the search path */
 			typoid = TypenameGetTypidExtended(typname, temp_ok);
+			if (!OidIsValid(typoid) &&
+				(strcmp(typname, "rowid") == 0 ||
+				 strcmp(typname, "rowidentity") == 0))
+				typoid = INT8OID;
 		}
 
 		/* If an array reference, return the array type instead */

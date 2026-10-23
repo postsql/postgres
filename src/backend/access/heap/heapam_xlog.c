@@ -455,8 +455,22 @@ heap_xlog_insert(XLogReaderState *record)
 
 		page = BufferGetPage(buffer);
 
-		if (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum)
+		if (xlrec->offnum > MaxHeapTuplesPerPage)
 			elog(PANIC, "invalid max offset number");
+
+		while (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum)
+		{
+			PageHeader	phdr = (PageHeader) page;
+			OffsetNumber pad_off = PageGetMaxOffsetNumber(page) + 1;
+			ItemId		lp;
+
+			if (phdr->pd_lower + sizeof(ItemIdData) > phdr->pd_upper)
+				elog(PANIC, "failed to pad line pointer");
+			phdr->pd_lower += sizeof(ItemIdData);
+			lp = PageGetItemId(page, pad_off);
+			ItemIdSetUnused(lp);
+			PageSetHasFreeLinePointers(page);
+		}
 
 		data = XLogRecGetBlockData(record, HEAP_INSERT_BLKREF_HEAP, &datalen);
 
@@ -604,8 +618,22 @@ heap_xlog_multi_insert(XLogReaderState *record)
 				offnum = FirstOffsetNumber + i;
 			else
 				offnum = xlrec->offsets[i];
-			if (PageGetMaxOffsetNumber(page) + 1 < offnum)
+			if (offnum > MaxHeapTuplesPerPage)
 				elog(PANIC, "invalid max offset number");
+
+			while (PageGetMaxOffsetNumber(page) + 1 < offnum)
+			{
+				PageHeader	phdr = (PageHeader) page;
+				OffsetNumber pad_off = PageGetMaxOffsetNumber(page) + 1;
+				ItemId		lp;
+
+				if (phdr->pd_lower + sizeof(ItemIdData) > phdr->pd_upper)
+					elog(PANIC, "failed to pad line pointer");
+				phdr->pd_lower += sizeof(ItemIdData);
+				lp = PageGetItemId(page, pad_off);
+				ItemIdSetUnused(lp);
+				PageSetHasFreeLinePointers(page);
+			}
 
 			xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata);
 			tupdata = ((char *) xlhdr) + SizeOfMultiInsertTuple;

@@ -63,8 +63,9 @@ typedef struct HeapTupleData
 {
 	uint32		t_len;			/* length of *t_data */
 	ItemPointerData t_self;		/* SelfItemPointer */
+	OffsetNumber t_rootoff;		/* root line pointer offset if HOT tuple */
 	Oid			t_tableOid;		/* table the tuple came from */
-#define FIELDNO_HEAPTUPLEDATA_DATA 3
+#define FIELDNO_HEAPTUPLEDATA_DATA 4
 	HeapTupleHeader t_data;		/* -> tuple header and data */
 } HeapTupleData;
 

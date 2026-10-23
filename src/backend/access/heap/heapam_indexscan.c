@@ -165,6 +165,8 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 	offnum = ItemPointerGetOffsetNumber(tid);
 	at_chain_start = first_call;
 	skip = !first_call;
+	if (first_call)
+		heapTuple->t_rootoff = offnum;
 
 	/* XXX: we should assert that a snapshot is pushed or registered */
 	Assert(TransactionIdIsValid(RecentXmin));
@@ -185,7 +187,8 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 		if (!ItemIdIsNormal(lp))
 		{
 			/* We should only see a redirect at start of chain */
-			if (ItemIdIsRedirected(lp) && at_chain_start)
+			if (ItemIdIsRedirected(lp) && at_chain_start &&
+				!ItemIdIsOffpageRedirect(lp))
 			{
 				/* Follow the redirect */
 				offnum = ItemIdGetRedirect(lp);

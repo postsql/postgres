@@ -103,6 +103,7 @@ typedef struct HeapScanDescData
 	uint32		rs_cindex;		/* current tuple's index in vistuples */
 	uint32		rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
+	OffsetNumber rs_rootoffs[MaxHeapTuplesPerPage]; /* root offsets for HOT tuples */
 } HeapScanDescData;
 typedef struct HeapScanDescData *HeapScanDesc;
 
@@ -541,6 +542,73 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
 
 	tuple->t_infomask = frz->t_infomask;
 	tuple->t_infomask2 = frz->t_infomask2;
+}
+
+/*
+ * heap_get_tuple_rootoff
+ *		Return the root line pointer offset for a tuple on a locked page.
+ *
+ * For non-HOT tuples (99%+ of cases), the tuple is its own root and this
+ * returns offnum immediately in O(1).  For HEAP_ONLY_TUPLE items, walks the
+ * page's HOT chains directly without zeroing a MaxHeapTuplesPerPage array.
+ */
+static inline OffsetNumber
+heap_get_tuple_rootoff(Page page, OffsetNumber offnum, HeapTupleHeader htup)
+{
+	OffsetNumber maxoff;
+	OffsetNumber r;
+
+	if (likely(!HeapTupleHeaderIsHeapOnly(htup)))
+		return offnum;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (r = FirstOffsetNumber; r <= maxoff; r = OffsetNumberNext(r))
+	{
+		ItemId		lp = PageGetItemId(page, r);
+		OffsetNumber cur;
+		int			steps = 0;
+
+		if (ItemIdIsRedirected(lp))
+		{
+			cur = ItemIdGetRedirect(lp);
+			if (OffsetNumberIsOffpageRedirect(cur))
+				continue;
+		}
+		else if (ItemIdIsNormal(lp))
+		{
+			HeapTupleHeader r_htup = (HeapTupleHeader) PageGetItem(page, lp);
+
+			if (HeapTupleHeaderIsHeapOnly(r_htup) ||
+				!HeapTupleHeaderIsHotUpdated(r_htup))
+				continue;
+			cur = ItemPointerGetOffsetNumber(&r_htup->t_ctid);
+		}
+		else
+			continue;
+
+		while (cur >= FirstOffsetNumber && cur <= maxoff &&
+			   steps++ < MaxHeapTuplesPerPage)
+		{
+			ItemId		clp;
+			HeapTupleHeader c_htup;
+
+			if (cur == offnum)
+				return r;
+
+			clp = PageGetItemId(page, cur);
+			if (!ItemIdIsNormal(clp))
+				break;
+			c_htup = (HeapTupleHeader) PageGetItem(page, clp);
+			if (!HeapTupleHeaderIsHeapOnly(c_htup) ||
+				!HeapTupleHeaderIsHotUpdated(c_htup))
+				break;
+			if (ItemPointerGetOffsetNumber(&c_htup->t_ctid) == cur)
+				break;
+			cur = ItemPointerGetOffsetNumber(&c_htup->t_ctid);
+		}
+	}
+
+	return offnum;
 }
 
 #endif							/* HEAPAM_H */

@@ -31,12 +31,16 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/hio.h"
 #include "access/multixact.h"
+#include "access/stratnum.h"
 #include "access/subtrans.h"
 #include "access/syncscan.h"
+#include "access/tableam.h"
+#include "access/tableam_indexscan.h"
 #include "access/valid.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
@@ -46,11 +50,13 @@
 #include "executor/instrument_node.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
+#include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/spccache.h"
@@ -558,6 +564,7 @@ page_collect_tuples(HeapScanDesc scan, Snapshot snapshot,
 			tup->t_len = ItemIdGetLength(lpp);
 			tup->t_tableOid = relid;
 			ItemPointerSet(&(tup->t_self), block, lineoff);
+			tup->t_rootoff = lineoff;
 		}
 
 		/*
@@ -696,6 +703,26 @@ heap_prepare_pagescan(TableScanDesc sscan)
 		else
 			scan->rs_ntuples = page_collect_tuples(scan, snapshot, page, buffer,
 												   block, lines, false, true);
+	}
+
+	if (unlikely(RelationGetDescr(scan->rs_base.rs_rd)->td_rowidentity_attno >= 0) &&
+		scan->rs_ntuples > 0)
+	{
+		OffsetNumber root_offsets[MaxHeapTuplesPerPage];
+
+		heap_get_root_tuples(page, root_offsets);
+		for (int i = 0; i < scan->rs_ntuples; i++)
+		{
+			OffsetNumber offnum = scan->rs_vistuples[i];
+			ItemId		lpp = PageGetItemId(page, offnum);
+			HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(page, lpp);
+
+			if (HeapTupleHeaderIsHeapOnly(htup) &&
+				root_offsets[offnum - 1] != InvalidOffsetNumber)
+				scan->rs_rootoffs[i] = root_offsets[offnum - 1];
+			else
+				scan->rs_rootoffs[i] = heap_get_tuple_rootoff(page, offnum, htup);
+		}
 	}
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -1030,6 +1057,8 @@ continue_page:
 			if (!visible)
 				continue;
 
+			tuple->t_rootoff = heap_get_tuple_rootoff(page, lineoff, tuple->t_data);
+
 			/* skip any tuples that don't match the scan key */
 			if (key != NULL &&
 				!HeapKeyTest(tuple, RelationGetDescr(scan->rs_base.rs_rd),
@@ -1137,6 +1166,10 @@ continue_page:
 			tuple->t_data = (HeapTupleHeader) PageGetItem(page, lpp);
 			tuple->t_len = ItemIdGetLength(lpp);
 			ItemPointerSetOffsetNumber(&tuple->t_self, lineoff);
+			if (unlikely(RelationGetDescr(scan->rs_base.rs_rd)->td_rowidentity_attno >= 0))
+				tuple->t_rootoff = scan->rs_rootoffs[lineindex];
+			else
+				tuple->t_rootoff = lineoff;
 
 			/* skip any tuples that don't match the scan key */
 			if (key != NULL &&
@@ -1743,6 +1776,7 @@ heap_fetch(Relation relation,
 	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	tuple->t_len = ItemIdGetLength(lp);
 	tuple->t_tableOid = RelationGetRelid(relation);
+	tuple->t_rootoff = heap_get_tuple_rootoff(page, offnum, tuple->t_data);
 
 	/*
 	 * check tuple visibility, then release lock
@@ -2003,17 +2037,164 @@ ReleaseBulkInsertStatePin(BulkInsertState bistate)
  * stored.  But note that any toasting of fields within the tuple data is NOT
  * reflected into *tup.
  */
+static OffsetNumber
+PageGetNextInsertOffsetNumber(Page page)
+{
+	OffsetNumber limit = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+
+	if (PageHasFreeLinePointers(page))
+	{
+		for (OffsetNumber offnum = FirstOffsetNumber; offnum < limit; offnum++)
+		{
+			ItemId		itemId = PageGetItemId(page, offnum);
+
+			if (!ItemIdIsUsed(itemId) && !ItemIdHasStorage(itemId))
+				return offnum;
+		}
+	}
+	return limit;
+}
+
+static bool
+RowIdIndexHasEntries(Relation heapRel)
+{
+	Oid			idxoid = RelationGetRowIdIndex(heapRel);
+	Relation	idxrel;
+	bool		has_entries;
+
+	if (!OidIsValid(idxoid))
+		return false;
+
+	idxrel = index_open(idxoid, AccessShareLock);
+	has_entries = (RelationGetNumberOfBlocks(idxrel) > 1);
+	index_close(idxrel, AccessShareLock);
+	return has_entries;
+}
+
+static bool
+RowIdIndexKeyExists(Relation heapRel, Buffer heapBuf, int64 rowid)
+{
+	Oid			idxoid = RelationGetRowIdIndex(heapRel);
+	Relation	idxrel;
+	IndexScanDesc scan;
+	ScanKeyData skey;
+	SnapshotData DirtySnap;
+	bool		exists = false;
+
+	if (!OidIsValid(idxoid))
+		return false;
+
+	LockBuffer(heapBuf, BUFFER_LOCK_UNLOCK);
+
+	idxrel = index_open(idxoid, AccessShareLock);
+	if (RelationGetNumberOfBlocks(idxrel) > 1)
+	{
+		InitDirtySnapshot(DirtySnap);
+		ScanKeyInit(&skey,
+					1,
+					BTEqualStrategyNumber,
+					F_INT8EQ,
+					Int64GetDatum(rowid));
+
+		scan = index_beginscan(heapRel, idxrel, false, &DirtySnap, NULL, 1, 0, SO_NONE);
+		index_rescan(scan, &skey, 1, NULL, 0);
+		while (tableam_index_getnext_tid(scan, ForwardScanDirection))
+		{
+			ItemPointerData heaptid = scan->xs_heaptid;
+			Buffer		buf;
+			HeapTupleData heapTuple;
+			bool		all_dead = false;
+
+			buf = ReadBuffer(heapRel, ItemPointerGetBlockNumber(&heaptid));
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			if (heap_hot_search_buffer(&heaptid, heapRel, buf, &DirtySnap,
+									   &heapTuple, &all_dead, true))
+			{
+				exists = true;
+			}
+			UnlockReleaseBuffer(buf);
+			if (exists)
+				break;
+		}
+		index_endscan(scan);
+	}
+	index_close(idxrel, AccessShareLock);
+
+	LockBuffer(heapBuf, BUFFER_LOCK_EXCLUSIVE);
+	return exists;
+}
+
+static void
+RelationPutHeapTupleAtOffset(Relation relation,
+							 Buffer buffer,
+							 HeapTuple tuple,
+							 bool token,
+							 OffsetNumber target_off)
+{
+	Page		pageHeader;
+	OffsetNumber offnum;
+
+	if (!OffsetNumberIsValid(target_off))
+	{
+		RelationPutHeapTuple(relation, buffer, tuple, token);
+		return;
+	}
+
+	Assert(!token || HeapTupleHeaderIsSpeculative(tuple->t_data));
+	Assert(!((tuple->t_data->t_infomask & HEAP_XMAX_COMMITTED) &&
+			 (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)));
+
+	pageHeader = BufferGetPage(buffer);
+
+	while (PageGetMaxOffsetNumber(pageHeader) + 1 < target_off)
+	{
+		PageHeader	phdr = (PageHeader) pageHeader;
+		OffsetNumber pad_off = PageGetMaxOffsetNumber(pageHeader) + 1;
+		ItemId		lp;
+
+		if (phdr->pd_lower + sizeof(ItemIdData) > phdr->pd_upper)
+			elog(PANIC, "failed to pad line pointer on page");
+		phdr->pd_lower += sizeof(ItemIdData);
+		lp = PageGetItemId(pageHeader, pad_off);
+		ItemIdSetUnused(lp);
+		PageSetHasFreeLinePointers(pageHeader);
+	}
+
+	offnum = PageAddItemExtended(pageHeader, tuple->t_data, tuple->t_len,
+								 target_off, PAI_OVERWRITE | PAI_IS_HEAP);
+	if (offnum == InvalidOffsetNumber)
+		elog(PANIC, "failed to add tuple to page at offset %u", target_off);
+
+	ItemPointerSet(&(tuple->t_self), BufferGetBlockNumber(buffer), offnum);
+
+	if (!token)
+	{
+		ItemId		itemId = PageGetItemId(pageHeader, offnum);
+		HeapTupleHeader item = (HeapTupleHeader) PageGetItem(pageHeader, itemId);
+
+		item->t_ctid = tuple->t_self;
+	}
+}
+
 void
 heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			uint32 options, BulkInsertState bistate)
 {
 	TransactionId xid = GetCurrentTransactionId();
-	HeapTuple	heaptup;
-	Buffer		buffer;
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	HeapTuple	heaptup = NULL;
+	HeapTuple	elided_tup = NULL;
+	HeapTuple	elided_heaptup = NULL;
+	HeapTuple	ext_tup = NULL;
+	Buffer		buffer = InvalidBuffer;
 	Page		page;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		clear_all_visible = false;
 	bool		vmbuffer_modified = false;
+	bool		placed_at_home = false;
+	bool		was_empty_page = false;
+	OffsetNumber chosen_off = InvalidOffsetNumber;
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -2021,24 +2202,401 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 	AssertHasSnapshotForToast(relation);
 
-	/*
-	 * Fill in tuple header fields and toast the tuple if necessary.
-	 *
-	 * Note: below this point, heaptup is the data we actually intend to store
-	 * into the relation; tup is the caller's original untoasted data.
-	 */
-	heaptup = heap_prepare_insert(relation, tup, xid, cid, options);
+	if (unlikely(rowid_attno >= 0) &&
+		!HeapTupleHeaderRowIdIsAtHome(tup->t_data, rowid_attno))
+	{
+		bool		isnull = false;
+		int64		explicit_rowid = DatumGetInt64(fastgetattr(tup, rowid_attno + 1,
+															   tupdesc, &isnull));
+		BlockNumber target_blk;
+		OffsetNumber target_off;
+		bool		is_local_home_key;
 
-	/*
-	 * Find buffer to insert this tuple into.  If the page is all visible,
-	 * this will also pin the requisite visibility map page.
-	 */
-	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
-									   InvalidBuffer, options, bistate,
-									   &vmbuffer, NULL,
-									   0);
+		if (isnull || explicit_rowid <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("row identity value must be positive")));
+
+		target_blk = RowIdGetBlockNumber(explicit_rowid, tupdesc->td_partition_bits);
+		target_off = RowIdGetOffsetNumber(explicit_rowid);
+		is_local_home_key = (!RowIdIsExtended(explicit_rowid) &&
+							 target_blk <= RowIdMaxBlockNumber(tupdesc->td_partition_bits) &&
+							 target_off >= FirstOffsetNumber &&
+							 target_off <= MaxHeapTuplesPerPage &&
+							 RowIdEncodeHomeKey(tupdesc->td_partition_prefix,
+												target_blk, target_off) == explicit_rowid);
+
+		if (is_local_home_key)
+		{
+			BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
+
+			if (target_blk <= nblocks + 256)
+			{
+				int			replCol = rowid_attno + 1;
+				Datum		replVal = (Datum) 0;
+				bool		replNull = true;
+				Buffer		target_buf = InvalidBuffer;
+				Page		target_page;
+				OffsetNumber maxoff;
+
+				elided_tup = heap_modify_tuple_by_cols(tup, tupdesc, 1,
+													   &replCol, &replVal, &replNull);
+				elided_heaptup = heap_prepare_insert(relation, elided_tup,
+													 xid, cid, options);
+
+				while (RelationGetNumberOfBlocks(relation) <= target_blk)
+				{
+					Buffer		extbuf = ExtendBufferedRel(BMR_REL(relation),
+														   MAIN_FORKNUM,
+														   bistate ? bistate->strategy : NULL,
+														   EB_LOCK_FIRST);
+					BlockNumber extblk = BufferGetBlockNumber(extbuf);
+					Page		extpage = BufferGetPage(extbuf);
+
+					if (PageIsNew(extpage))
+					{
+						PageInit(extpage, BufferGetPageSize(extbuf), 0);
+						MarkBufferDirty(extbuf);
+					}
+					if (extblk == target_blk)
+					{
+						target_buf = extbuf;
+						break;
+					}
+					if (RelationNeedsWAL(relation))
+						log_newpage_buffer(extbuf, true);
+					RecordPageWithFreeSpace(relation, extblk,
+											PageGetHeapFreeSpace(extpage));
+					UnlockReleaseBuffer(extbuf);
+				}
+
+				retry_home_check:
+				if (!BufferIsValid(target_buf))
+				{
+					target_buf = ReadBuffer(relation, target_blk);
+					heap_page_prune_opt(relation, target_buf, &vmbuffer, false);
+					if (PageIsAllVisible(BufferGetPage(target_buf)))
+						visibilitymap_pin(relation, target_blk, &vmbuffer);
+					LockBuffer(target_buf, BUFFER_LOCK_EXCLUSIVE);
+				}
+
+				while (PageIsAllVisible(BufferGetPage(target_buf)) &&
+					   !visibilitymap_pin_ok(target_blk, vmbuffer))
+				{
+					LockBuffer(target_buf, BUFFER_LOCK_UNLOCK);
+					visibilitymap_pin(relation, target_blk, &vmbuffer);
+					LockBuffer(target_buf, BUFFER_LOCK_EXCLUSIVE);
+				}
+
+				target_page = BufferGetPage(target_buf);
+				if (PageIsNew(target_page))
+				{
+					PageInit(target_page, BufferGetPageSize(target_buf), 0);
+					MarkBufferDirty(target_buf);
+				}
+				maxoff = PageGetMaxOffsetNumber(target_page);
+
+				if (target_off <= maxoff)
+				{
+					ItemId		lp = PageGetItemId(target_page, target_off);
+
+					if (ItemIdIsNormal(lp) ||
+						(ItemIdIsRedirected(lp) && !ItemIdIsOffpageRedirect(lp)))
+					{
+						OffsetNumber cur = ItemIdIsRedirected(lp) ?
+							ItemIdGetRedirect(lp) : target_off;
+						int			steps = 0;
+
+						while (cur >= FirstOffsetNumber && cur <= maxoff &&
+							   steps++ < MaxHeapTuplesPerPage)
+						{
+							ItemId		clp = PageGetItemId(target_page, cur);
+							HeapTupleHeader c_htup;
+
+							if (!ItemIdIsNormal(clp))
+								break;
+							c_htup = (HeapTupleHeader) PageGetItem(target_page, clp);
+							if (cur != target_off && !HeapTupleHeaderIsHeapOnly(c_htup))
+								break;
+
+							if (HeapTupleHeaderRowIdIsAtHome(c_htup, rowid_attno))
+							{
+								HeapTupleData checktup;
+								SnapshotData DirtySnap;
+
+								checktup.t_tableOid = RelationGetRelid(relation);
+								checktup.t_data = c_htup;
+								checktup.t_len = ItemIdGetLength(clp);
+								ItemPointerSet(&checktup.t_self, target_blk, cur);
+								checktup.t_rootoff = target_off;
+
+								InitDirtySnapshot(DirtySnap);
+								if (HeapTupleSatisfiesVisibility(&checktup,
+																 &DirtySnap,
+																 target_buf))
+								{
+									TransactionId xwait =
+										TransactionIdIsValid(DirtySnap.xmin) ?
+										DirtySnap.xmin : DirtySnap.xmax;
+
+									if (TransactionIdIsValid(xwait))
+									{
+										LockBuffer(target_buf, BUFFER_LOCK_UNLOCK);
+										XactLockTableWait(xwait, relation,
+														  &checktup.t_self,
+														  XLTW_InsertIndex);
+										LockBuffer(target_buf, BUFFER_LOCK_EXCLUSIVE);
+										goto retry_home_check;
+									}
+
+									UnlockReleaseBuffer(target_buf);
+									if (BufferIsValid(vmbuffer))
+										ReleaseBuffer(vmbuffer);
+									ereport(ERROR,
+											(errcode(ERRCODE_UNIQUE_VIOLATION),
+											 errmsg("duplicate key value violates unique constraint \"%s\"",
+													RelationGetRelationName(relation)),
+											 errdetail("Key (%s)=(%lld) already exists.",
+													   NameStr(TupleDescAttr(tupdesc, rowid_attno)->attname),
+													   (long long) explicit_rowid)));
+								}
+							}
+
+							if (!HeapTupleHeaderIsHotUpdated(c_htup) ||
+								ItemPointerGetOffsetNumber(&c_htup->t_ctid) == cur)
+								break;
+							cur = ItemPointerGetOffsetNumber(&c_htup->t_ctid);
+						}
+					}
+				}
+
+				if (target_off > maxoff ||
+					!ItemIdIsUsed(PageGetItemId(target_page, target_off)))
+				{
+					Size		lp_space = (target_off > maxoff) ?
+						((Size) (target_off - maxoff) * sizeof(ItemIdData)) : 0;
+					Size		needed_space = MAXALIGN(elided_heaptup->t_len) + lp_space;
+					Size		free_space = ((PageHeader) target_page)->pd_upper -
+						((PageHeader) target_page)->pd_lower;
+
+					if (needed_space <= free_space)
+					{
+						buffer = target_buf;
+						heaptup = elided_heaptup;
+						placed_at_home = true;
+						chosen_off = target_off;
+					}
+					else
+					{
+						if (lp_space <= free_space)
+						{
+							START_CRIT_SECTION();
+							while (PageGetMaxOffsetNumber(target_page) + 1 < target_off)
+							{
+								PageHeader	phdr = (PageHeader) target_page;
+								OffsetNumber pad_off = PageGetMaxOffsetNumber(target_page) + 1;
+								ItemId		pad_lp;
+
+								phdr->pd_lower += sizeof(ItemIdData);
+								pad_lp = PageGetItemId(target_page, pad_off);
+								ItemIdSetUnused(pad_lp);
+								PageSetHasFreeLinePointers(target_page);
+							}
+							if (target_off > maxoff)
+								((PageHeader) target_page)->pd_lower += sizeof(ItemIdData);
+							ItemIdSetRedirect(PageGetItemId(target_page, target_off),
+											  LP_REDIRECT_OFFPAGE_LOCAL);
+							MarkBufferDirty(target_buf);
+							if (RelationNeedsWAL(relation))
+								log_newpage_buffer(target_buf, true);
+							END_CRIT_SECTION();
+						}
+						UnlockReleaseBuffer(target_buf);
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+					}
+				}
+				else
+				{
+					UnlockReleaseBuffer(target_buf);
+					if (BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
+				}
+			}
+		}
+	}
+
+	if (!placed_at_home)
+	{
+		bool		has_offhome_index_entries = false;
+
+		if (unlikely(rowid_attno >= 0) &&
+			HeapTupleHeaderRowIdIsAtHome(tup->t_data, rowid_attno))
+			has_offhome_index_entries = RowIdIndexHasEntries(relation);
+
+		/*
+		 * Fill in tuple header fields and toast the tuple if necessary.
+		 *
+		 * Note: below this point, heaptup is the data we actually intend to
+		 * store into the relation; tup is the caller's original untoasted
+		 * data.
+		 */
+		heaptup = heap_prepare_insert(relation, tup, xid, cid, options);
+
+		/*
+		 * Find buffer to insert this tuple into.  If the page is all visible,
+		 * this will also pin the requisite visibility map page.
+		 */
+		buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
+										   InvalidBuffer, options, bistate,
+										   &vmbuffer, NULL,
+										   0);
+
+		if (rowid_attno >= 0 &&
+			HeapTupleHeaderRowIdIsAtHome(tup->t_data, rowid_attno))
+		{
+			for (;;)
+			{
+				BlockNumber blkno = BufferGetBlockNumber(buffer);
+
+				if (unlikely(blkno > RowIdMaxBlockNumber(tupdesc->td_partition_bits)))
+					break;
+
+				if (unlikely(has_offhome_index_entries))
+				{
+					Page		cur_page = BufferGetPage(buffer);
+					OffsetNumber cand_off = PageGetNextInsertOffsetNumber(cur_page);
+					int64		cand_key = RowIdEncodeHomeKey(tupdesc->td_partition_prefix,
+															  blkno, cand_off);
+
+					if (RowIdIndexKeyExists(relation, buffer, cand_key))
+					{
+						cur_page = BufferGetPage(buffer);
+						if (PageGetNextInsertOffsetNumber(cur_page) == cand_off)
+						{
+							OffsetNumber maxoff = PageGetMaxOffsetNumber(cur_page);
+							Size		lp_space = (cand_off > maxoff) ? sizeof(ItemIdData) : 0;
+							Size		free_space = ((PageHeader) cur_page)->pd_upper -
+								((PageHeader) cur_page)->pd_lower;
+
+							if (lp_space <= free_space && cand_off <= MaxHeapTuplesPerPage)
+							{
+								START_CRIT_SECTION();
+								if (cand_off > maxoff)
+									((PageHeader) cur_page)->pd_lower += sizeof(ItemIdData);
+								ItemIdSetRedirect(PageGetItemId(cur_page, cand_off),
+												  LP_REDIRECT_OFFPAGE_INDEXED);
+								MarkBufferDirty(buffer);
+								if (RelationNeedsWAL(relation))
+									log_newpage_buffer(buffer, true);
+								END_CRIT_SECTION();
+
+								if (MAXALIGN(heaptup->t_len) <= PageGetHeapFreeSpace(cur_page))
+									continue;
+							}
+						}
+
+						UnlockReleaseBuffer(buffer);
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+						buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
+														   InvalidBuffer, options, bistate,
+														   &vmbuffer, NULL,
+														   0);
+						continue;
+					}
+
+					while (PageIsAllVisible(BufferGetPage(buffer)) &&
+						   !visibilitymap_pin_ok(blkno, vmbuffer))
+					{
+						LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+						visibilitymap_pin(relation, blkno, &vmbuffer);
+						LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+					}
+					if (MAXALIGN(heaptup->t_len) > PageGetHeapFreeSpace(BufferGetPage(buffer)))
+					{
+						UnlockReleaseBuffer(buffer);
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+						buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
+														   InvalidBuffer, options, bistate,
+														   &vmbuffer, NULL,
+														   0);
+						continue;
+					}
+				}
+
+				placed_at_home = true;
+				break;
+			}
+
+			if (!placed_at_home)
+			{
+				/*
+				 * Block overflow beyond RowIdMaxBlockNumber(part_bits):
+				 * materialize a deterministic extended key in the tuple so it
+				 * is stored inline (8 bytes) and indexed in rd_rowidindex.
+				 */
+				int			replCol = rowid_attno + 1;
+				Datum		replVal = Int64GetDatum(1);
+				bool		replNull = false;
+				OffsetNumber ext_off;
+				int64		ext_rowid;
+
+				UnlockReleaseBuffer(buffer);
+				if (BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+				if (heaptup != tup)
+					heap_freetuple(heaptup);
+
+				ext_tup = heap_modify_tuple_by_cols(tup, tupdesc, 1,
+													&replCol, &replVal, &replNull);
+				heaptup = heap_prepare_insert(relation, ext_tup, xid, cid, options);
+				buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
+												   InvalidBuffer, options, bistate,
+												   &vmbuffer, NULL,
+												   0);
+				ext_off = PageGetNextInsertOffsetNumber(BufferGetPage(buffer));
+				ext_rowid = RowIdEncodeExtendedKey(tupdesc->td_partition_prefix,
+												   BufferGetBlockNumber(buffer),
+												   ext_off);
+				replVal = Int64GetDatum(ext_rowid);
+				{
+					HeapTuple	final_tup = heap_modify_tuple_by_cols(heaptup, tupdesc,
+																	  1, &replCol,
+																	  &replVal, &replNull);
+
+					final_tup->t_data->t_infomask = heaptup->t_data->t_infomask;
+					final_tup->t_data->t_infomask2 = heaptup->t_data->t_infomask2;
+					final_tup->t_data->t_choice = heaptup->t_data->t_choice;
+					final_tup->t_data->t_ctid = heaptup->t_data->t_ctid;
+					if (heaptup != ext_tup)
+						heap_freetuple(heaptup);
+					heaptup = final_tup;
+				}
+				chosen_off = ext_off;
+				placed_at_home = false;
+			}
+		}
+	}
 
 	page = BufferGetPage(buffer);
+	was_empty_page = (PageGetMaxOffsetNumber(page) == 0);
 
 	/*
 	 * We're about to do the actual insert -- but check for conflict first, to
@@ -2067,8 +2625,13 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
 
-	RelationPutHeapTuple(relation, buffer, heaptup,
-						 (options & HEAP_INSERT_SPECULATIVE) != 0);
+	if (OffsetNumberIsValid(chosen_off))
+		RelationPutHeapTupleAtOffset(relation, buffer, heaptup,
+									 (options & HEAP_INSERT_SPECULATIVE) != 0,
+									 chosen_off);
+	else
+		RelationPutHeapTuple(relation, buffer, heaptup,
+							 (options & HEAP_INSERT_SPECULATIVE) != 0);
 
 	if (clear_all_visible)
 	{
@@ -2120,8 +2683,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		 * page instead of restoring the whole thing.  Set flag, and hide
 		 * buffer references from XLogInsert.
 		 */
-		if (ItemPointerGetOffsetNumber(&(heaptup->t_self)) == FirstOffsetNumber &&
-			PageGetMaxOffsetNumber(page) == FirstOffsetNumber)
+		if (was_empty_page &&
+			PageGetMaxOffsetNumber(page) == ItemPointerGetOffsetNumber(&(heaptup->t_self)))
 		{
 			info |= XLOG_HEAP_INIT_PAGE;
 			bufflags |= REGBUF_WILL_INIT;
@@ -2198,6 +2761,17 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	if (BufferIsValid(vmbuffer))
 		ReleaseBuffer(vmbuffer);
 
+	if (placed_at_home)
+	{
+		heaptup->t_rootoff = ItemPointerGetOffsetNumber(&heaptup->t_self);
+		tup->t_rootoff = heaptup->t_rootoff;
+	}
+	else
+	{
+		heaptup->t_rootoff = InvalidOffsetNumber;
+		tup->t_rootoff = InvalidOffsetNumber;
+	}
+
 	/*
 	 * If tuple is cacheable, mark it for invalidation from the caches in case
 	 * we abort.  Note it is OK to do this after releasing the buffer, because
@@ -2216,8 +2790,18 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	if (heaptup != tup)
 	{
 		tup->t_self = heaptup->t_self;
-		heap_freetuple(heaptup);
+		if (heaptup != elided_tup && heaptup != ext_tup)
+			heap_freetuple(heaptup);
 	}
+	if (elided_tup != NULL)
+	{
+		if (elided_heaptup != NULL && elided_heaptup != elided_tup &&
+			elided_heaptup != heaptup)
+			heap_freetuple(elided_heaptup);
+		heap_freetuple(elided_tup);
+	}
+	if (ext_tup != NULL)
+		heap_freetuple(ext_tup);
 }
 
 /*
@@ -2311,7 +2895,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				  CommandId cid, uint32 options, BulkInsertState bistate)
 {
 	TransactionId xid = GetCurrentTransactionId();
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
 	HeapTuple  *heaptuples;
+	HeapTuple  *origtuples;
 	int			i;
 	int			ndone;
 	PGAlignedBlock scratch;
@@ -2330,17 +2917,40 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	AssertHasSnapshotForToast(relation);
 
+	if (unlikely(rowid_attno >= 0))
+	{
+		bool		use_single_insert =
+			(RowIdMaxBlockNumber(tupdesc->td_partition_bits) < MaxBlockNumber) ||
+			RowIdIndexHasEntries(relation);
+
+		for (i = 0; i < ntuples && !use_single_insert; i++)
+		{
+			slot_getallattrs(slots[i]);
+			if (!slots[i]->tts_isnull[rowid_attno])
+				use_single_insert = true;
+		}
+
+		if (use_single_insert)
+		{
+			for (i = 0; i < ntuples; i++)
+				table_tuple_insert(relation, slots[i], cid, options, bistate);
+			return;
+		}
+	}
+
 	needwal = RelationNeedsWAL(relation);
 	saveFreeSpace = RelationGetTargetPageFreeSpace(relation,
 												   HEAP_DEFAULT_FILLFACTOR);
 
 	/* Toast and set header data in all the slots */
 	heaptuples = palloc_array(HeapTuple, ntuples);
+	origtuples = palloc_array(HeapTuple, ntuples);
 	for (i = 0; i < ntuples; i++)
 	{
 		HeapTuple	tuple;
 
 		tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
+		origtuples[i] = tuple;
 		slots[i]->tts_tableOid = RelationGetRelid(relation);
 		tuple->t_tableOid = slots[i]->tts_tableOid;
 		heaptuples[i] = heap_prepare_insert(relation, tuple, xid, cid,
@@ -2685,7 +3295,23 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	/* copy t_self fields back to the caller's slots */
 	for (i = 0; i < ntuples; i++)
+	{
 		slots[i]->tts_tid = heaptuples[i]->t_self;
+		origtuples[i]->t_self = heaptuples[i]->t_self;
+		if (unlikely(rowid_attno >= 0))
+		{
+			BlockNumber blkno = ItemPointerGetBlockNumber(&heaptuples[i]->t_self);
+			OffsetNumber offnum = ItemPointerGetOffsetNumber(&heaptuples[i]->t_self);
+
+			heaptuples[i]->t_rootoff = offnum;
+			origtuples[i]->t_rootoff = offnum;
+			slots[i]->tts_values[rowid_attno] =
+				Int64GetDatum(RowIdEncodeHomeKey(tupdesc->td_partition_prefix,
+												 blkno, offnum));
+			slots[i]->tts_isnull[rowid_attno] = false;
+			slots[i]->tts_flags |= TTS_FLAG_ROWID_AT_HOME;
+		}
+	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -2818,6 +3444,9 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	tp.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	tp.t_len = ItemIdGetLength(lp);
 	tp.t_self = *tid;
+	tp.t_rootoff = (RelationGetDescr(relation)->td_rowidentity_attno >= 0) ?
+		heap_get_tuple_rootoff(page, ItemPointerGetOffsetNumber(tid), tp.t_data) :
+		InvalidOffsetNumber;
 
 l1:
 
@@ -3310,6 +3939,20 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 	bool		checked_lockers;
 	bool		locker_remains;
 	bool		id_has_external = false;
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	int64		orig_rowid = 0;
+	bool		old_at_home = false;
+	bool		can_hot = false;
+	bool		can_repatriate = false;
+	BlockNumber home_blk = InvalidBlockNumber;
+	OffsetNumber home_off = InvalidOffsetNumber;
+	HeapTuple	newtup_with_rowid = NULL;
+	HeapTuple	newtup_at_home = NULL;
+	HeapTuple	toasted_with_rowid = NULL;
+	HeapTuple	toasted_at_home = NULL;
+	bool		repatriated = false;
+	OffsetNumber repatriate_off = InvalidOffsetNumber;
 	TransactionId xmax_new_tuple,
 				xmax_old_tuple;
 	uint16		infomask_old_tuple,
@@ -3439,6 +4082,9 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 	oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	oldtup.t_len = ItemIdGetLength(lp);
 	oldtup.t_self = *otid;
+	oldtup.t_rootoff = (rowid_attno >= 0) ?
+		heap_get_tuple_rootoff(page, ItemPointerGetOffsetNumber(otid), oldtup.t_data) :
+		InvalidOffsetNumber;
 
 	/* the new tuple is ready, except for this: */
 	newtup->t_tableOid = RelationGetRelid(relation);
@@ -3464,7 +4110,7 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 	 * the value ends up being the same, this test will fail and we will use
 	 * the stronger lock.  This is acceptable; the important case to optimize
 	 * is updates that don't manipulate key columns, not those that
-	 * serendipitously arrive at the same key values.
+	 * superfluously detoast unchanged values.
 	 */
 	if (!bms_overlap(modified_attrs, key_attrs))
 	{
@@ -3824,6 +4470,78 @@ l2:
 	newtup->t_data->t_infomask2 |= infomask2_new_tuple;
 	HeapTupleHeaderSetXmax(newtup->t_data, xmax_new_tuple);
 
+	can_hot = !bms_overlap(modified_attrs, hot_attrs);
+
+	if (unlikely(rowid_attno >= 0))
+	{
+		int			repl_col = rowid_attno + 1;
+		Datum		repl_val;
+		bool		repl_isnull;
+
+		old_at_home = HeapTupleHeaderRowIdIsAtHome(oldtup.t_data, rowid_attno);
+		orig_rowid = HeapTupleGetRowIdentity(&oldtup, tupdesc);
+		repl_val = Int64GetDatum(orig_rowid);
+
+		if (HeapTupleHeaderRowIdIsAtHome(newtup->t_data, rowid_attno))
+		{
+			newtup_at_home = newtup;
+			repl_isnull = false;
+			newtup_with_rowid = heap_modify_tuple_by_cols(newtup, tupdesc,
+														  1, &repl_col,
+														  &repl_val, &repl_isnull);
+		}
+		else
+		{
+			bool		cur_isnull;
+			Datum		cur_val = fastgetattr(newtup, repl_col, tupdesc, &cur_isnull);
+
+			if (!cur_isnull && DatumGetInt64(cur_val) == orig_rowid)
+				newtup_with_rowid = newtup;
+			else
+			{
+				repl_isnull = false;
+				newtup_with_rowid = heap_modify_tuple_by_cols(newtup, tupdesc,
+															  1, &repl_col,
+															  &repl_val, &repl_isnull);
+			}
+			repl_isnull = true;
+			newtup_at_home = heap_modify_tuple_by_cols(newtup_with_rowid, tupdesc,
+													   1, &repl_col,
+													   &repl_val, &repl_isnull);
+		}
+
+		/* Ensure both variants carry the prepared transaction header fields */
+		if (newtup_with_rowid != newtup)
+		{
+			newtup_with_rowid->t_data->t_choice = newtup->t_data->t_choice;
+			newtup_with_rowid->t_data->t_infomask &= ~HEAP_XACT_MASK;
+			newtup_with_rowid->t_data->t_infomask |= (newtup->t_data->t_infomask & HEAP_XACT_MASK);
+			newtup_with_rowid->t_data->t_infomask2 &= ~HEAP2_XACT_MASK;
+			newtup_with_rowid->t_data->t_infomask2 |= (newtup->t_data->t_infomask2 & HEAP2_XACT_MASK);
+			newtup_with_rowid->t_tableOid = newtup->t_tableOid;
+		}
+		if (newtup_at_home != newtup)
+		{
+			newtup_at_home->t_data->t_choice = newtup->t_data->t_choice;
+			newtup_at_home->t_data->t_infomask &= ~HEAP_XACT_MASK;
+			newtup_at_home->t_data->t_infomask |= (newtup->t_data->t_infomask & HEAP_XACT_MASK);
+			newtup_at_home->t_data->t_infomask2 &= ~HEAP2_XACT_MASK;
+			newtup_at_home->t_data->t_infomask2 |= (newtup->t_data->t_infomask2 & HEAP2_XACT_MASK);
+			newtup_at_home->t_tableOid = newtup->t_tableOid;
+		}
+
+		if (!old_at_home &&
+			!RowIdIsExtended(orig_rowid) &&
+			RowIdGetPartitionId(orig_rowid, tupdesc->td_partition_bits) ==
+			tupdesc->td_partition_prefix)
+		{
+			home_blk = RowIdGetBlockNumber(orig_rowid, tupdesc->td_partition_bits);
+			home_off = RowIdGetOffsetNumber(orig_rowid);
+			if (home_off >= FirstOffsetNumber)
+				can_repatriate = true;
+		}
+	}
+
 	/*
 	 * Replace cid with a combo CID if necessary.  Note that we already put
 	 * the plain cid into the new tuple.
@@ -3850,15 +4568,32 @@ l2:
 		need_toast = false;
 	}
 	else
+	{
+		HeapTuple	checktup = (rowid_attno >= 0) ? newtup_with_rowid : newtup;
+
 		need_toast = (HeapTupleHasExternal(&oldtup) ||
-					  HeapTupleHasExternal(newtup) ||
-					  newtup->t_len > TOAST_TUPLE_THRESHOLD);
+					  HeapTupleHasExternal(checktup) ||
+					  checktup->t_len > TOAST_TUPLE_THRESHOLD);
+	}
 
 	pagefree = PageGetHeapFreeSpace(page);
 
-	newtupsize = MAXALIGN(newtup->t_len);
+	if (unlikely(rowid_attno >= 0))
+	{
+		if (old_at_home && can_hot)
+			newtupsize = MAXALIGN(newtup_at_home->t_len);
+		else if (can_repatriate && home_blk == block &&
+				 home_off <= PageGetMaxOffsetNumber(page) &&
+				 ItemIdIsOffpageRedirect(PageGetItemId(page, home_off)) &&
+				 MAXALIGN(newtup_at_home->t_len) <= PageGetExactFreeSpace(page))
+			newtupsize = 0;
+		else
+			newtupsize = MAXALIGN(newtup_with_rowid->t_len);
+	}
+	else
+		newtupsize = MAXALIGN(newtup->t_len);
 
-	if (need_toast || newtupsize > pagefree)
+	if (need_toast || newtupsize > pagefree || (can_repatriate && home_blk != block))
 	{
 		TransactionId xmax_lock_old_tuple;
 		uint16		infomask_lock_old_tuple,
@@ -3978,12 +4713,104 @@ l2:
 			 * If logical decoding is not needed, suppress it for the TOAST
 			 * tuples too. We never skip the FSM here.
 			 */
-			heaptup = heap_toast_insert_or_update(relation, newtup, &oldtup,
-												  walLogical ? 0 : HEAP_INSERT_NO_LOGICAL);
-			newtupsize = MAXALIGN(heaptup->t_len);
+			if (unlikely(rowid_attno >= 0))
+			{
+				int			repl_col = rowid_attno + 1;
+				Datum		repl_val = Int64GetDatum(orig_rowid);
+				bool		repl_isnull = true;
+
+				toasted_with_rowid =
+					heap_toast_insert_or_update(relation, newtup_with_rowid, &oldtup,
+												walLogical ? 0 : HEAP_INSERT_NO_LOGICAL);
+				toasted_at_home =
+					heap_modify_tuple_by_cols(toasted_with_rowid, tupdesc,
+											  1, &repl_col,
+											  &repl_val, &repl_isnull);
+				toasted_at_home->t_data->t_choice = toasted_with_rowid->t_data->t_choice;
+				toasted_at_home->t_data->t_infomask &= ~HEAP_XACT_MASK;
+				toasted_at_home->t_data->t_infomask |=
+					(toasted_with_rowid->t_data->t_infomask & HEAP_XACT_MASK);
+				toasted_at_home->t_data->t_infomask2 &= ~HEAP2_XACT_MASK;
+				toasted_at_home->t_data->t_infomask2 |=
+					(toasted_with_rowid->t_data->t_infomask2 & HEAP2_XACT_MASK);
+				toasted_at_home->t_tableOid = toasted_with_rowid->t_tableOid;
+			}
+			else
+			{
+				heaptup = heap_toast_insert_or_update(relation, newtup, &oldtup,
+													  walLogical ? 0 : HEAP_INSERT_NO_LOGICAL);
+				newtupsize = MAXALIGN(heaptup->t_len);
+			}
+		}
+		else if (unlikely(rowid_attno >= 0))
+		{
+			toasted_with_rowid = newtup_with_rowid;
+			toasted_at_home = newtup_at_home;
 		}
 		else
 			heaptup = newtup;
+
+		/*
+		 * If this tuple was previously moved off its home page, attempt to
+		 * repatriate it back to (home_blk, home_off) if the home page has an
+		 * off-page redirect tombstone at home_off and sufficient free space.
+		 */
+		if (unlikely(can_repatriate && home_blk != block &&
+					 home_blk < RelationGetNumberOfBlocks(relation)))
+		{
+			Buffer		home_buf = ReadBuffer(relation, home_blk);
+			Page		home_page = BufferGetPage(home_buf);
+
+			heap_page_prune_opt(relation, home_buf, &vmbuffer_new, false);
+
+			for (;;)
+			{
+				if (PageIsAllVisible(home_page) &&
+					!visibilitymap_pin_ok(home_blk, vmbuffer_new))
+					visibilitymap_pin(relation, home_blk, &vmbuffer_new);
+				if (PageIsAllVisible(page) &&
+					!visibilitymap_pin_ok(block, vmbuffer))
+					visibilitymap_pin(relation, block, &vmbuffer);
+
+				if (home_blk < block)
+				{
+					LockBuffer(home_buf, BUFFER_LOCK_EXCLUSIVE);
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				}
+				else
+				{
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+					LockBuffer(home_buf, BUFFER_LOCK_EXCLUSIVE);
+				}
+
+				if ((PageIsAllVisible(home_page) &&
+					 !visibilitymap_pin_ok(home_blk, vmbuffer_new)) ||
+					(PageIsAllVisible(page) &&
+					 !visibilitymap_pin_ok(block, vmbuffer)))
+				{
+					LockBuffer(home_buf, BUFFER_LOCK_UNLOCK);
+					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+					continue;
+				}
+				break;
+			}
+
+			if (!PageIsNew(home_page) &&
+				home_off <= PageGetMaxOffsetNumber(home_page) &&
+				ItemIdIsOffpageRedirect(PageGetItemId(home_page, home_off)) &&
+				MAXALIGN(toasted_at_home->t_len) <= PageGetExactFreeSpace(home_page))
+			{
+				newbuf = home_buf;
+				heaptup = toasted_at_home;
+				repatriated = true;
+				repatriate_off = home_off;
+			}
+			else
+			{
+				UnlockReleaseBuffer(home_buf);
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			}
+		}
 
 		/*
 		 * Now, do we need a new page for the tuple, or not?  This is a bit
@@ -4008,40 +4835,79 @@ l2:
 		 * pins; but if we don't, we have to handle that here.  Hence we need
 		 * a loop.
 		 */
-		for (;;)
+		if (!repatriated)
 		{
-			if (newtupsize > pagefree)
+			if (unlikely(rowid_attno >= 0))
+				newtupsize = (old_at_home && can_hot) ?
+					MAXALIGN(toasted_at_home->t_len) :
+					MAXALIGN(toasted_with_rowid->t_len);
+
+			for (;;)
 			{
-				/* It doesn't fit, must use RelationGetBufferForTuple. */
-				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
-												   buffer, 0, NULL,
-												   &vmbuffer_new, &vmbuffer,
-												   0);
-				/* We're all done. */
-				break;
-			}
-			/* Acquire VM page pin if needed and we don't have it. */
-			if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
-				visibilitymap_pin(relation, block, &vmbuffer);
-			/* Re-acquire the lock on the old tuple's page. */
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-			/* Re-check using the up-to-date free space */
-			pagefree = PageGetHeapFreeSpace(page);
-			if (newtupsize > pagefree ||
-				(vmbuffer == InvalidBuffer && PageIsAllVisible(page)))
-			{
-				/*
-				 * Rats, it doesn't fit anymore, or somebody just now set the
-				 * all-visible flag.  We must now unlock and loop to avoid
-				 * deadlock.  Fortunately, this path should seldom be taken.
-				 */
-				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			}
-			else
-			{
-				/* We're all done. */
-				newbuf = buffer;
-				break;
+				if (newtupsize > pagefree && !(can_repatriate && home_blk == block))
+				{
+					Size		reqlen = (rowid_attno >= 0) ?
+						toasted_with_rowid->t_len : heaptup->t_len;
+
+					/* It doesn't fit, must use RelationGetBufferForTuple. */
+					newbuf = RelationGetBufferForTuple(relation, reqlen,
+													   buffer, 0, NULL,
+													   &vmbuffer_new, &vmbuffer,
+													   0);
+					if (unlikely(rowid_attno >= 0))
+						heaptup = (newbuf == buffer && old_at_home && can_hot) ?
+							toasted_at_home : toasted_with_rowid;
+					/* We're all done. */
+					break;
+				}
+				/* Acquire VM page pin if needed and we don't have it. */
+				if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
+					visibilitymap_pin(relation, block, &vmbuffer);
+				/* Re-acquire the lock on the old tuple's page. */
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				/* Re-check using the up-to-date free space */
+				pagefree = PageGetHeapFreeSpace(page);
+
+				if (unlikely(can_repatriate && home_blk == block))
+				{
+					if (home_off <= PageGetMaxOffsetNumber(page) &&
+						ItemIdIsOffpageRedirect(PageGetItemId(page, home_off)) &&
+						MAXALIGN(toasted_at_home->t_len) <= PageGetExactFreeSpace(page))
+					{
+						if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
+						{
+							LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+							continue;
+						}
+						newbuf = buffer;
+						heaptup = toasted_at_home;
+						repatriated = true;
+						repatriate_off = home_off;
+						break;
+					}
+					can_repatriate = false;
+				}
+
+				if (newtupsize > pagefree ||
+					(vmbuffer == InvalidBuffer && PageIsAllVisible(page)))
+				{
+					/*
+					 * Rats, it doesn't fit anymore, or somebody just now set
+					 * the all-visible flag.  We must now unlock and loop to
+					 * avoid deadlock.  Fortunately, this path should seldom
+					 * be taken.
+					 */
+					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				}
+				else
+				{
+					/* We're all done. */
+					newbuf = buffer;
+					if (unlikely(rowid_attno >= 0))
+						heaptup = (old_at_home && can_hot) ?
+							toasted_at_home : toasted_with_rowid;
+					break;
+				}
 			}
 		}
 	}
@@ -4049,7 +4915,24 @@ l2:
 	{
 		/* No TOAST work needed, and it'll fit on same page */
 		newbuf = buffer;
-		heaptup = newtup;
+		if (unlikely(rowid_attno >= 0))
+		{
+			if (can_repatriate && home_blk == block &&
+				home_off <= PageGetMaxOffsetNumber(page) &&
+				ItemIdIsOffpageRedirect(PageGetItemId(page, home_off)) &&
+				MAXALIGN(newtup_at_home->t_len) <= PageGetExactFreeSpace(page))
+			{
+				heaptup = newtup_at_home;
+				repatriated = true;
+				repatriate_off = home_off;
+			}
+			else if (old_at_home && can_hot)
+				heaptup = newtup_at_home;
+			else
+				heaptup = newtup_with_rowid;
+		}
+		else
+			heaptup = newtup;
 	}
 
 	newpage = BufferGetPage(newbuf);
@@ -4077,7 +4960,7 @@ l2:
 	 * one pin is held.
 	 */
 
-	if (newbuf == buffer)
+	if (newbuf == buffer && !repatriated)
 	{
 		/*
 		 * Since the new tuple is going into the same page, we might be able
@@ -4099,7 +4982,7 @@ l2:
 				summarized_update = true;
 		}
 	}
-	else
+	else if (newbuf != buffer)
 	{
 		/* Set a hint that the old page could use prune/defrag */
 		PageSetFull(page);
@@ -4214,7 +5097,10 @@ l2:
 		HeapTupleClearHeapOnly(newtup);
 	}
 
-	RelationPutHeapTuple(relation, newbuf, heaptup, false); /* insert new tuple */
+	if (unlikely(repatriated))
+		RelationPutHeapTupleAtOffset(relation, newbuf, heaptup, false, repatriate_off);
+	else
+		RelationPutHeapTuple(relation, newbuf, heaptup, false); /* insert new tuple */
 
 
 	/* Clear obsolete visibility flags, possibly set by ourselves above... */
@@ -4346,6 +5232,17 @@ l2:
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
 
+	if (unlikely(rowid_attno >= 0))
+	{
+		if (old_at_home && use_hot_update)
+			heaptup->t_rootoff = oldtup.t_rootoff;
+		else if (repatriated)
+			heaptup->t_rootoff = repatriate_off;
+		else
+			heaptup->t_rootoff = InvalidOffsetNumber;
+		newtup->t_rootoff = heaptup->t_rootoff;
+	}
+
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
 	 * back to the caller's image, too.
@@ -4353,8 +5250,19 @@ l2:
 	if (heaptup != newtup)
 	{
 		newtup->t_self = heaptup->t_self;
-		heap_freetuple(heaptup);
+		if (rowid_attno < 0)
+			heap_freetuple(heaptup);
 	}
+	if (toasted_with_rowid != NULL && toasted_with_rowid != newtup &&
+		toasted_with_rowid != newtup_with_rowid)
+		heap_freetuple(toasted_with_rowid);
+	if (toasted_at_home != NULL && toasted_at_home != newtup &&
+		toasted_at_home != newtup_at_home)
+		heap_freetuple(toasted_at_home);
+	if (newtup_with_rowid != NULL && newtup_with_rowid != newtup)
+		heap_freetuple(newtup_with_rowid);
+	if (newtup_at_home != NULL && newtup_at_home != newtup)
+		heap_freetuple(newtup_at_home);
 
 	/*
 	 * If it is a HOT update, the update may still need to update summarized
@@ -4609,6 +5517,12 @@ HeapDetermineColumnsInfo(Relation relation,
 		}
 
 		/*
+		 * A ROW IDENTITY column is immutable across all updates of a row.
+		 */
+		if (unlikely(attrnum > 0 && attrnum - 1 == tupdesc->td_rowidentity_attno))
+			continue;
+
+		/*
 		 * Extract the corresponding values.  XXX this is pretty inefficient
 		 * if there are many indexed columns.  Should we do a single
 		 * heap_deform_tuple call on each tuple, instead?	But that doesn't
@@ -4785,6 +5699,9 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	tuple->t_len = ItemIdGetLength(lp);
 	tuple->t_tableOid = RelationGetRelid(relation);
+	tuple->t_rootoff = (RelationGetDescr(relation)->td_rowidentity_attno >= 0) ?
+		heap_get_tuple_rootoff(page, ItemPointerGetOffsetNumber(tid), tuple->t_data) :
+		InvalidOffsetNumber;
 
 l3:
 	result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);

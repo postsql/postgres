@@ -1556,6 +1556,12 @@ heap_prune_chain(OffsetNumber maxoff, OffsetNumber rootoffnum,
 
 	rootlp = PageGetItemId(page, rootoffnum);
 
+	if (ItemIdIsOffpageRedirect(rootlp))
+	{
+		heap_prune_record_unchanged_lp_redirect(prstate, rootoffnum);
+		return;
+	}
+
 	/* Start from the root tuple */
 	offnum = rootoffnum;
 
@@ -1713,13 +1719,75 @@ process_chain:
 	}
 	else if (ndeadchain == nchain)
 	{
-		/*
-		 * The entire chain is dead.  Mark the root line pointer LP_DEAD, and
-		 * fully remove the other tuples in the chain.
-		 */
-		heap_prune_record_dead_or_unused(prstate, rootoffnum, ItemIdIsNormal(rootlp));
-		for (int i = 1; i < nchain; i++)
-			heap_prune_record_unused(prstate, chainitems[i], true);
+		TupleDesc	tupdesc = RelationGetDescr(prstate->relation);
+		bool		anchored = false;
+
+		if (unlikely(tupdesc->td_rowidentity_attno >= 0))
+		{
+			OffsetNumber firstoff = ItemIdIsNormal(rootlp) ?
+				chainitems[0] : chainitems[1];
+			ItemId		firstlp = PageGetItemId(page, firstoff);
+			HeapTupleHeader firsthtup = (HeapTupleHeader) PageGetItem(page, firstlp);
+
+			if (HeapTupleHeaderRowIdIsAtHome(firsthtup, tupdesc->td_rowidentity_attno))
+			{
+				OffsetNumber tailoff = chainitems[nchain - 1];
+				ItemId		taillp = PageGetItemId(page, tailoff);
+				HeapTupleHeader tailhtup = (HeapTupleHeader) PageGetItem(page, taillp);
+				ItemPointerData tail_self;
+
+				ItemPointerSet(&tail_self, prstate->block, tailoff);
+
+				if (!HeapTupleHeaderXminCommitted(tailhtup) &&
+					(HeapTupleHeaderXminInvalid(tailhtup) ||
+					 !TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(tailhtup))))
+				{
+					/*
+					 * Tuple's xmin aborted.  If it was an aborted repatriation
+					 * UPDATE (HEAP_UPDATED set), the off-page version is still
+					 * live and indexed, so restore the off-page redirect anchor.
+					 */
+					if ((tailhtup->t_infomask & HEAP_UPDATED) != 0)
+					{
+						heap_prune_record_redirect(prstate, rootoffnum,
+												   LP_REDIRECT_OFFPAGE_INDEXED,
+												   ItemIdIsNormal(rootlp));
+						for (int i = 1; i < nchain; i++)
+							heap_prune_record_unused(prstate, chainitems[i], true);
+						anchored = true;
+					}
+				}
+				else if (HeapTupleHeaderIndicatesMovedPartitions(tailhtup))
+				{
+					heap_prune_record_redirect(prstate, rootoffnum,
+											   LP_REDIRECT_OFFPAGE_PART,
+											   ItemIdIsNormal(rootlp));
+					for (int i = 1; i < nchain; i++)
+						heap_prune_record_unused(prstate, chainitems[i], true);
+					anchored = true;
+				}
+				else if (!ItemPointerEquals(&tailhtup->t_ctid, &tail_self))
+				{
+					heap_prune_record_redirect(prstate, rootoffnum,
+											   LP_REDIRECT_OFFPAGE_LOCAL,
+											   ItemIdIsNormal(rootlp));
+					for (int i = 1; i < nchain; i++)
+						heap_prune_record_unused(prstate, chainitems[i], true);
+					anchored = true;
+				}
+			}
+		}
+
+		if (!anchored)
+		{
+			/*
+			 * The entire chain is dead.  Mark the root line pointer LP_DEAD, and
+			 * fully remove the other tuples in the chain.
+			 */
+			heap_prune_record_dead_or_unused(prstate, rootoffnum, ItemIdIsNormal(rootlp));
+			for (int i = 1; i < nchain; i++)
+				heap_prune_record_unused(prstate, chainitems[i], true);
+		}
 	}
 	else
 	{
@@ -2107,6 +2175,8 @@ heap_prune_record_unchanged_lp_redirect(PruneState *prstate, OffsetNumber offnum
 	 */
 	Assert(!prstate->processed[offnum]);
 	prstate->processed[offnum] = true;
+	if (ItemIdIsOffpageRedirect(PageGetItemId(prstate->page, offnum)))
+		prstate->hastup = true;
 }
 
 /*
@@ -2183,10 +2253,13 @@ heap_page_prune_execute(Buffer buffer, bool lp_truncate_only,
 		 * be marked as unused subsequently. The page_verify_redirects() check
 		 * below will catch such problems.
 		 */
-		tolp = PageGetItemId(page, tooff);
-		Assert(ItemIdHasStorage(tolp) && ItemIdIsNormal(tolp));
-		htup = (HeapTupleHeader) PageGetItem(page, tolp);
-		Assert(HeapTupleHeaderIsHeapOnly(htup));
+		if (!OffsetNumberIsOffpageRedirect(tooff))
+		{
+			tolp = PageGetItemId(page, tooff);
+			Assert(ItemIdHasStorage(tolp) && ItemIdIsNormal(tolp));
+			htup = (HeapTupleHeader) PageGetItem(page, tolp);
+			Assert(HeapTupleHeaderIsHeapOnly(htup));
+		}
 #endif
 
 		ItemIdSetRedirect(fromlp, tooff);
@@ -2316,6 +2389,8 @@ page_verify_redirects(Page page)
 			continue;
 
 		targoff = ItemIdGetRedirect(itemid);
+		if (OffsetNumberIsOffpageRedirect(targoff))
+			continue;
 		targitem = PageGetItemId(page, targoff);
 
 		Assert(ItemIdIsUsed(targitem));
@@ -2394,6 +2469,8 @@ heap_get_root_tuples(Page page, OffsetNumber *root_offsets)
 		{
 			/* Must be a redirect item. We do not set its root_offsets entry */
 			Assert(ItemIdIsRedirected(lp));
+			if (ItemIdIsOffpageRedirect(lp))
+				continue;
 			/* Set up to scan the HOT-chain */
 			nextoffnum = ItemIdGetRedirect(lp);
 			priorXmax = InvalidTransactionId;

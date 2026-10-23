@@ -589,6 +589,86 @@ generateSerialExtraStmts(CreateStmtContext *cxt, ColumnDef *column,
 }
 
 /*
+ * generateRowIdExtraStmts
+ *		Generate the backing partial unique B-Tree index for a GENERATED ALWAYS
+ *		AS ROW IDENTITY column.
+ */
+static void
+generateRowIdExtraStmts(CreateStmtContext *cxt, ColumnDef *column)
+{
+	IndexStmt  *index;
+	IndexElem  *iparam;
+	NullTest   *pred;
+	ColumnRef  *cref;
+
+	if (cxt->isforeign)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("row identity columns are not supported on foreign tables")));
+
+	index = makeNode(IndexStmt);
+	index->idxname = psprintf("%s_%s_rowid_idx",
+							  cxt->relation->relname,
+							  column->colname);
+	index->relation = cxt->relation;
+	index->accessMethod = DEFAULT_INDEX_TYPE;
+	index->tableSpace = NULL;
+	index->indexParams = NIL;
+	index->indexIncludingParams = NIL;
+	index->options = NIL;
+	index->whereClause = NULL;
+	index->excludeOpNames = NIL;
+	index->idxcomment = NULL;
+	index->indexOid = InvalidOid;
+	index->oldNumber = InvalidRelFileNumber;
+	index->oldCreateSubid = InvalidSubTransactionId;
+	index->oldFirstRelfilelocatorSubid = InvalidSubTransactionId;
+	index->unique = true;
+	index->nulls_not_distinct = false;
+	index->primary = false;
+	index->isconstraint = false;
+	index->iswithoutoverlaps = false;
+	index->deferrable = false;
+	index->initdeferred = false;
+	index->transformed = false;
+	index->concurrent = false;
+	index->if_not_exists = true;
+	index->reset_default_tblspc = false;
+
+	iparam = makeNode(IndexElem);
+	iparam->name = pstrdup(column->colname);
+	iparam->expr = NULL;
+	iparam->indexcolname = NULL;
+	iparam->collation = NIL;
+	iparam->opclass = NIL;
+	iparam->opclassopts = NIL;
+	iparam->ordering = SORTBY_DEFAULT;
+	iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+	index->indexParams = list_make1(iparam);
+
+	/*
+	 * Use an untransformed NullTest (col IS NULL) as the catalog predicate so
+	 * the index is recorded as a partial unique index on the row identity
+	 * column. Because the column is NOT NULL, the standard B-Tree planner
+	 * will never match this partial index as a full-table index, while
+	 * RowIdScan, ExecInsertIndexTuples, and vacuumlazy access it directly via
+	 * RelationGetRowIdIndex().
+	 */
+	cref = makeNode(ColumnRef);
+	cref->fields = list_make1(makeString(pstrdup(column->colname)));
+	cref->location = -1;
+
+	pred = makeNode(NullTest);
+	pred->arg = (Expr *) cref;
+	pred->nulltesttype = IS_NULL;
+	pred->argisrow = false;
+	pred->location = -1;
+	index->whereClause = (Node *) pred;
+
+	cxt->alist = lappend(cxt->alist, index);
+}
+
+/*
  * transformColumnDefinition -
  *		transform a single ColumnDef within CREATE TABLE
  *		Also used in ALTER TABLE ADD COLUMN
@@ -597,6 +677,7 @@ static void
 transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 {
 	bool		is_serial;
+	bool		is_rowid_shorthand = false;
 	bool		saw_nullable;
 	bool		saw_default;
 	bool		saw_identity;
@@ -607,7 +688,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 
 	cxt->columns = lappend(cxt->columns, column);
 
-	/* Check for SERIAL pseudo-types */
+	/* Check for SERIAL and ROWID pseudo-types */
 	is_serial = false;
 	if (column->typeName
 		&& list_length(column->typeName->names) == 1
@@ -636,6 +717,14 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 			column->typeName->names = NIL;
 			column->typeName->typeOid = INT8OID;
 		}
+		else if ((strcmp(typname, "rowid") == 0 ||
+				  strcmp(typname, "rowidentity") == 0) &&
+				 column->typeName->arrayBounds == NIL)
+		{
+			column->typeName->names = NIL;
+			column->typeName->typeOid = INT8OID;
+			is_rowid_shorthand = !cxt->partbound;
+		}
 
 		/*
 		 * We have to reject "serial[]" explicitly, because once we've set
@@ -653,6 +742,32 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	/* Do necessary work on the column type declaration */
 	if (column->typeName)
 		transformColumnType(cxt, column);
+
+	if (is_rowid_shorthand)
+	{
+		bool		has_identity_or_gen = false;
+
+		foreach_node(Constraint, c, column->constraints)
+		{
+			if (c->contype == CONSTR_IDENTITY ||
+				c->contype == CONSTR_GENERATED ||
+				c->contype == CONSTR_DEFAULT)
+			{
+				has_identity_or_gen = true;
+				break;
+			}
+		}
+		if (!has_identity_or_gen)
+		{
+			Constraint *constraint = makeNode(Constraint);
+
+			constraint->contype = CONSTR_IDENTITY;
+			constraint->generated_when = ATTRIBUTE_IDENTITY_ROW;
+			constraint->options = NIL;
+			constraint->location = column->typeName ? column->typeName->location : -1;
+			column->constraints = lappend(column->constraints, constraint);
+		}
+	}
 
 	/* Special actions for SERIAL pseudo-types */
 	if (is_serial)
@@ -861,10 +976,45 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 								 parser_errposition(cxt->pstate,
 													constraint->location)));
 
-					generateSerialExtraStmts(cxt, column,
-											 typeOid, constraint->options,
-											 true, false,
-											 NULL, NULL);
+					if (constraint->generated_when == ATTRIBUTE_IDENTITY_ROW)
+					{
+						if (typeOid != INT8OID)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATATYPE_MISMATCH),
+									 errmsg("row identity column \"%s\" must be of type bigint",
+											column->colname),
+									 parser_errposition(cxt->pstate,
+														column->typeName->location)));
+
+						if (cxt->rel && cxt->rel->rd_att->td_rowidentity_attno >= 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+									 errmsg("table \"%s\" already has a row identity column",
+											cxt->relation->relname),
+									 parser_errposition(cxt->pstate,
+														constraint->location)));
+
+						foreach_node(ColumnDef, othercol, cxt->columns)
+						{
+							if (othercol != column &&
+								othercol->identity == ATTRIBUTE_IDENTITY_ROW)
+								ereport(ERROR,
+										(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+										 errmsg("multiple row identity columns for table \"%s\" are not allowed",
+												cxt->relation->relname),
+										 parser_errposition(cxt->pstate,
+															constraint->location)));
+						}
+
+						generateRowIdExtraStmts(cxt, column);
+					}
+					else
+					{
+						generateSerialExtraStmts(cxt, column,
+												 typeOid, constraint->options,
+												 true, false,
+												 NULL, NULL);
+					}
 
 					column->identity = constraint->generated_when;
 					saw_identity = true;
@@ -1226,19 +1376,26 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 			(table_like_clause->options & CREATE_TABLE_LIKE_IDENTITY) &&
 			!cxt->isforeign)
 		{
-			Oid			seq_relid;
-			List	   *seq_options;
+			if (attribute->attidentity == ATTRIBUTE_IDENTITY_ROW)
+			{
+				generateRowIdExtraStmts(cxt, def);
+			}
+			else
+			{
+				Oid			seq_relid;
+				List	   *seq_options;
 
-			/*
-			 * find sequence owned by old column; extract sequence parameters;
-			 * build new create sequence command
-			 */
-			seq_relid = getIdentitySequence(relation, attribute->attnum, false);
-			seq_options = sequence_options(seq_relid);
-			generateSerialExtraStmts(cxt, def,
-									 InvalidOid, seq_options,
-									 true, false,
-									 NULL, NULL);
+				/*
+				 * find sequence owned by old column; extract sequence
+				 * parameters; build new create sequence command
+				 */
+				seq_relid = getIdentitySequence(relation, attribute->attnum, false);
+				seq_options = sequence_options(seq_relid);
+				generateSerialExtraStmts(cxt, def,
+										 InvalidOid, seq_options,
+										 true, false,
+										 NULL, NULL);
+			}
 			def->identity = attribute->attidentity;
 		}
 
@@ -1575,6 +1732,9 @@ expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 			Oid			parent_index_oid = lfirst_oid(l);
 			Relation	parent_index;
 			IndexStmt  *index_stmt;
+
+			if (parent_index_oid == RelationGetRowIdIndex(relation))
+				continue;
 
 			parent_index = index_open(parent_index_oid, AccessShareLock);
 

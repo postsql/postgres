@@ -412,6 +412,33 @@ static relopt_int intRelOpts[] =
 		},
 		-1, 0, 1024
 	},
+	{
+		{
+			"partition_id_bits",
+			"Bit width of partition_id in GENERATED ALWAYS AS ROW IDENTITY keys (0..45).",
+			RELOPT_KIND_HEAP | RELOPT_KIND_PARTITIONED,
+			AccessExclusiveLock
+		},
+		-1, -1, 45
+	},
+	{
+		{
+			"partition_bits",
+			"Bit width of partition_id in GENERATED ALWAYS AS ROW IDENTITY keys (0..45).",
+			RELOPT_KIND_HEAP | RELOPT_KIND_PARTITIONED,
+			AccessExclusiveLock
+		},
+		-1, -1, 45
+	},
+	{
+		{
+			"partition_id",
+			"Partition identifier encoded in GENERATED ALWAYS AS ROW IDENTITY keys.",
+			RELOPT_KIND_HEAP | RELOPT_KIND_PARTITIONED,
+			AccessExclusiveLock
+		},
+		-1, -1, (1 << 30) - 1
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -2117,7 +2144,13 @@ static const relopt_parse_elt stdRdOptionsTab[] = {
 	{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 	offsetof(StdRdOptions, vacuum_truncate)},
 	{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-	offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+	offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
+	{"partition_id_bits", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, partition_id_bits)},
+	{"partition_bits", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, partition_bits)},
+	{"partition_id", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, partition_id)}
 };
 
 /*
@@ -2332,11 +2365,24 @@ bytea *
 partitioned_table_reloptions(Datum reloptions, bool validate)
 {
 	if (validate && reloptions)
-		ereport(ERROR,
-				errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				errmsg("cannot specify storage parameters for a partitioned table"),
-				errhint("Specify storage parameters for its leaf partitions instead."));
-	return NULL;
+	{
+		List	   *deflist = untransformRelOptions(reloptions);
+		ListCell   *lc;
+
+		foreach(lc, deflist)
+		{
+			DefElem    *def = lfirst_node(DefElem, lc);
+
+			if (strcmp(def->defname, "partition_id_bits") != 0 &&
+				strcmp(def->defname, "partition_bits") != 0 &&
+				strcmp(def->defname, "partition_id") != 0)
+				ereport(ERROR,
+						errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("cannot specify storage parameters for a partitioned table"),
+						errhint("Specify storage parameters for its leaf partitions instead."));
+		}
+	}
+	return default_reloptions(reloptions, validate, RELOPT_KIND_PARTITIONED);
 }
 
 /*

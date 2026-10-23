@@ -1214,6 +1214,7 @@ removeabbrev_heap(Tuplesortstate *state, SortTuple *stups, int count)
 
 		htup.t_len = ((MinimalTuple) stups[i].tuple)->t_len +
 			MINIMAL_TUPLE_OFFSET;
+		ItemPointerSetInvalid(&htup.t_self);
 		htup.t_data = (HeapTupleHeader) ((char *) stups[i].tuple -
 										 MINIMAL_TUPLE_OFFSET);
 		stups[i].datum1 = heap_getattr(&htup,
@@ -1259,8 +1260,10 @@ comparetup_heap_tiebreak(const SortTuple *a, const SortTuple *b, Tuplesortstate 
 				isnull2;
 
 	ltup.t_len = ((MinimalTuple) a->tuple)->t_len + MINIMAL_TUPLE_OFFSET;
+	ItemPointerSetInvalid(&ltup.t_self);
 	ltup.t_data = (HeapTupleHeader) ((char *) a->tuple - MINIMAL_TUPLE_OFFSET);
 	rtup.t_len = ((MinimalTuple) b->tuple)->t_len + MINIMAL_TUPLE_OFFSET;
+	ItemPointerSetInvalid(&rtup.t_self);
 	rtup.t_data = (HeapTupleHeader) ((char *) b->tuple - MINIMAL_TUPLE_OFFSET);
 	tupDesc = (TupleDesc) base->arg;
 
@@ -1498,11 +1501,13 @@ writetup_cluster(Tuplesortstate *state, LogicalTape *tape, SortTuple *stup)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	HeapTuple	tuple = (HeapTuple) stup->tuple;
-	unsigned int tuplen = tuple->t_len + sizeof(ItemPointerData) + sizeof(int);
+	unsigned int tuplen = tuple->t_len + sizeof(ItemPointerData) +
+		sizeof(OffsetNumber) + sizeof(int);
 
-	/* We need to store t_self, but not other fields of HeapTupleData */
+	/* We need to store t_self and t_rootoff, but not other fields of HeapTupleData */
 	LogicalTapeWrite(tape, &tuplen, sizeof(tuplen));
 	LogicalTapeWrite(tape, &tuple->t_self, sizeof(ItemPointerData));
+	LogicalTapeWrite(tape, &tuple->t_rootoff, sizeof(OffsetNumber));
 	LogicalTapeWrite(tape, tuple->t_data, tuple->t_len);
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeWrite(tape, &tuplen, sizeof(tuplen));
@@ -1514,7 +1519,8 @@ readtup_cluster(Tuplesortstate *state, SortTuple *stup,
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	TuplesortClusterArg *arg = (TuplesortClusterArg *) base->arg;
-	unsigned int t_len = tuplen - sizeof(ItemPointerData) - sizeof(int);
+	unsigned int t_len = tuplen - sizeof(ItemPointerData) -
+		sizeof(OffsetNumber) - sizeof(int);
 	HeapTuple	tuple = (HeapTuple) tuplesort_readtup_alloc(state,
 															t_len + HEAPTUPLESIZE);
 
@@ -1522,6 +1528,7 @@ readtup_cluster(Tuplesortstate *state, SortTuple *stup,
 	tuple->t_data = (HeapTupleHeader) ((char *) tuple + HEAPTUPLESIZE);
 	tuple->t_len = t_len;
 	LogicalTapeReadExact(tape, &tuple->t_self, sizeof(ItemPointerData));
+	LogicalTapeReadExact(tape, &tuple->t_rootoff, sizeof(OffsetNumber));
 	/* We don't currently bother to reconstruct t_tableOid */
 	tuple->t_tableOid = InvalidOid;
 	/* Read in the tuple body */

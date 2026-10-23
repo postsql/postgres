@@ -242,7 +242,8 @@ PageAddItemExtended(Page page,
 			if (offsetNumber < limit)
 			{
 				itemId = PageGetItemId(page, offsetNumber);
-				if (ItemIdIsUsed(itemId) || ItemIdHasStorage(itemId))
+				if ((ItemIdIsUsed(itemId) && !ItemIdIsOffpageRedirect(itemId)) ||
+					ItemIdHasStorage(itemId))
 				{
 					elog(WARNING, "will not overwrite a used ItemId");
 					return InvalidOffsetNumber;

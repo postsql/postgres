@@ -949,6 +949,20 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 										 &nulls[defmap[i]]);
 	}
 
+	if (unlikely(tupDesc->td_rowidentity_attno >= 0))
+	{
+		int			rowid_attno = tupDesc->td_rowidentity_attno;
+
+		if (nulls[rowid_attno] &&
+			!cstate->defaults[rowid_attno] &&
+			(!cstate->convert_select_flags || cstate->convert_select_flags[rowid_attno]) &&
+			list_member_int(cstate->attnumlist, rowid_attno + 1))
+		{
+			nulls[rowid_attno] = false;
+			values[rowid_attno] = Int64GetDatum(PG_INT64_MIN);
+		}
+	}
+
 	return true;
 }
 

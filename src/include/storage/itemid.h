@@ -181,4 +181,23 @@ typedef uint16 ItemLength;
 	(itemId)->lp_flags = LP_DEAD \
 )
 
+/*
+ * Special lp_off values used with lp_flags == LP_REDIRECT to anchor a
+ * home-page root line pointer whose tuple was updated off-page or across
+ * partitions on a table with a GENERATED ALWAYS AS ROW IDENTITY column.
+ * Because normal redirect links are OffsetNumbers (1 .. MaxHeapTuplesPerPage),
+ * values >= 0x7FFD never collide with valid same-page line pointer offsets.
+ */
+#define LP_REDIRECT_OFFPAGE_LOCAL	0x7FFF	/* off-page, not yet vacuumed */
+#define LP_REDIRECT_OFFPAGE_INDEXED	0x7FFE	/* survived 1st vacuum pass */
+#define LP_REDIRECT_OFFPAGE_PART	0x7FFD	/* moved across partitions */
+
+#define OffsetNumberIsOffpageRedirect(offnum) \
+	((offnum) >= LP_REDIRECT_OFFPAGE_PART && \
+	 (offnum) <= LP_REDIRECT_OFFPAGE_LOCAL)
+
+#define ItemIdIsOffpageRedirect(itemId) \
+	(ItemIdIsRedirected(itemId) && \
+	 OffsetNumberIsOffpageRedirect(ItemIdGetRedirect(itemId)))
+
 #endif							/* ITEMID_H */

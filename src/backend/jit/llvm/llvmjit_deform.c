@@ -113,6 +113,16 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		Form_pg_attribute attr = TupleDescAttr(desc, attnum);
 
 		/*
+		 * A GENERATED ALWAYS AS ROW IDENTITY column may be added instantly via
+		 * ALTER TABLE ADD COLUMN (without rewriting existing tuples) and is
+		 * elided (0 bytes, t_bits = 0) when stored at its home TID, so neither
+		 * it nor any subsequent column can be assumed unconditionally present.
+		 */
+		if (attnum == desc->td_rowidentity_attno ||
+			attr->attidentity == ATTRIBUTE_IDENTITY_ROW)
+			break;
+
+		/*
 		 * If the column is declared NOT NULL then it must be present in every
 		 * tuple, unless there's a "missing" entry that could provide a
 		 * non-NULL value for it. That in turn guarantees that the NULL bitmap
@@ -446,7 +456,9 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		 * as NULL, so we must always perform NULL checks for these.
 		 */
 		if (att->attnullability != ATTNULLABLE_VALID ||
-			attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ||
+			attr->attidentity == ATTRIBUTE_IDENTITY_ROW ||
+			attnum == desc->td_rowidentity_attno)
 		{
 			LLVMBasicBlockRef b_ifnotnull;
 			LLVMBasicBlockRef b_ifnull;
@@ -613,6 +625,8 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			attguaranteedalign = false;
 		}
 		else if (att->attnullability == ATTNULLABLE_VALID &&
+				 attr->attidentity != ATTRIBUTE_IDENTITY_ROW &&
+				 attnum != desc->td_rowidentity_attno &&
 				 attguaranteedalign && known_alignment >= 0)
 		{
 			/*
@@ -625,6 +639,8 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		}
 		else if (att->attnullability == ATTNULLABLE_VALID &&
 				 attr->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL &&
+				 attr->attidentity != ATTRIBUTE_IDENTITY_ROW &&
+				 attnum != desc->td_rowidentity_attno &&
 				 (att->attlen % alignto) == 0)
 		{
 			/*
@@ -761,6 +777,23 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		LLVMBuildStore(b, l_int16_const(lc, natts), v_nvalidp);
 		v_off = LLVMBuildTrunc(b, v_off, LLVMInt32TypeInContext(lc), "");
 		LLVMBuildStore(b, v_off, v_slotoffp);
+
+		if (desc->td_rowidentity_attno >= 0 &&
+			natts > desc->td_rowidentity_attno &&
+			(ops == &TTSOpsHeapTuple || ops == &TTSOpsBufferHeapTuple))
+		{
+			LLVMValueRef v_params[3];
+			LLVMValueRef f;
+
+			v_params[0] = v_slot;
+			v_params[1] = l_int32_const(lc, natts);
+			v_params[2] = l_int32_const(lc, natts);
+			f = llvm_pg_func(mod, "slot_getmissingattrs");
+			l_call(b,
+				   LLVMGetFunctionType(f), f,
+				   v_params, lengthof(v_params), "");
+		}
+
 		LLVMBuildRetVoid(b);
 	}
 

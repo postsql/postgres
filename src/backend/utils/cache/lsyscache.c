@@ -1128,6 +1128,36 @@ get_attgenerated(Oid relid, AttrNumber attnum)
 }
 
 /*
+ * get_attidentity
+ *
+ *		Given the relation id and the attribute number,
+ *		return the "attidentity" field from the attribute relation.
+ *
+ *		Errors if not found.
+ *
+ *		Since not an identity column is represented by '\0', this can also be
+ *		used as a Boolean test.
+ */
+char
+get_attidentity(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	tp;
+	Form_pg_attribute att_tup;
+	char		result;
+
+	tp = SearchSysCache2(ATTNUM,
+						 ObjectIdGetDatum(relid),
+						 Int16GetDatum(attnum));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+			 attnum, relid);
+	att_tup = (Form_pg_attribute) GETSTRUCT(tp);
+	result = att_tup->attidentity;
+	ReleaseSysCache(tp);
+	return result;
+}
+
+/*
  * get_atttype
  *
  *		Given the relation OID and the attribute number with the relation,

@@ -2059,6 +2059,19 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 		{
 			Form_pg_attribute att = TupleDescAttr(tupdesc, attnum - 1);
 
+			if (att->attidentity == ATTRIBUTE_IDENTITY_ROW)
+			{
+				bool		isnull;
+				Datum		val = slot_getattr(slot, attnum, &isnull);
+
+				if (!isnull && DatumGetInt64(val) == PG_INT64_MIN)
+				{
+					slot->tts_isnull[attnum - 1] = true;
+					ReportNotNullViolationError(resultRelInfo, slot, estate, attnum);
+				}
+				continue;
+			}
+
 			if (att->attnotnull && att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 				notnull_virtual_attrs = lappend_int(notnull_virtual_attrs, attnum);
 			else if (att->attnotnull && slot_attisnull(slot, attnum))

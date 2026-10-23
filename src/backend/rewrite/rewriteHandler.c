@@ -930,7 +930,8 @@ rewriteTargetListIU(List *targetList,
 			 * unless either OVERRIDING USER VALUE or OVERRIDING SYSTEM VALUE
 			 * is specified.
 			 */
-			if (att_tup->attidentity == ATTRIBUTE_IDENTITY_ALWAYS && !apply_default)
+			if ((att_tup->attidentity == ATTRIBUTE_IDENTITY_ALWAYS ||
+				 att_tup->attidentity == ATTRIBUTE_IDENTITY_ROW) && !apply_default)
 			{
 				if (override == OVERRIDING_USER_VALUE)
 					apply_default = true;
@@ -959,6 +960,27 @@ rewriteTargetListIU(List *targetList,
 								 errdetail("Column \"%s\" is an identity column defined as GENERATED ALWAYS.",
 										   NameStr(att_tup->attname)),
 								 errhint("Use OVERRIDING SYSTEM VALUE to override.")));
+				}
+				else if (att_tup->attidentity == ATTRIBUTE_IDENTITY_ROW &&
+						 new_tle && new_tle->expr)
+				{
+					/*
+					 * Distinguish an explicit NULL in OVERRIDING SYSTEM VALUE
+					 * from a DEFAULT (which becomes NULL to signal home
+					 * placement) by coalescing explicit NULLs to PG_INT64_MIN
+					 * so ExecConstraints reports a NOT NULL violation.
+					 */
+					CoalesceExpr *coalesce = makeNode(CoalesceExpr);
+					Const	   *sentinel = makeConst(INT8OID, -1, InvalidOid,
+													 sizeof(int64),
+													 Int64GetDatum(PG_INT64_MIN),
+													 false, true);
+
+					coalesce->coalescetype = INT8OID;
+					coalesce->coalescecollid = InvalidOid;
+					coalesce->args = list_make2(new_tle->expr, sentinel);
+					coalesce->location = -1;
+					new_tle->expr = (Expr *) coalesce;
 				}
 			}
 
@@ -1017,7 +1039,8 @@ rewriteTargetListIU(List *targetList,
 		 */
 		if (commandType == CMD_UPDATE)
 		{
-			if (att_tup->attidentity == ATTRIBUTE_IDENTITY_ALWAYS &&
+			if ((att_tup->attidentity == ATTRIBUTE_IDENTITY_ALWAYS ||
+				 att_tup->attidentity == ATTRIBUTE_IDENTITY_ROW) &&
 				new_tle && !apply_default)
 				ereport(ERROR,
 						(errcode(ERRCODE_GENERATED_ALWAYS),
@@ -1040,6 +1063,16 @@ rewriteTargetListIU(List *targetList,
 			/*
 			 * virtual generated column stores a null value; stored generated
 			 * column will be fixed in executor
+			 */
+			new_tle = NULL;
+		}
+		else if (att_tup->attidentity == ATTRIBUTE_IDENTITY_ROW && apply_default)
+		{
+			/*
+			 * On INSERT, a NULL placeholder tells heap_insert to elide the
+			 * column at its physical home (P_0, B_0, O_0).  On UPDATE SET col
+			 * = DEFAULT, omitting the TLE preserves the existing row
+			 * identity via expand_targetlist.
 			 */
 			new_tle = NULL;
 		}
@@ -1283,7 +1316,8 @@ build_column_default(Relation rel, int attrno)
 	Node	   *expr = NULL;
 	Oid			exprtype;
 
-	if (att_tup->attidentity)
+	if (att_tup->attidentity &&
+		att_tup->attidentity != ATTRIBUTE_IDENTITY_ROW)
 	{
 		NextValueExpr *nve = makeNode(NextValueExpr);
 

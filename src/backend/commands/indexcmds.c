@@ -987,10 +987,18 @@ DefineIndex(ParseState *pstate,
 	 * violate uniqueness by putting values that ought to be unique in
 	 * different partitions.
 	 *
-	 * We could lift this limitation if we had global indexes, but those have
-	 * their own problems, so this is a useful feature combination.
+	 * Exception: the internal partial row identity index on a GENERATED ALWAYS
+	 * AS ROW IDENTITY column is exempt because row identity values encode
+	 * partition_id in their high bits, guaranteeing cross-partition uniqueness.
 	 */
-	if (partitioned && (stmt->unique || exclusion))
+	if (partitioned && (stmt->unique || exclusion) &&
+		!(rel->rd_att->td_rowidentity_attno >= 0 &&
+		  indexInfo->ii_Unique &&
+		  indexInfo->ii_NumIndexAttrs == 1 &&
+		  indexInfo->ii_IndexAttrNumbers[0] == rel->rd_att->td_rowidentity_attno + 1 &&
+		  list_length(indexInfo->ii_Predicate) == 1 &&
+		  IsA(linitial(indexInfo->ii_Predicate), NullTest) &&
+		  ((NullTest *) linitial(indexInfo->ii_Predicate))->nulltesttype == IS_NULL))
 	{
 		PartitionKey key = RelationGetPartitionKey(rel);
 		const char *constraint_type;

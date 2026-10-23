@@ -7926,6 +7926,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 						  "ON (inh.inhrelid = indexrelid) "
 						  "WHERE (i.indisvalid OR t2.relkind = 'p') "
 						  "AND i.indisready "
+						  "AND NOT EXISTS ("
+						  "SELECT 1 FROM pg_catalog.pg_depend d "
+						  "WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+						  "AND d.objid = i.indexrelid "
+						  "AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+						  "AND d.refobjid = i.indrelid "
+						  "AND d.refobjsubid > 0 "
+						  "AND d.deptype = 'i') "
 						  "ORDER BY i.indrelid, indexname",
 						  tbloids->data);
 	}
@@ -9480,7 +9488,8 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 			 * ignore dropped columns here or we'd emit a spurious OVERRIDING
 			 * SYSTEM VALUE clause for the table's data.
 			 */
-			if (tbinfo->attidentity[j] == ATTRIBUTE_IDENTITY_ALWAYS &&
+			if ((tbinfo->attidentity[j] == ATTRIBUTE_IDENTITY_ALWAYS ||
+				 tbinfo->attidentity[j] == ATTRIBUTE_IDENTITY_ROW) &&
 				!tbinfo->attisdropped[j])
 				tbinfo->needs_override = true;
 
@@ -17260,7 +17269,16 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 										  tbinfo->atttypnames[j]);
 					}
 
-					if (print_default)
+					if (tbinfo->attidentity[j] == ATTRIBUTE_IDENTITY_ROW)
+					{
+						appendPQExpBufferStr(q, " GENERATED ALWAYS AS ROW IDENTITY");
+						if (print_notnull &&
+							tbinfo->notnull_constrs[j][0] == '\0' &&
+							!tbinfo->notnull_noinh[j] &&
+							!dopt->binary_upgrade)
+							print_notnull = false;
+					}
+					else if (print_default)
 					{
 						if (tbinfo->attgenerated[j] == ATTRIBUTE_GENERATED_STORED)
 							appendPQExpBuffer(q, " GENERATED ALWAYS AS (%s) STORED",

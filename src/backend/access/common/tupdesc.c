@@ -200,6 +200,9 @@ CreateTemplateTupleDesc(int natts)
 	/* This will be set to the correct value by TupleDescFinalize() */
 	desc->firstNonCachedOffsetAttr = -1;
 	desc->firstNonGuaranteedAttr = -1;
+	desc->td_rowidentity_attno = -1;
+	desc->td_partition_bits = 0;
+	desc->td_partition_prefix = 0;
 
 	return desc;
 }
@@ -272,6 +275,9 @@ CreateTupleDescCopy(TupleDesc tupdesc)
 	/* We can copy the tuple type identification, too */
 	desc->tdtypeid = tupdesc->tdtypeid;
 	desc->tdtypmod = tupdesc->tdtypmod;
+	desc->td_rowidentity_attno = tupdesc->td_rowidentity_attno;
+	desc->td_partition_bits = tupdesc->td_partition_bits;
+	desc->td_partition_prefix = tupdesc->td_partition_prefix;
 
 	TupleDescFinalize(desc);
 
@@ -321,6 +327,10 @@ CreateTupleDescTruncatedCopy(TupleDesc tupdesc, int natts)
 	/* We can copy the tuple type identification, too */
 	desc->tdtypeid = tupdesc->tdtypeid;
 	desc->tdtypmod = tupdesc->tdtypmod;
+	desc->td_rowidentity_attno =
+		(tupdesc->td_rowidentity_attno < natts) ? tupdesc->td_rowidentity_attno : -1;
+	desc->td_partition_bits = tupdesc->td_partition_bits;
+	desc->td_partition_prefix = tupdesc->td_partition_prefix;
 
 	TupleDescFinalize(desc);
 
@@ -409,6 +419,9 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 	/* We can copy the tuple type identification, too */
 	desc->tdtypeid = tupdesc->tdtypeid;
 	desc->tdtypmod = tupdesc->tdtypmod;
+	desc->td_rowidentity_attno = tupdesc->td_rowidentity_attno;
+	desc->td_partition_bits = tupdesc->td_partition_bits;
+	desc->td_partition_prefix = tupdesc->td_partition_prefix;
 
 	TupleDescFinalize(desc);
 
@@ -514,6 +527,20 @@ TupleDescFinalize(TupleDesc tupdesc)
 	int			firstNonGuaranteedAttr = tupdesc->natts;
 	int			off = 0;
 
+	if (tupdesc->td_rowidentity_attno >= 0 &&
+		(tupdesc->td_rowidentity_attno >= tupdesc->natts ||
+		 TupleDescAttr(tupdesc, tupdesc->td_rowidentity_attno)->attisdropped))
+		tupdesc->td_rowidentity_attno = -1;
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (!attr->attisdropped &&
+			attr->attidentity == ATTRIBUTE_IDENTITY_ROW)
+			tupdesc->td_rowidentity_attno = i;
+	}
+
 	for (int i = 0; i < tupdesc->natts; i++)
 	{
 		CompactAttribute *cattr = TupleDescCompactAttr(tupdesc, i);
@@ -528,16 +555,20 @@ TupleDescFinalize(TupleDesc tupdesc)
 			(cattr->attnullability != ATTNULLABLE_VALID || !cattr->attbyval ||
 			 cattr->atthasmissing || cattr->attisdropped ||
 			 cattr->attlen <= 0 ||
-			 attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL))
+			 attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ||
+			 attr->attidentity == ATTRIBUTE_IDENTITY_ROW ||
+			 i == tupdesc->td_rowidentity_attno))
 			firstNonGuaranteedAttr = i;
 
 		/*
 		 * Don't cache offsets beyond fixed-width attributes.  Virtual
-		 * generated attributes are stored as NULLs in the tuple, so we don't
-		 * cache offsets beyond these.
+		 * generated attributes and at-home row identity attributes are stored
+		 * as NULLs in the tuple, so we don't cache offsets beyond these.
 		 */
 		if (cattr->attlen <= 0 ||
-			attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ||
+			attr->attidentity == ATTRIBUTE_IDENTITY_ROW ||
+			i == tupdesc->td_rowidentity_attno)
 			break;
 
 		off = att_nominal_alignby(off, cattr->attalignby);

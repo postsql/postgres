@@ -62,6 +62,7 @@ endif
 # XXX: Need to determine proper version of the function cflags for clang
 bitcode_cflags = ['-fno-strict-aliasing', '-fwrapv']
 bitcode_cflags += get_option('c_args')
+bitcode_cflags += ['-fno-sanitize=all']
 bitcode_cflags += cppflags
 
 # XXX: Worth improving on the logic to find directories here

@@ -1095,6 +1095,7 @@ index_create(Relation heapRelation,
 		ObjectAddress myself,
 					referenced;
 		ObjectAddresses *addrs;
+		bool		is_rowid_index = false;
 
 		ObjectAddressSet(myself, RelationRelationId, indexRelationId);
 
@@ -1131,6 +1132,16 @@ index_create(Relation heapRelation,
 		{
 			bool		have_simple_col = false;
 
+			if (!concurrent &&
+				heapRelation->rd_att->td_rowidentity_attno >= 0 &&
+				indexInfo->ii_Unique &&
+				indexInfo->ii_NumIndexAttrs == 1 &&
+				indexInfo->ii_IndexAttrNumbers[0] == heapRelation->rd_att->td_rowidentity_attno + 1 &&
+				list_length(indexInfo->ii_Predicate) == 1 &&
+				IsA(linitial(indexInfo->ii_Predicate), NullTest) &&
+				((NullTest *) linitial(indexInfo->ii_Predicate))->nulltesttype == IS_NULL)
+				is_rowid_index = true;
+
 			addrs = new_object_addresses();
 
 			/* Create auto dependencies on simply-referenced columns */
@@ -1159,7 +1170,8 @@ index_create(Relation heapRelation,
 				add_exact_object_address(&referenced, addrs);
 			}
 
-			record_object_address_dependencies(&myself, addrs, DEPENDENCY_AUTO);
+			record_object_address_dependencies(&myself, addrs,
+											   is_rowid_index ? DEPENDENCY_INTERNAL : DEPENDENCY_AUTO);
 			free_object_addresses(addrs);
 		}
 
@@ -1214,7 +1226,7 @@ index_create(Relation heapRelation,
 		}
 
 		/* Store dependencies on anything mentioned in predicate */
-		if (indexInfo->ii_Predicate)
+		if (indexInfo->ii_Predicate && !is_rowid_index)
 		{
 			recordDependencyOnSingleRelExpr(&myself,
 											(Node *) indexInfo->ii_Predicate,

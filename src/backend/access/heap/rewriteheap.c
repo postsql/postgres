@@ -676,6 +676,51 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 		PageInit(page, BLCKSZ, 0);
 	}
 
+	/*
+	 * If the new relation has a GENERATED ALWAYS AS ROW IDENTITY column and
+	 * this tuple is landing at its exact home TID (B_0, O_0) in the rewritten
+	 * heap, elide the 8-byte row identity column (t_bits = 0) so Invariant 1
+	 * (0 bytes at home, 0 index entries) is preserved across VACUUM FULL and
+	 * CLUSTER.
+	 */
+	{
+		TupleDesc	new_tupdesc = RelationGetDescr(state->rs_new_rel);
+		int			rowid_attno = new_tupdesc->td_rowidentity_attno;
+
+		if (unlikely(rowid_attno >= 0) &&
+			state->rs_blockno <= RowIdMaxBlockNumber(new_tupdesc->td_partition_bits) &&
+			!HeapTupleHeaderRowIdIsAtHome(heaptup->t_data, rowid_attno))
+		{
+			OffsetNumber next_off = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+			int64		expected_home = RowIdEncodeHomeKey(new_tupdesc->td_partition_prefix,
+														   state->rs_blockno,
+														   next_off);
+
+			if (HeapTupleGetRowIdentity(heaptup, new_tupdesc) == expected_home)
+			{
+				int			replCol = rowid_attno + 1;
+				Datum		replVal = (Datum) 0;
+				bool		replNull = true;
+				HeapTuple	elided_tup;
+
+				elided_tup = heap_modify_tuple_by_cols(heaptup, new_tupdesc, 1,
+													   &replCol, &replVal, &replNull);
+				elided_tup->t_data->t_infomask =
+					(elided_tup->t_data->t_infomask & ~HEAP_XACT_MASK) |
+					(heaptup->t_data->t_infomask & HEAP_XACT_MASK);
+				elided_tup->t_data->t_infomask2 =
+					(elided_tup->t_data->t_infomask2 & ~HEAP2_XACT_MASK) |
+					(heaptup->t_data->t_infomask2 & HEAP2_XACT_MASK);
+				elided_tup->t_data->t_choice = heaptup->t_data->t_choice;
+				elided_tup->t_data->t_ctid = heaptup->t_data->t_ctid;
+
+				if (heaptup != tup)
+					heap_freetuple(heaptup);
+				heaptup = elided_tup;
+			}
+		}
+	}
+
 	/* And now we can insert the tuple into the page */
 	newoff = PageAddItem(page, heaptup->t_data, heaptup->t_len, InvalidOffsetNumber, false, true);
 	if (newoff == InvalidOffsetNumber)

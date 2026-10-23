@@ -1261,6 +1261,7 @@ cost_tidscan(Path *path, PlannerInfo *root,
 	ListCell   *l;
 	double		spc_random_page_cost;
 	uint64		enable_mask = 0;
+	bool		is_rowid = false;
 
 	/* Should only be applied to base relations */
 	Assert(baserel->relid > 0);
@@ -1275,6 +1276,7 @@ cost_tidscan(Path *path, PlannerInfo *root,
 
 	/* Count how many tuples we expect to retrieve */
 	ntuples = 0;
+
 	foreach(l, tidquals)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
@@ -1292,7 +1294,11 @@ cost_tidscan(Path *path, PlannerInfo *root,
 		{
 			/* Each element of the array yields 1 tuple */
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) qual;
+			Node	   *arg1 = (Node *) linitial(saop->args);
 			Node	   *arraynode = (Node *) lsecond(saop->args);
+
+			if (arg1 && IsA(arg1, Var) && ((Var *) arg1)->varattno > 0)
+				is_rowid = true;
 
 			ntuples += estimate_array_length(root, arraynode);
 		}
@@ -1303,7 +1309,16 @@ cost_tidscan(Path *path, PlannerInfo *root,
 		}
 		else
 		{
-			/* It's just CTID = something, count 1 tuple */
+			if (is_opclause(qual))
+			{
+				Node	   *left = get_leftop(qual);
+				Node	   *right = get_rightop(qual);
+
+				if ((left && IsA(left, Var) && ((Var *) left)->varattno > 0 && ((Var *) left)->varno == baserel->relid) ||
+					(right && IsA(right, Var) && ((Var *) right)->varattno > 0 && ((Var *) right)->varno == baserel->relid))
+					is_rowid = true;
+			}
+			/* It's just CTID/rowid = something, count 1 tuple */
 			ntuples++;
 		}
 	}
@@ -1319,8 +1334,15 @@ cost_tidscan(Path *path, PlannerInfo *root,
 							  &spc_random_page_cost,
 							  NULL);
 
-	/* disk costs --- assume each tuple on a different page */
-	run_cost += spc_random_page_cost * ntuples;
+	/*
+	 * For GENERATED ALWAYS AS ROW IDENTITY quals on small tables (<= 4 pages),
+	 * a direct slot lookup pins only the target block and inspects a single
+	 * line pointer, so scale the page cost below a full page scan.
+	 */
+	if (is_rowid && baserel->pages <= 4 && ntuples <= 4)
+		run_cost += (spc_random_page_cost * 0.1) * ntuples;
+	else
+		run_cost += spc_random_page_cost * ntuples;
 
 	/* Add scanning CPU costs */
 	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);

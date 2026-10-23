@@ -545,6 +545,13 @@ verify_heapam(PG_FUNCTION_ARGS)
 				OffsetNumber rdoffnum = ItemIdGetRedirect(ctx.itemid);
 				ItemId		rditem;
 
+				if (RelationGetDescr(ctx.rel)->td_rowidentity_attno >= 0 &&
+					OffsetNumberIsOffpageRedirect(rdoffnum))
+				{
+					lp_valid[ctx.offnum] = true;
+					continue;
+				}
+
 				if (rdoffnum < FirstOffsetNumber)
 				{
 					report_corruption(&ctx,
@@ -1697,6 +1704,22 @@ check_tuple_attribute(HeapCheckContext *ctx)
 
 	infomask = ctx->tuphdr->t_infomask;
 	thisatt = TupleDescCompactAttr(RelationGetDescr(ctx->rel), ctx->attnum);
+
+	if (ctx->attnum == RelationGetDescr(ctx->rel)->td_rowidentity_attno)
+	{
+		if (HeapTupleHeaderRowIdIsAtHome(ctx->tuphdr, ctx->attnum))
+			return true;
+		ctx->offset = att_nominal_alignby(ctx->offset, thisatt->attalignby);
+		if (ctx->tuphdr->t_hoff + ctx->offset + sizeof(int64) > ctx->lp_len)
+		{
+			report_corruption(ctx,
+							  psprintf("off-page row identity attribute extends beyond total tuple length %u",
+									   ctx->lp_len));
+			return false;
+		}
+		ctx->offset += sizeof(int64);
+		return true;
+	}
 
 	tp = (char *) ctx->tuphdr + ctx->tuphdr->t_hoff;
 

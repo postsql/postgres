@@ -229,6 +229,7 @@ MAKE_SYSCACHE(ATTNUM, pg_attribute_relid_attnum_index, 128);
 
 #define		  ATTRIBUTE_IDENTITY_ALWAYS		'a'
 #define		  ATTRIBUTE_IDENTITY_BY_DEFAULT 'd'
+#define		  ATTRIBUTE_IDENTITY_ROW		'r'
 
 #define		  ATTRIBUTE_GENERATED_STORED	's'
 #define		  ATTRIBUTE_GENERATED_VIRTUAL	'v'

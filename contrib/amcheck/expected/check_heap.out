@@ -286,6 +286,42 @@ SELECT * FROM verify_heapam('test_foreign_table',
 							endblock := NULL);
 ERROR:  cannot check relation "test_foreign_table"
 DETAIL:  This operation is not supported for foreign tables.
+-- Check that GENERATED ALWAYS AS ROW IDENTITY tables (home tuples, HOT chains,
+-- off-page moved tuples, and LP_REDIRECT_OFFPAGE_LOCAL / VACUUMED anchors) pass
+CREATE TABLE test_rowid_heap (
+    id bigint GENERATED ALWAYS AS ROW IDENTITY,
+    val text,
+    num int
+);
+ALTER TABLE test_rowid_heap ALTER COLUMN val SET STORAGE PLAIN;
+INSERT INTO test_rowid_heap (val, num) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4);
+-- Same-page HOT update
+UPDATE test_rowid_heap SET val = 'a_hot', num = 10 WHERE id = 1;
+-- Cross-page non-HOT updates creating LP_REDIRECT_OFFPAGE_LOCAL anchors (including id=1 whose low byte is 0x01)
+UPDATE test_rowid_heap SET val = repeat('W', 3000) WHERE id = 1;
+UPDATE test_rowid_heap SET val = repeat('X', 3000) WHERE id = 2;
+UPDATE test_rowid_heap SET val = repeat('Y', 3000) WHERE id = 3;
+SELECT * FROM verify_heapam('test_rowid_heap');
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
+-- Delete off-page tuple and run first VACUUM to transition anchor to LP_REDIRECT_OFFPAGE_VACUUMED
+DELETE FROM test_rowid_heap WHERE id = 3;
+VACUUM test_rowid_heap;
+SELECT * FROM verify_heapam('test_rowid_heap');
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
+-- Second VACUUM reclaims the anchor back to LP_UNUSED
+VACUUM test_rowid_heap;
+SELECT * FROM verify_heapam('test_rowid_heap');
+ blkno | offnum | attnum | msg 
+-------+--------+--------+-----
+(0 rows)
+
+DROP TABLE test_rowid_heap;
 -- cleanup
 DROP TABLE test_toast_oid;
 DROP TABLE test_toast_oid8;

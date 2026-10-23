@@ -469,6 +469,24 @@ tts_heap_copy_heap_tuple(TupleTableSlot *slot)
 	if (!hslot->tuple)
 		tts_heap_materialize(slot);
 
+	if (unlikely(slot->tts_tupleDescriptor->td_rowidentity_attno >= 0 &&
+				 ItemPointerIsValid(&hslot->tuple->t_self) &&
+				 HeapTupleHeaderRowIdIsAtHome(hslot->tuple->t_data,
+											  slot->tts_tupleDescriptor->td_rowidentity_attno)))
+	{
+		HeapTuple	res;
+
+		slot_getallattrs(slot);
+		res = heap_form_tuple(slot->tts_tupleDescriptor,
+							  slot->tts_values,
+							  slot->tts_isnull);
+		res->t_self = hslot->tuple->t_self;
+		res->t_tableOid = hslot->tuple->t_tableOid;
+		res->t_rootoff = hslot->tuple->t_rootoff;
+		res->t_data->t_ctid = hslot->tuple->t_data->t_ctid;
+		return res;
+	}
+
 	return heap_copytuple(hslot->tuple);
 }
 
@@ -479,6 +497,18 @@ tts_heap_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
 
 	if (!hslot->tuple)
 		tts_heap_materialize(slot);
+
+	if (unlikely(slot->tts_tupleDescriptor->td_rowidentity_attno >= 0 &&
+				 ItemPointerIsValid(&hslot->tuple->t_self) &&
+				 HeapTupleHeaderRowIdIsAtHome(hslot->tuple->t_data,
+											  slot->tts_tupleDescriptor->td_rowidentity_attno)))
+	{
+		slot_getallattrs(slot);
+		return heap_form_minimal_tuple(slot->tts_tupleDescriptor,
+									   slot->tts_values,
+									   slot->tts_isnull,
+									   extra);
+	}
 
 	return minimal_tuple_from_heap_tuple(hslot->tuple, extra);
 }
@@ -872,7 +902,8 @@ tts_buffer_heap_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
 	 */
 	if (dstslot->tts_ops != srcslot->tts_ops ||
 		TTS_SHOULDFREE(srcslot) ||
-		!bsrcslot->base.tuple)
+		!bsrcslot->base.tuple ||
+		srcslot->tts_tupleDescriptor->td_rowidentity_attno >= 0)
 	{
 		MemoryContext oldContext;
 
@@ -924,6 +955,24 @@ tts_buffer_heap_copy_heap_tuple(TupleTableSlot *slot)
 	if (!bslot->base.tuple)
 		tts_buffer_heap_materialize(slot);
 
+	if (unlikely(slot->tts_tupleDescriptor->td_rowidentity_attno >= 0 &&
+				 ItemPointerIsValid(&bslot->base.tuple->t_self) &&
+				 HeapTupleHeaderRowIdIsAtHome(bslot->base.tuple->t_data,
+											  slot->tts_tupleDescriptor->td_rowidentity_attno)))
+	{
+		HeapTuple	res;
+
+		slot_getallattrs(slot);
+		res = heap_form_tuple(slot->tts_tupleDescriptor,
+							  slot->tts_values,
+							  slot->tts_isnull);
+		res->t_self = bslot->base.tuple->t_self;
+		res->t_tableOid = bslot->base.tuple->t_tableOid;
+		res->t_rootoff = bslot->base.tuple->t_rootoff;
+		res->t_data->t_ctid = bslot->base.tuple->t_data->t_ctid;
+		return res;
+	}
+
 	return heap_copytuple(bslot->base.tuple);
 }
 
@@ -936,6 +985,18 @@ tts_buffer_heap_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
 
 	if (!bslot->base.tuple)
 		tts_buffer_heap_materialize(slot);
+
+	if (unlikely(slot->tts_tupleDescriptor->td_rowidentity_attno >= 0 &&
+				 ItemPointerIsValid(&bslot->base.tuple->t_self) &&
+				 HeapTupleHeaderRowIdIsAtHome(bslot->base.tuple->t_data,
+											  slot->tts_tupleDescriptor->td_rowidentity_attno)))
+	{
+		slot_getallattrs(slot);
+		return heap_form_minimal_tuple(slot->tts_tupleDescriptor,
+									   slot->tts_values,
+									   slot->tts_isnull,
+									   extra);
+	}
 
 	return minimal_tuple_from_heap_tuple(bslot->base.tuple, extra);
 }
@@ -1265,9 +1326,30 @@ slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
 		 * stored in the previous call to slot_getmissingattrs().
 		 */
 		slot_getmissingattrs(slot, HeapTupleHeaderGetNatts(tup), reqnatts);
+
+		if (unlikely(tupleDesc->td_rowidentity_attno >= 0 &&
+					 reqnatts > tupleDesc->td_rowidentity_attno &&
+					 isnull[tupleDesc->td_rowidentity_attno] &&
+					 ItemPointerIsValid(&tuple->t_self)))
+		{
+			int			rowid_attno = tupleDesc->td_rowidentity_attno;
+
+			values[rowid_attno] = Int64GetDatum(HeapTupleGetRowIdentity(tuple, tupleDesc));
+			isnull[rowid_attno] = false;
+		}
 		return;
 	}
 done:
+	if (unlikely(tupleDesc->td_rowidentity_attno >= 0 &&
+				 reqnatts > tupleDesc->td_rowidentity_attno &&
+				 isnull[tupleDesc->td_rowidentity_attno] &&
+				 ItemPointerIsValid(&tuple->t_self)))
+	{
+		int			rowid_attno = tupleDesc->td_rowidentity_attno;
+
+		values[rowid_attno] = Int64GetDatum(HeapTupleGetRowIdentity(tuple, tupleDesc));
+		isnull[rowid_attno] = false;
+	}
 
 	/* Save current offset for next execution */
 	*offp = off;
@@ -1801,7 +1883,7 @@ ExecForceStoreMinimalTuple(MinimalTuple mtup,
 	}
 	else
 	{
-		HeapTupleData htup;
+		HeapTupleData htup = {0};
 
 		ExecClearTuple(slot);
 
@@ -2175,6 +2257,22 @@ slot_getmissingattrs(TupleTableSlot *slot, int startAttNum, int lastAttNum)
 		{
 			slot->tts_values[attnum] = attrmiss[attnum].am_value;
 			slot->tts_isnull[attnum] = !attrmiss[attnum].am_present;
+		}
+	}
+
+	if (unlikely(slot->tts_tupleDescriptor->td_rowidentity_attno >= 0 &&
+				 lastAttNum > slot->tts_tupleDescriptor->td_rowidentity_attno &&
+				 slot->tts_isnull[slot->tts_tupleDescriptor->td_rowidentity_attno] &&
+				 (TTS_IS_HEAPTUPLE(slot) || TTS_IS_BUFFERTUPLE(slot))))
+	{
+		HeapTuple	tuple = ((HeapTupleTableSlot *) slot)->tuple;
+		int			rowid_attno = slot->tts_tupleDescriptor->td_rowidentity_attno;
+
+		if (tuple != NULL && ItemPointerIsValid(&tuple->t_self))
+		{
+			slot->tts_values[rowid_attno] =
+				Int64GetDatum(HeapTupleGetRowIdentity(tuple, slot->tts_tupleDescriptor));
+			slot->tts_isnull[rowid_attno] = false;
 		}
 	}
 }

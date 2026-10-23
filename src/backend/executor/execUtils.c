@@ -658,6 +658,8 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, int varno, TupleDesc tupdesc)
 			return false;		/* table contains dropped columns */
 		if (att_tup->atthasmissing)
 			return false;		/* table contains cols with missing values */
+		if (att_tup->attidentity == ATTRIBUTE_IDENTITY_ROW)
+			return false;		/* table contains elided row identity column */
 
 		/*
 		 * Note: usually the Var's type should match the tupdesc exactly, but

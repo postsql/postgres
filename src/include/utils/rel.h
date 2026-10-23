@@ -153,6 +153,7 @@ typedef struct RelationData
 	Oid			rd_pkindex;		/* OID of (deferrable?) primary key, if any */
 	bool		rd_ispkdeferrable;	/* is rd_pkindex a deferrable PK? */
 	Oid			rd_replidindex; /* OID of replica identity index, if any */
+	Oid			rd_rowidindex;	/* OID of row identity partial index, if any */
 
 	/* data managed by RelationGetStatExtList: */
 	List	   *rd_statlist;	/* list of OIDs of extended stats */
@@ -376,10 +377,35 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+	int			partition_id_bits;	/* bit width of partition_id (0..30), or -1 */
+	int			partition_bits; /* alias for partition_id_bits (0..30), or -1 */
+	int			partition_id;	/* partition_id for row identity, or -1 */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
 #define HEAP_DEFAULT_FILLFACTOR		100
+
+/*
+ * RelationGetPartitionIdBits
+ *		Returns the relation's configured partition_id_bits, or defaultbits.
+ */
+#define StdRdOptionsGetPartitionIdBits(opts, defaultbits) \
+	(((opts)->partition_id_bits >= 0) ? (opts)->partition_id_bits : \
+	 (((opts)->partition_bits >= 0) ? (opts)->partition_bits : (defaultbits)))
+
+#define RelationGetPartitionIdBits(relation, defaultbits) \
+	(((relation)->rd_options != NULL) ? \
+	 StdRdOptionsGetPartitionIdBits((StdRdOptions *) (relation)->rd_options, defaultbits) : \
+	 (defaultbits))
+
+/*
+ * RelationGetPartitionId
+ *		Returns the relation's configured partition_id, or defaultid.
+ */
+#define RelationGetPartitionId(relation, defaultid) \
+	(((relation)->rd_options && \
+	  ((StdRdOptions *) (relation)->rd_options)->partition_id >= 0) ? \
+	 ((StdRdOptions *) (relation)->rd_options)->partition_id : (defaultid))
 
 /*
  * RelationGetToastTupleTarget

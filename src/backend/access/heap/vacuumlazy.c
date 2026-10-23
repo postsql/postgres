@@ -133,6 +133,10 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
+#include "access/skey.h"
+#include "access/tableam.h"
+#include "access/tableam_indexscan.h"
 #include "access/tidstore.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
@@ -152,9 +156,12 @@
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/read_stream.h"
+#include "utils/fmgroids.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_rusage.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -446,6 +453,7 @@ static void lazy_vacuum_heap_rel(LVRelState *vacrel);
 static void lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
 								  Buffer buffer, OffsetNumber *deadoffsets,
 								  int num_offsets, Buffer vmbuffer);
+static void lazy_reclaim_offpage_redirects(LVRelState *vacrel);
 static bool lazy_check_wraparound_failsafe(LVRelState *vacrel);
 static void lazy_cleanup_all_indexes(LVRelState *vacrel);
 static IndexBulkDeleteResult *lazy_vacuum_one_index(Relation indrel,
@@ -1616,6 +1624,10 @@ lazy_scan_heap(LVRelState *vacrel)
 	if (vacrel->dead_items_info->num_items > 0)
 		lazy_vacuum(vacrel);
 
+	if (RelationGetDescr(vacrel->rel)->td_rowidentity_attno >= 0 &&
+		vacrel->do_index_vacuuming && !VacuumFailsafeActive)
+		lazy_reclaim_offpage_redirects(vacrel);
+
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or
 	 * not there were indexes, and whether or not we bypassed index vacuuming.
@@ -2414,7 +2426,8 @@ lazy_vacuum(LVRelState *vacrel)
 	 * HOT through careful tuning.
 	 */
 	bypass = false;
-	if (vacrel->consider_bypass_optimization && vacrel->rel_pages > 0)
+	if (vacrel->consider_bypass_optimization && vacrel->rel_pages > 0 &&
+		RelationGetDescr(vacrel->rel)->td_rowidentity_attno < 0)
 	{
 		BlockNumber threshold;
 
@@ -2885,6 +2898,319 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 
 	/* Revert to the previous phase information for error traceback */
 	restore_vacuum_error_info(vacrel, &saved_err_info);
+}
+
+/*
+ *	lazy_reclaim_offpage_redirects() -- Two-phase reclamation of off-page
+ *	row identity redirect tombstones:
+ *	  - LP_REDIRECT_OFFPAGE_INDEXED (0x7FFE): verify against rd_rowidindex;
+ *	    if no live/non-dead off-page tuple exists for (prefix, blkno, offnum),
+ *	    reclaim the line pointer to LP_UNUSED.
+ *	  - LP_REDIRECT_OFFPAGE_LOCAL (0x7FFF): promote to
+ *	    LP_REDIRECT_OFFPAGE_INDEXED (0x7FFE) for reclamation in the next cycle.
+ */
+static void
+lazy_reclaim_offpage_redirects(LVRelState *vacrel)
+{
+	TupleDesc	tupdesc = RelationGetDescr(vacrel->rel);
+	Oid			rowid_idx_oid;
+	Relation	rowid_idx = NULL;
+	BlockNumber new_nonempty_pages = 0;
+	LVSavedErrInfo saved_err_info;
+
+	if (tupdesc->td_rowidentity_attno < 0)
+		return;
+
+	rowid_idx_oid = RelationGetRowIdIndex(vacrel->rel);
+	if (OidIsValid(rowid_idx_oid))
+		rowid_idx = index_open(rowid_idx_oid, RowExclusiveLock);
+
+	update_vacuum_error_info(vacrel, &saved_err_info,
+							 VACUUM_ERRCB_PHASE_VACUUM_HEAP,
+							 InvalidBlockNumber, InvalidOffsetNumber);
+
+	for (BlockNumber blkno = 0; blkno < vacrel->rel_pages; blkno++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber offnum;
+		bool		has_offpage_redir = false;
+		bool		has_used = false;
+		OffsetNumber check_offs[MaxHeapTuplesPerPage];
+		bool		still_alive[MaxHeapTuplesPerPage];
+		int			ncheck = 0;
+		OffsetNumber redirected[MaxHeapTuplesPerPage * 2];
+		int			nredirected = 0;
+		OffsetNumber unused[MaxHeapTuplesPerPage];
+		int			nunused = 0;
+		Size		freespace;
+
+		CHECK_FOR_INTERRUPTS();
+		vacuum_delay_point(false);
+
+		vacrel->blkno = blkno;
+		vacrel->offnum = InvalidOffsetNumber;
+
+		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+								 vacrel->bstrategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (PageIsNew(page) || PageIsEmpty(page))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (offnum = FirstOffsetNumber;
+			 offnum <= maxoff;
+			 offnum = OffsetNumberNext(offnum))
+		{
+			ItemId		itemid = PageGetItemId(page, offnum);
+
+			if (!ItemIdIsUsed(itemid))
+				continue;
+
+			has_used = true;
+			if (ItemIdIsRedirected(itemid))
+			{
+				OffsetNumber rdoff = ItemIdGetRedirect(itemid);
+
+				if (rdoff == LP_REDIRECT_OFFPAGE_LOCAL ||
+					rdoff == LP_REDIRECT_OFFPAGE_INDEXED)
+					has_offpage_redir = true;
+			}
+		}
+
+		if (!has_offpage_redir)
+		{
+			if (has_used)
+				new_nonempty_pages = blkno + 1;
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		LockBufferForCleanup(buf);
+		page = BufferGetPage(buf);
+
+		if (!PageIsNew(page) && !PageIsEmpty(page))
+		{
+			maxoff = PageGetMaxOffsetNumber(page);
+			for (offnum = FirstOffsetNumber;
+				 offnum <= maxoff;
+				 offnum = OffsetNumberNext(offnum))
+			{
+				ItemId		itemid = PageGetItemId(page, offnum);
+
+				if (ItemIdIsRedirected(itemid) &&
+					ItemIdGetRedirect(itemid) == LP_REDIRECT_OFFPAGE_INDEXED)
+				{
+					check_offs[ncheck] = offnum;
+					still_alive[ncheck] = false;
+					ncheck++;
+				}
+			}
+		}
+
+		/*
+		 * Release buffer lock on buf while probing rowid_idx and checking
+		 * target heap pages so we never hold two buffer locks in arbitrary
+		 * block order.
+		 */
+		if (ncheck > 0)
+		{
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+			for (int i = 0; i < ncheck; i++)
+			{
+				int64		key = RowIdEncodeHomeKey(tupdesc->td_partition_prefix,
+													 blkno, check_offs[i]);
+				bool		alive = false;
+
+				if (rowid_idx != NULL)
+				{
+					IndexScanDesc iscan;
+					ScanKeyData skey;
+
+					ScanKeyInit(&skey, 1, BTEqualStrategyNumber, F_INT8EQ,
+								Int64GetDatum(key));
+					iscan = index_beginscan(vacrel->rel, rowid_idx, false,
+											SnapshotAny, NULL, 1, 0, SO_NONE);
+					index_rescan(iscan, &skey, 1, NULL, 0);
+
+					while (tableam_index_getnext_tid(iscan, ForwardScanDirection))
+					{
+						BlockNumber hblk = ItemPointerGetBlockNumber(&iscan->xs_heaptid);
+						OffsetNumber hoff = ItemPointerGetOffsetNumber(&iscan->xs_heaptid);
+						Buffer		hbuf;
+						Page		hpage;
+						OffsetNumber hmaxoff;
+						OffsetNumber cur_off;
+						int			steps = 0;
+
+						if (hblk >= RelationGetNumberOfBlocks(vacrel->rel))
+							continue;
+
+						hbuf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM,
+												  hblk, RBM_NORMAL,
+												  vacrel->bstrategy);
+						LockBuffer(hbuf, BUFFER_LOCK_SHARE);
+						hpage = BufferGetPage(hbuf);
+						if (!PageIsNew(hpage) && !PageIsEmpty(hpage))
+						{
+							hmaxoff = PageGetMaxOffsetNumber(hpage);
+							cur_off = hoff;
+							while (cur_off >= FirstOffsetNumber &&
+								   cur_off <= hmaxoff &&
+								   steps++ < MaxHeapTuplesPerPage)
+							{
+								ItemId		hlp = PageGetItemId(hpage, cur_off);
+								HeapTupleData htup;
+
+								if (!ItemIdIsUsed(hlp) || ItemIdIsDead(hlp))
+									break;
+								if (ItemIdIsRedirected(hlp))
+								{
+									if (ItemIdIsOffpageRedirect(hlp) || steps > 1)
+										break;
+									cur_off = ItemIdGetRedirect(hlp);
+									continue;
+								}
+
+								Assert(ItemIdIsNormal(hlp));
+								htup.t_tableOid = RelationGetRelid(vacrel->rel);
+								htup.t_data = (HeapTupleHeader) PageGetItem(hpage, hlp);
+								htup.t_len = ItemIdGetLength(hlp);
+								ItemPointerSet(&htup.t_self, hblk, cur_off);
+								htup.t_rootoff = hoff;
+
+								if (cur_off != hoff &&
+									!HeapTupleHeaderIsHeapOnly(htup.t_data))
+									break;
+
+								if (!HeapTupleHeaderRowIdIsAtHome(htup.t_data,
+																  tupdesc->td_rowidentity_attno) &&
+									HeapTupleGetRowIdentity(&htup, tupdesc) == key &&
+									HeapTupleSatisfiesVacuum(&htup,
+															 vacrel->cutoffs.OldestXmin,
+															 hbuf) != HEAPTUPLE_DEAD)
+								{
+									alive = true;
+									break;
+								}
+
+								if (!HeapTupleHeaderIsHotUpdated(htup.t_data) ||
+									ItemPointerGetOffsetNumber(&htup.t_data->t_ctid) == cur_off)
+									break;
+								cur_off = ItemPointerGetOffsetNumber(&htup.t_data->t_ctid);
+							}
+						}
+						UnlockReleaseBuffer(hbuf);
+						if (alive)
+							break;
+					}
+					index_endscan(iscan);
+				}
+
+				still_alive[i] = alive;
+			}
+
+			LockBufferForCleanup(buf);
+			page = BufferGetPage(buf);
+		}
+
+		if (!PageIsNew(page) && !PageIsEmpty(page))
+		{
+			int			check_idx = 0;
+
+			maxoff = PageGetMaxOffsetNumber(page);
+			for (offnum = FirstOffsetNumber;
+				 offnum <= maxoff;
+				 offnum = OffsetNumberNext(offnum))
+			{
+				ItemId		itemid = PageGetItemId(page, offnum);
+
+				while (check_idx < ncheck && check_offs[check_idx] < offnum)
+					check_idx++;
+
+				if (!ItemIdIsRedirected(itemid))
+					continue;
+
+				if (ItemIdGetRedirect(itemid) == LP_REDIRECT_OFFPAGE_INDEXED)
+				{
+					if (check_idx < ncheck &&
+						check_offs[check_idx] == offnum &&
+						!still_alive[check_idx])
+					{
+						unused[nunused++] = offnum;
+					}
+				}
+				else if (ItemIdGetRedirect(itemid) == LP_REDIRECT_OFFPAGE_LOCAL)
+				{
+					redirected[nredirected * 2] = offnum;
+					redirected[nredirected * 2 + 1] = LP_REDIRECT_OFFPAGE_INDEXED;
+					nredirected++;
+				}
+			}
+
+			if (nredirected > 0 || nunused > 0)
+			{
+				START_CRIT_SECTION();
+
+				heap_page_prune_execute(buf, false,
+										redirected, nredirected,
+										NULL, 0,
+										unused, nunused);
+
+				MarkBufferDirty(buf);
+
+				if (RelationNeedsWAL(vacrel->rel))
+				{
+					log_heap_prune_and_freeze(vacrel->rel, buf,
+											  InvalidBuffer, 0,
+											  InvalidTransactionId,
+											  true, /* cleanup lock */
+											  PRUNE_VACUUM_CLEANUP,
+											  NULL, 0,
+											  redirected, nredirected,
+											  NULL, 0,
+											  unused, nunused);
+				}
+
+				END_CRIT_SECTION();
+			}
+
+			has_used = false;
+			maxoff = PageGetMaxOffsetNumber(page);
+			for (offnum = FirstOffsetNumber;
+				 offnum <= maxoff;
+				 offnum = OffsetNumberNext(offnum))
+			{
+				if (ItemIdIsUsed(PageGetItemId(page, offnum)))
+				{
+					has_used = true;
+					break;
+				}
+			}
+			if (has_used)
+				new_nonempty_pages = blkno + 1;
+		}
+
+		freespace = PageGetHeapFreeSpace(page);
+		UnlockReleaseBuffer(buf);
+		RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
+	}
+
+	vacrel->nonempty_pages = new_nonempty_pages;
+	vacrel->blkno = InvalidBlockNumber;
+	vacrel->offnum = InvalidOffsetNumber;
+	restore_vacuum_error_info(vacrel, &saved_err_info);
+
+	if (rowid_idx != NULL)
+		index_close(rowid_idx, RowExclusiveLock);
 }
 
 /*

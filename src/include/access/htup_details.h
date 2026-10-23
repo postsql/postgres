@@ -837,6 +837,139 @@ extern MinimalTuple minimal_expand_tuple(HeapTuple sourceTuple, TupleDesc tupleD
 
 #ifndef FRONTEND
 /*
+ * 64-bit Row Identity key layout (GENERATED ALWAYS AS ROW IDENTITY):
+ *
+ * Bit 63:        0 (sign bit; keys are always positive 1 .. INT64_MAX)
+ * Bit 62:        ROWID_EXTENDED_FLAG (1 if allocated via sequence beyond ctid)
+ * Bits [61:48-S]: partition_id (P bits, where S = Max(0, P - 14))
+ * Bits [47-S:16]: BlockNumber (32 - S bits)
+ * Bits [15:0]:   OffsetNumber (16 bits, 1 .. MaxHeapTuplesPerPage)
+ */
+#define ROWID_EXTENDED_FLAG			(UINT64CONST(1) << 62)
+#define ROWID_DEFAULT_PART_BITS		14
+#define ROWID_MAX_PART_BITS			30
+
+static inline uint8
+RowIdGetBlockShift(uint8 part_bits)
+{
+	return (part_bits > ROWID_DEFAULT_PART_BITS) ?
+		(part_bits - ROWID_DEFAULT_PART_BITS) : 0;
+}
+
+static inline BlockNumber
+RowIdMaxBlockNumber(uint8 part_bits)
+{
+	uint8		shift = RowIdGetBlockShift(part_bits);
+
+	if (shift == 0)
+		return MaxBlockNumber;
+	return (BlockNumber) ((UINT64CONST(1) << (32 - shift)) - 1);
+}
+
+static inline uint64
+RowIdComputePartitionPrefix(uint32 part_id, uint8 part_bits)
+{
+	if (part_bits == 0)
+		return 0;
+	return ((uint64) part_id) << (48 - RowIdGetBlockShift(part_bits));
+}
+
+static inline int64
+RowIdEncodeHomeKey(uint64 part_prefix, BlockNumber blkno, OffsetNumber offnum)
+{
+	return (int64) (part_prefix | (((uint64) blkno) << 16) |
+					((uint64) (uint16) offnum));
+}
+
+static inline int64
+RowIdEncodeExtendedKey(uint64 part_prefix, BlockNumber blkno, OffsetNumber offnum)
+{
+	return (int64) (ROWID_EXTENDED_FLAG | part_prefix |
+					((((uint64) blkno) << 11) | ((uint64) (offnum & 0x7FF))));
+}
+
+static inline bool
+RowIdIsExtended(int64 rowid)
+{
+	return (rowid <= 0) || (((uint64) rowid & ROWID_EXTENDED_FLAG) != 0);
+}
+
+static inline uint64
+RowIdGetPartitionId(int64 rowid, uint8 part_bits)
+{
+	uint8		shift = RowIdGetBlockShift(part_bits);
+
+	if (RowIdIsExtended(rowid))
+		return 0;
+	return ((uint64) rowid) & (~UINT64CONST(0) << (48 - shift)) & ~ROWID_EXTENDED_FLAG;
+}
+
+static inline BlockNumber
+RowIdGetBlockNumber(int64 rowid, uint8 part_bits)
+{
+	uint8		shift = RowIdGetBlockShift(part_bits);
+	uint64		mask = (shift == 0) ? UINT64CONST(0xFFFFFFFF) :
+		((UINT64CONST(1) << (32 - shift)) - 1);
+
+	return (BlockNumber) (((uint64) rowid >> 16) & mask);
+}
+
+static inline OffsetNumber
+RowIdGetOffsetNumber(int64 rowid)
+{
+	return (OffsetNumber) ((uint64) rowid & UINT64CONST(0xFFFF));
+}
+
+static inline bool
+HeapTupleHeaderRowIdIsAtHome(const HeapTupleHeaderData *tup, int rowid_attno)
+{
+	Assert(rowid_attno >= 0);
+	if ((int) HeapTupleHeaderGetNatts(tup) <= rowid_attno)
+		return true;
+	if ((tup->t_infomask & HEAP_HASNULL) != 0 &&
+		att_isnull(rowid_attno, tup->t_bits))
+		return true;
+	return false;
+}
+
+static inline int64
+HeapTupleGetRowIdentity(HeapTuple tup, TupleDesc tupleDesc)
+{
+	int			rowid_attno = tupleDesc->td_rowidentity_attno;
+
+	Assert(rowid_attno >= 0);
+
+	if (HeapTupleHeaderRowIdIsAtHome(tup->t_data, rowid_attno))
+	{
+		OffsetNumber rootoff;
+
+		if (HeapTupleHeaderIsHeapOnly(tup->t_data) &&
+			tup->t_rootoff >= FirstOffsetNumber &&
+			tup->t_rootoff <= MaxHeapTuplesPerPage)
+			rootoff = tup->t_rootoff;
+		else
+			rootoff = ItemPointerGetOffsetNumber(&tup->t_self);
+
+		return RowIdEncodeHomeKey(tupleDesc->td_partition_prefix,
+								  ItemPointerGetBlockNumber(&tup->t_self),
+								  rootoff);
+	}
+	else
+	{
+		CompactAttribute *att = TupleDescCompactAttr(tupleDesc, rowid_attno);
+		Datum		val;
+
+		if (HeapTupleNoNulls(tup) && att->attcacheoff >= 0)
+			val = fetchatt(att, (char *) tup->t_data + tup->t_data->t_hoff +
+						   att->attcacheoff);
+		else
+			val = nocachegetattr(tup, rowid_attno + 1, tupleDesc);
+
+		return DatumGetInt64(val);
+	}
+}
+
+/*
  *	fastgetattr
  *		Fetch a user attribute's value as a Datum (might be either a
  *		value, or a pointer into the data area of the tuple).
@@ -869,6 +1002,22 @@ fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 	{
 		if (att_isnull(attnum - 1, tup->t_data->t_bits))
 		{
+			if (unlikely(attnum - 1 == tupleDesc->td_rowidentity_attno &&
+						 ItemPointerIsValid(&tup->t_self)))
+			{
+				OffsetNumber rootoff;
+
+				if (HeapTupleHeaderIsHeapOnly(tup->t_data) &&
+					tup->t_rootoff >= FirstOffsetNumber &&
+					tup->t_rootoff <= MaxHeapTuplesPerPage)
+					rootoff = tup->t_rootoff;
+				else
+					rootoff = ItemPointerGetOffsetNumber(&tup->t_self);
+
+				return Int64GetDatum(RowIdEncodeHomeKey(tupleDesc->td_partition_prefix,
+														ItemPointerGetBlockNumber(&tup->t_self),
+														rootoff));
+			}
 			*isnull = true;
 			return (Datum) 0;
 		}
@@ -897,7 +1046,15 @@ heap_getattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 	if (attnum > 0)
 	{
 		if (attnum > (int) HeapTupleHeaderGetNatts(tup->t_data))
+		{
+			if (unlikely(attnum - 1 == tupleDesc->td_rowidentity_attno &&
+						 ItemPointerIsValid(&tup->t_self)))
+			{
+				*isnull = false;
+				return Int64GetDatum(HeapTupleGetRowIdentity(tup, tupleDesc));
+			}
 			return getmissingattr(tupleDesc, attnum, isnull);
+		}
 		else
 			return fastgetattr(tup, attnum, tupleDesc, isnull);
 	}

@@ -4113,6 +4113,22 @@ ColConstraintElem:
 					n->location = @1;
 					$$ = (Node *) n;
 				}
+			| GENERATED generated_when AS ROW IDENTITY_P
+				{
+					Constraint *n = makeNode(Constraint);
+
+					if ($2 != ATTRIBUTE_IDENTITY_ALWAYS)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("for a row identity column, GENERATED ALWAYS must be specified"),
+								 parser_errposition(@2)));
+
+					n->contype = CONSTR_IDENTITY;
+					n->generated_when = ATTRIBUTE_IDENTITY_ROW;
+					n->options = NIL;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
 			| GENERATED generated_when AS '(' a_expr ')' opt_virtual_or_stored
 				{
 					Constraint *n = makeNode(Constraint);

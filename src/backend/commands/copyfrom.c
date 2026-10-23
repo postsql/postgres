@@ -40,6 +40,7 @@
 #include "foreign/fdwapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/miscnodes.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
@@ -1805,6 +1806,10 @@ BeginCopyFrom(ParseState *pstate,
 		{
 			Expr	   *defexpr = (Expr *) build_column_default(cstate->rel,
 																attnum);
+
+			if (defexpr == NULL && att->attidentity == ATTRIBUTE_IDENTITY_ROW)
+				defexpr = (Expr *) makeNullConst(att->atttypid, att->atttypmod,
+												 att->attcollation);
 
 			if (defexpr != NULL)
 			{

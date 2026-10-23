@@ -152,6 +152,11 @@ heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 {
 	bool		shouldFree = true;
 	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+
+	bool		rowid_was_at_home = (unlikely(rowid_attno >= 0)) ?
+		HeapTupleHeaderRowIdIsAtHome(tuple->t_data, rowid_attno) : false;
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -160,6 +165,35 @@ heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	/* Perform the insertion, and copy the resulting ItemPointer */
 	heap_insert(relation, tuple, cid, options, bistate);
 	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
+
+	if (unlikely(rowid_attno >= 0))
+	{
+		BlockNumber blkno = ItemPointerGetBlockNumber(&tuple->t_self);
+		OffsetNumber offnum = ItemPointerGetOffsetNumber(&tuple->t_self);
+
+		if (slot->tts_nvalid <= rowid_attno)
+			slot_getallattrs(slot);
+
+		if (tuple->t_rootoff != InvalidOffsetNumber)
+		{
+			slot->tts_values[rowid_attno] =
+				Int64GetDatum(RowIdEncodeHomeKey(tupdesc->td_partition_prefix,
+												 blkno, tuple->t_rootoff));
+			slot->tts_isnull[rowid_attno] = false;
+			slot->tts_flags |= TTS_FLAG_ROWID_AT_HOME;
+		}
+		else
+		{
+			if (rowid_was_at_home || slot->tts_isnull[rowid_attno])
+			{
+				slot->tts_values[rowid_attno] =
+					Int64GetDatum(RowIdEncodeExtendedKey(tupdesc->td_partition_prefix,
+														 blkno, offnum));
+				slot->tts_isnull[rowid_attno] = false;
+			}
+			slot->tts_flags &= ~TTS_FLAG_ROWID_AT_HOME;
+		}
+	}
 
 	if (shouldFree)
 		pfree(tuple);
@@ -172,6 +206,10 @@ heapam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 {
 	bool		shouldFree = true;
 	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	bool		rowid_was_at_home = (unlikely(rowid_attno >= 0)) ?
+		HeapTupleHeaderRowIdIsAtHome(tuple->t_data, rowid_attno) : false;
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -183,6 +221,35 @@ heapam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 	/* Perform the insertion, and copy the resulting ItemPointer */
 	heap_insert(relation, tuple, cid, options, bistate);
 	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
+
+	if (unlikely(rowid_attno >= 0))
+	{
+		BlockNumber blkno = ItemPointerGetBlockNumber(&tuple->t_self);
+		OffsetNumber offnum = ItemPointerGetOffsetNumber(&tuple->t_self);
+
+		if (slot->tts_nvalid <= rowid_attno)
+			slot_getallattrs(slot);
+
+		if (tuple->t_rootoff != InvalidOffsetNumber)
+		{
+			slot->tts_values[rowid_attno] =
+				Int64GetDatum(RowIdEncodeHomeKey(tupdesc->td_partition_prefix,
+												 blkno, tuple->t_rootoff));
+			slot->tts_isnull[rowid_attno] = false;
+			slot->tts_flags |= TTS_FLAG_ROWID_AT_HOME;
+		}
+		else
+		{
+			if (rowid_was_at_home || slot->tts_isnull[rowid_attno])
+			{
+				slot->tts_values[rowid_attno] =
+					Int64GetDatum(RowIdEncodeExtendedKey(tupdesc->td_partition_prefix,
+														 blkno, offnum));
+				slot->tts_isnull[rowid_attno] = false;
+			}
+			slot->tts_flags &= ~TTS_FLAG_ROWID_AT_HOME;
+		}
+	}
 
 	if (shouldFree)
 		pfree(tuple);
@@ -222,8 +289,15 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	int			rowid_attno = tupdesc->td_rowidentity_attno;
+	HeapTuple	tuple;
 	TM_Result	result;
+
+	if (unlikely(rowid_attno >= 0 && slot->tts_nvalid <= rowid_attno))
+		slot_getallattrs(slot);
+
+	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -233,6 +307,14 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 						 crosscheck, wait,
 						 tmfd, lockmode, update_indexes);
 	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
+
+	if (result == TM_Ok && unlikely(rowid_attno >= 0))
+	{
+		if (tuple->t_rootoff != InvalidOffsetNumber)
+			slot->tts_flags |= TTS_FLAG_ROWID_AT_HOME;
+		else
+			slot->tts_flags &= ~TTS_FLAG_ROWID_AT_HOME;
+	}
 
 	/*
 	 * Decide whether new index entries are needed for the tuple
@@ -1108,6 +1190,9 @@ heapam_scan_analyze_next_tuple(TableScanDesc scan,
 
 		if (sample_it)
 		{
+			targtuple->t_rootoff = (RelationGetDescr(scan->rs_rd)->td_rowidentity_attno >= 0) ?
+				heap_get_tuple_rootoff(targpage, hscan->rs_cindex, targtuple->t_data) :
+				InvalidOffsetNumber;
 			ExecStoreBufferHeapTuple(targtuple, slot, hscan->rs_cbuf);
 			hscan->rs_cindex++;
 
@@ -1123,6 +1208,33 @@ heapam_scan_analyze_next_tuple(TableScanDesc scan,
 	/* also prevent old slot contents from having pin on page */
 	ExecClearTuple(slot);
 
+	return false;
+}
+
+static inline bool
+IsRowIdBackingIndex(Relation heapRelation, Relation indexRelation,
+					IndexInfo *indexInfo)
+{
+	int			rowid_attno = RelationGetDescr(heapRelation)->td_rowidentity_attno;
+
+	if (rowid_attno < 0)
+		return false;
+	if (RelationGetRelid(indexRelation) == RelationGetRowIdIndex(heapRelation))
+		return true;
+	if (indexInfo != NULL &&
+		indexInfo->ii_Unique &&
+		indexInfo->ii_NumIndexKeyAttrs == 1 &&
+		indexInfo->ii_IndexAttrNumbers[0] == (AttrNumber) (rowid_attno + 1) &&
+		list_length(indexInfo->ii_Predicate) == 1 &&
+		IsA(linitial(indexInfo->ii_Predicate), NullTest))
+	{
+		NullTest   *nt = (NullTest *) linitial(indexInfo->ii_Predicate);
+
+		if (nt->nulltesttype == IS_NULL &&
+			IsA(nt->arg, Var) &&
+			((Var *) nt->arg)->varattno == (AttrNumber) (rowid_attno + 1))
+			return true;
+	}
 	return false;
 }
 
@@ -1142,6 +1254,7 @@ heapam_index_build_range_scan(Relation heapRelation,
 	HeapScanDesc hscan;
 	bool		is_system_catalog;
 	bool		checking_uniqueness;
+	bool		is_rowid_index;
 	HeapTuple	heapTuple;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
@@ -1164,6 +1277,7 @@ heapam_index_build_range_scan(Relation heapRelation,
 
 	/* Remember if it's a system catalog */
 	is_system_catalog = IsSystemRelation(heapRelation);
+	is_rowid_index = IsRowIdBackingIndex(heapRelation, indexRelation, indexInfo);
 
 	/* See whether we're verifying uniqueness/exclusion properties */
 	checking_uniqueness = (indexInfo->ii_Unique ||
@@ -1187,7 +1301,8 @@ heapam_index_build_range_scan(Relation heapRelation,
 	econtext->ecxt_scantuple = slot;
 
 	/* Set up execution state for predicate, if any. */
-	predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+	predicate = is_rowid_index ? NULL :
+		ExecPrepareQual(indexInfo->ii_Predicate, estate);
 
 	/*
 	 * Prepare for scan of the base relation.  In a normal index build, we use
@@ -1585,6 +1700,15 @@ heapam_index_build_range_scan(Relation heapRelation,
 			reltuples += 1;
 		}
 
+		/*
+		 * The implicit ROW IDENTITY B-tree index only indexes off-home
+		 * tuples. Skip tuples whose ROW IDENTITY is elided at home.
+		 */
+		if (unlikely(is_rowid_index &&
+					 HeapTupleHeaderRowIdIsAtHome(heapTuple->t_data,
+												  RelationGetDescr(heapRelation)->td_rowidentity_attno)))
+			continue;
+
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
 		/* Set up for predicate or expression evaluation */
@@ -1721,6 +1845,7 @@ heapam_index_validate_scan(Relation heapRelation,
 	OffsetNumber root_offsets[MaxHeapTuplesPerPage];
 	bool		in_index[MaxHeapTuplesPerPage];
 	BlockNumber previous_blkno = InvalidBlockNumber;
+	bool		is_rowid_index;
 
 	/* state variables for the merge */
 	ItemPointer indexcursor = NULL;
@@ -1731,6 +1856,7 @@ heapam_index_validate_scan(Relation heapRelation,
 	 * sanity checks
 	 */
 	Assert(OidIsValid(indexRelation->rd_rel->relam));
+	is_rowid_index = IsRowIdBackingIndex(heapRelation, indexRelation, indexInfo);
 
 	/*
 	 * Need an EState for evaluation of index expressions and partial-index
@@ -1745,7 +1871,8 @@ heapam_index_validate_scan(Relation heapRelation,
 	econtext->ecxt_scantuple = slot;
 
 	/* Set up execution state for predicate, if any. */
-	predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+	predicate = is_rowid_index ? NULL :
+		ExecPrepareQual(indexInfo->ii_Predicate, estate);
 
 	/*
 	 * Prepare for scan of the base relation.  We need just those tuples
@@ -1784,6 +1911,15 @@ heapam_index_validate_scan(Relation heapRelation,
 										 hscan->rs_cblock);
 			previous_blkno = hscan->rs_cblock;
 		}
+
+		/*
+		 * The implicit ROW IDENTITY B-tree index only indexes off-home
+		 * tuples. Skip tuples whose ROW IDENTITY is elided at home.
+		 */
+		if (unlikely(is_rowid_index &&
+					 HeapTupleHeaderRowIdIsAtHome(heapTuple->t_data,
+												  RelationGetDescr(heapRelation)->td_rowidentity_attno)))
+			continue;
 
 		/*
 		 * As commented in table_index_build_scan, we should index heap-only
@@ -2112,6 +2248,20 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 	hscan->rs_ctup.t_len = ItemIdGetLength(lp);
 	hscan->rs_ctup.t_tableOid = scan->rs_rd->rd_id;
 	ItemPointerSet(&hscan->rs_ctup.t_self, hscan->rs_cblock, targoffset);
+	if (unlikely(RelationGetDescr(scan->rs_rd)->td_rowidentity_attno >= 0))
+	{
+		if (!HeapTupleHeaderIsHeapOnly(hscan->rs_ctup.t_data))
+			hscan->rs_ctup.t_rootoff = targoffset;
+		else
+		{
+			LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+			hscan->rs_ctup.t_rootoff =
+				heap_get_tuple_rootoff(page, targoffset, hscan->rs_ctup.t_data);
+			LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+		}
+	}
+	else
+		hscan->rs_ctup.t_rootoff = InvalidOffsetNumber;
 
 	pgstat_count_heap_fetch(scan->rs_rd);
 
@@ -2285,6 +2435,22 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 			if (!visible)
 				continue;
 
+			if (unlikely(RelationGetDescr(scan->rs_rd)->td_rowidentity_attno >= 0))
+			{
+				if (!HeapTupleHeaderIsHeapOnly(tuple->t_data))
+					tuple->t_rootoff = tupoffset;
+				else if (!pagemode)
+					tuple->t_rootoff = heap_get_tuple_rootoff(page, tupoffset, tuple->t_data);
+				else
+				{
+					LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+					tuple->t_rootoff = heap_get_tuple_rootoff(page, tupoffset, tuple->t_data);
+					LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+				}
+			}
+			else
+				tuple->t_rootoff = InvalidOffsetNumber;
+
 			/* Found visible tuple, return it. */
 			if (!pagemode)
 				LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
@@ -2397,6 +2563,9 @@ reform_tuple(HeapTuple tuple, Relation OldHeap, Relation NewHeap,
 	TupleDesc	oldTupDesc = RelationGetDescr(OldHeap);
 	TupleDesc	newTupDesc = RelationGetDescr(NewHeap);
 	bool		needs_reform = false;
+
+	if (unlikely(newTupDesc->td_rowidentity_attno >= 0))
+		needs_reform = true;
 
 	/*
 	 * A short tuple might require values from attmissing val, so activate the
