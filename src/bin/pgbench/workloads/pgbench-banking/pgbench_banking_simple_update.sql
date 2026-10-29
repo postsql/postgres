@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-b (modernized, database-function based Simple-Update transaction)
+-- pgbench-banking (modernized, database-function based Simple-Update transaction)
 --
 -- Executes the standard 3-statement Simple-Update transaction inside a single
 -- stored procedure call, eliminating client-server roundtrips and
@@ -24,4 +24,4 @@
 \set tid random(1, 10 * :scale)
 \set delta random(-5000, 5000)
 
-CALL pgbench_b_simple_update(:aid, :bid, :tid, :delta);
+CALL pgbench_banking_simple_update(:aid, :bid, :tid, :delta);

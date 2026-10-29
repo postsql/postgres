@@ -12,7 +12,7 @@
  */
 
 --
--- TPC-E Trade-Result and Market-Feed Transaction Script
+-- pgbench-brokerage Trade-Result and Market-Feed Transaction Script
 --
 
 \set num_trades (300 * :scale)
@@ -23,5 +23,5 @@
 \set s_symb format_string('SYM%06d', :sec_idx)
 \set feed_qty random(1, 10) * 100
 
-CALL pgbench_e_trade_result(:t_id, :trade_price);
-CALL tpce_market_feed(:s_symb, :trade_price, :feed_qty);
+CALL pgbench_brokerage_trade_result(:t_id, :trade_price);
+CALL pgbench_brokerage_market_feed(:s_symb, :trade_price, :feed_qty);

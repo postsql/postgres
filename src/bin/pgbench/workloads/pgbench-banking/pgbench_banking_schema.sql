@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-b (modernized, database-function based workload)
+-- pgbench-banking (modernized, database-function based workload)
 -- Schema DDL and Server-Side Stored Procedures
 --
 
@@ -61,7 +61,7 @@ CREATE TABLE pgbench_history (
 -- procedure call, eliminating client-server roundtrips and running cleanly
 -- under PostgreSQL autocommit mode.
 --
-CREATE OR REPLACE PROCEDURE pgbench_b_transaction(
+CREATE OR REPLACE PROCEDURE pgbench_banking_transaction(
     p_aid integer,
     p_bid integer,
     p_tid integer,
@@ -92,7 +92,7 @@ $$;
 --
 -- Modernized Simple-Update transaction procedure
 --
-CREATE OR REPLACE PROCEDURE pgbench_b_simple_update(
+CREATE OR REPLACE PROCEDURE pgbench_banking_simple_update(
     p_aid integer,
     p_bid integer,
     p_tid integer,

@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-b (Select-Only query)
+-- pgbench-banking (Select-Only query)
 --
 -- Executes the standard single-statement Select-Only query against pgbench_accounts.
 --

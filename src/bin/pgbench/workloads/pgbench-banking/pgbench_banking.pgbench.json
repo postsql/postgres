@@ -1,5 +1,5 @@
 {
-  "suite": "pgbench-b",
+  "suite": "pgbench-banking",
   "description": "Modernized banking OLTP workload using server-side stored procedures (pgbench_banking_transaction)",
   "scale": 10,
   "no_vacuum": true,

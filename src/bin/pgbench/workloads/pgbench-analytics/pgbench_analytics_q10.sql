@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 10: Returned Item Reporting Query
+-- pgbench-analytics (TPC-H-inspired) Query 10: Returned Item Reporting Query
 --
 
 \set m_off random(0, 23)

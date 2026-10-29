@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 19: Discounted Revenue Query
+-- pgbench-analytics (TPC-H-inspired) Query 19: Discounted Revenue Query
 --
 
 \set b1 format_string('Brand#%d%d', random(1, 5), random(1, 5))

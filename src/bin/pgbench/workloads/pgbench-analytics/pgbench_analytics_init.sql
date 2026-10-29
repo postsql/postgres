@@ -12,10 +12,10 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Parallel In-Database Data Generation Script for pgbench
+-- pgbench-analytics (TPC-H-inspired) Parallel In-Database Data Generation Script for pgbench
 --
 -- Usage:
---   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_h_init.sql
+--   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_analytics_init.sql
 --
 -- Optional density overrides (via -D):
 --   supp_per_scale   (default: 100;  full TPC-H: 10000)

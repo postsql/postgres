@@ -193,7 +193,7 @@ CREATE TABLE settlement (
 --
 -- TPC-E: Trade-Order Transaction
 --
-CREATE OR REPLACE PROCEDURE pgbench_e_trade_order(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_trade_order(
     p_ca_id        bigint,
     p_s_symb       text,
     p_tt_id        text,
@@ -264,7 +264,7 @@ $$;
 --
 -- TPC-E: Trade-Result Transaction
 --
-CREATE OR REPLACE PROCEDURE pgbench_e_trade_result(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_trade_result(
     p_t_id        bigint,
     p_trade_price numeric
 ) LANGUAGE plpgsql AS $$
@@ -354,7 +354,7 @@ $$;
 --
 -- TPC-E: Trade-Lookup Transaction
 --
-CREATE OR REPLACE PROCEDURE tpce_trade_lookup(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_trade_lookup(
     p_ca_id      bigint,
     p_max_trades integer
 ) LANGUAGE plpgsql AS $$
@@ -376,7 +376,7 @@ $$;
 --
 -- TPC-E: Trade-Update Transaction
 --
-CREATE OR REPLACE PROCEDURE tpce_trade_update(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_trade_update(
     p_ca_id       bigint,
     p_max_updates integer
 ) LANGUAGE plpgsql AS $$
@@ -396,7 +396,7 @@ $$;
 --
 -- TPC-E: Trade-Status Transaction
 --
-CREATE OR REPLACE PROCEDURE pgbench_e_trade_status(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_trade_status(
     p_ca_id bigint
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -418,27 +418,39 @@ $$;
 --
 -- TPC-E: Customer-Position Transaction
 --
-CREATE OR REPLACE PROCEDURE pgbench_e_customer_position(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_customer_position(
     p_c_id        bigint,
-    p_ca_id       bigint,
     p_get_history boolean
 ) LANGUAGE plpgsql AS $$
 DECLARE
+    v_ca_id  bigint;
     v_assets numeric(14,2);
     v_hist   integer;
 BEGIN
-    SELECT COALESCE(sum(hs.hs_qty * lt.lt_price), 0)
-      INTO v_assets
-      FROM holding_summary hs
-      JOIN last_trade lt ON lt.lt_s_symb = hs.hs_s_symb
-     WHERE hs.hs_ca_id = p_ca_id;
+    -- Frame 1: Identify customer account
+    SELECT ca_id
+      INTO v_ca_id
+      FROM customer_account
+     WHERE ca_c_id = p_c_id
+     ORDER BY ca_id
+     LIMIT 1;
 
-    IF p_get_history THEN
-        SELECT count(*)
-          INTO v_hist
-          FROM trade t
-          JOIN trade_history th ON th.th_t_id = t.t_id
-         WHERE t.t_ca_id = p_ca_id;
+    -- Frame 2: Customer account holdings summary
+    IF v_ca_id IS NOT NULL THEN
+        SELECT COALESCE(sum(hs.hs_qty * lt.lt_price), 0)
+          INTO v_assets
+          FROM holding_summary hs
+          JOIN last_trade lt ON lt.lt_s_symb = hs.hs_s_symb
+         WHERE hs.hs_ca_id = v_ca_id;
+
+        -- Frame 3: Trade history for the account
+        IF p_get_history THEN
+            SELECT count(*)
+              INTO v_hist
+              FROM trade t
+              JOIN trade_history th ON th.th_t_id = t.t_id
+             WHERE t.t_ca_id = v_ca_id;
+        END IF;
     END IF;
 END;
 $$;
@@ -446,7 +458,7 @@ $$;
 --
 -- TPC-E: Broker-Volume Transaction
 --
-CREATE OR REPLACE PROCEDURE pgbench_e_broker_volume(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_broker_volume(
     p_b_id_min bigint,
     p_b_id_max bigint
 ) LANGUAGE plpgsql AS $$
@@ -464,7 +476,7 @@ $$;
 --
 -- TPC-E: Market-Watch Transaction
 --
-CREATE OR REPLACE PROCEDURE pgbench_e_market_watch(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_market_watch(
     p_wl_id      bigint,
     p_co_id_min  bigint,
     p_co_id_max  bigint,
@@ -488,7 +500,7 @@ $$;
 --
 -- TPC-E: Security-Detail Transaction
 --
-CREATE OR REPLACE PROCEDURE tpce_security_detail(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_security_detail(
     p_s_symb text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -507,7 +519,7 @@ $$;
 --
 -- TPC-E: Market-Feed Transaction
 --
-CREATE OR REPLACE PROCEDURE tpce_market_feed(
+CREATE OR REPLACE PROCEDURE pgbench_brokerage_market_feed(
     p_s_symb text,
     p_price  numeric,
     p_qty    integer

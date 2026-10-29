@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 3: Shipping Priority Query
+-- pgbench-analytics (TPC-H-inspired) Query 3: Shipping Priority Query
 --
 
 \set seg_idx random(0, 4)

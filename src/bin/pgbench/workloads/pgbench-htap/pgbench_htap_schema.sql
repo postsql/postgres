@@ -184,7 +184,7 @@ CREATE TABLE htap_supplier (
     su_comment   varchar(101) NOT NULL
 );
 
-CREATE OR REPLACE PROCEDURE pgbench_c_new_order(
+CREATE OR REPLACE PROCEDURE pgbench_order_new_order(
     p_w_id    integer,
     p_d_id    integer,
     p_c_id    integer,
@@ -274,7 +274,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE pgbench_c_payment(
+CREATE OR REPLACE PROCEDURE pgbench_order_payment(
     p_w_id     integer,
     p_d_id     integer,
     p_c_w_id   integer,
@@ -313,7 +313,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE pgbench_c_order_status(
+CREATE OR REPLACE PROCEDURE pgbench_order_order_status(
     p_w_id   integer,
     p_d_id   integer,
     p_c_id   integer,
@@ -341,7 +341,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE pgbench_c_delivery(
+CREATE OR REPLACE PROCEDURE pgbench_order_delivery(
     p_w_id         integer,
     p_d_id         integer,
     p_o_carrier_id integer
@@ -383,7 +383,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE pgbench_c_stock_level(
+CREATE OR REPLACE PROCEDURE pgbench_order_stock_level(
     p_w_id      integer,
     p_d_id      integer,
     p_threshold integer,

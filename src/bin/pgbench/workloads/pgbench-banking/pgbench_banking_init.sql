@@ -12,11 +12,11 @@
  */
 
 --
--- pgbench-b (modernized, database-function based workload)
+-- pgbench-banking (modernized, database-function based workload)
 -- Parallel In-Database Data Generation Script for pgbench
 --
 -- Usage:
---   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_b_init.sql
+--   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_banking_init.sql
 --
 
 SELECT

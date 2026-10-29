@@ -1,5 +1,5 @@
 {
-  "suite": "pgbench-h",
+  "suite": "pgbench-analytics",
   "description": "TPC-H-inspired decision support analytical query streams (Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19) with concurrent RF1/RF2 refresh stream",
   "scale": 1,
   "no_vacuum": true,

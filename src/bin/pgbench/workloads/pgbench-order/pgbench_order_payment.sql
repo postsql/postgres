@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-c (TPC-C-inspired) Payment Transaction Script
+-- pgbench-order (TPC-C-inspired) Payment Transaction Script
 --
 -- Features:
 --   - 85% home warehouse / 15% remote warehouse selection
@@ -36,9 +36,9 @@
 
 \if random(1, 100) <= 60
   \set c_last c_last(nurand(255, 0, 999))
-  CALL pgbench_c_payment(:w_id, :d_id, :c_w_id, :c_d_id, NULL, :c_last, :h_amount);
+  CALL pgbench_order_payment(:w_id, :d_id, :c_w_id, :c_d_id, NULL, :c_last, :h_amount);
 \else
   \set c_id nurand(1023, 1, 30)
-  CALL pgbench_c_payment(:w_id, :d_id, :c_w_id, :c_d_id, :c_id, NULL, :h_amount);
+  CALL pgbench_order_payment(:w_id, :d_id, :c_w_id, :c_d_id, :c_id, NULL, :h_amount);
 \endif
 \think_time random_exponential(1, 5, 2.0) ms

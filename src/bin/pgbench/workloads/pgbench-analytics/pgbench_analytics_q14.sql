@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 14: Promotion Effect Query
+-- pgbench-analytics (TPC-H-inspired) Query 14: Promotion Effect Query
 --
 
 \set m_off random(0, 59)

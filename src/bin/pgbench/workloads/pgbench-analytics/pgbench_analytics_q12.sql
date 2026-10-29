@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 12: Shipping Modes and Order Priority Query
+-- pgbench-analytics (TPC-H-inspired) Query 12: Shipping Modes and Order Priority Query
 --
 
 \set yr_off random(0, 4)

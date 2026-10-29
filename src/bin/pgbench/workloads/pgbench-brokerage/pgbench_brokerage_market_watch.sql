@@ -12,7 +12,7 @@
  */
 
 --
--- TPC-E Market-Watch and Security-Detail Transaction Script
+-- pgbench-brokerage Market-Watch and Security-Detail Transaction Script
 --
 
 \set wl_id random(1, 100 * :scale)
@@ -21,5 +21,5 @@
 \set sec_idx random_zipfian(1, 100 * :scale, 1.2)
 \set s_symb format_string('SYM%06d', :sec_idx)
 
-CALL pgbench_e_market_watch(:wl_id, :co_min, :co_max, 0);
-CALL tpce_security_detail(:s_symb);
+CALL pgbench_brokerage_market_watch(:wl_id, :co_min, :co_max, 0);
+CALL pgbench_brokerage_security_detail(:s_symb);

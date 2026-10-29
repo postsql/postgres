@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-b Post-Load Constraints, Indexes, and Vacuum Analyze
+-- pgbench-banking Post-Load Constraints, Indexes, and Vacuum Analyze
 --
 
 ALTER TABLE pgbench_branches ADD PRIMARY KEY (bid);

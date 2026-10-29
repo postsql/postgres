@@ -12,10 +12,10 @@
  */
 
 --
--- pgbench-ds (TPC-DS-inspired) Parallel In-Database Data Generation Script for pgbench
+-- pgbench-retail (TPC-DS-inspired) Parallel In-Database Data Generation Script for pgbench
 --
 -- Usage:
---   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_ds_init.sql
+--   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_retail_init.sql
 --
 -- Optional density overrides (via -D):
 --   days_count      (default: 730;  2 years 2000-01-01..2001-12-30)

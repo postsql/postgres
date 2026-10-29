@@ -38,22 +38,22 @@
     \set i_ids[:ol_cnt - 1] -1
   \endif
   \try
-  CALL pgbench_c_new_order(:w_id, :d_id, :c_id, :ol_cnt, :i_ids, :s_w_ids, :qtys);
+  CALL pgbench_order_new_order(:w_id, :d_id, :c_id, :ol_cnt, :i_ids, :s_w_ids, :qtys);
   \catch 'P0001'
   \endtry
 \elif :tx_type <= 88
   \set c_id nurand(1023, 1, 30)
   \set h_amount random(100, 50000) / 100.0
-  CALL pgbench_c_payment(:w_id, :d_id, :w_id, :d_id, :c_id, NULL, :h_amount);
+  CALL pgbench_order_payment(:w_id, :d_id, :w_id, :d_id, :c_id, NULL, :h_amount);
 \elif :tx_type <= 92
   \set c_id nurand(1023, 1, 30)
-  CALL pgbench_c_order_status(:w_id, :d_id, :c_id, NULL);
+  CALL pgbench_order_order_status(:w_id, :d_id, :c_id, NULL);
 \elif :tx_type <= 96
   \set carrier random(1, 10)
   \for del_d 1 .. 10 BY 1
-    CALL pgbench_c_delivery(:w_id, :del_d, :carrier);
+    CALL pgbench_order_delivery(:w_id, :del_d, :carrier);
   \endfor
 \else
   \set threshold random(10, 20)
-  CALL pgbench_c_stock_level(:w_id, :d_id, :threshold, 0);
+  CALL pgbench_order_stock_level(:w_id, :d_id, :threshold, 0);
 \endif

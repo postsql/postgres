@@ -1,5 +1,5 @@
 {
-  "suite": "pgbench-c",
+  "suite": "pgbench-order",
   "description": "TPC-C-inspired order-entry OLTP workload (New-Order 45%, Payment 43%, Order-Status 4%, Delivery 4%, Stock-Level 4%)",
   "scale": 4,
   "no_vacuum": true,

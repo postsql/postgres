@@ -27,6 +27,7 @@ NAME_MAPPINGS = [
     ("pgbench_b_", "pgbench_banking_"),
     ("pgbench_c_", "pgbench_order_"),
     ("pgbench_e_", "pgbench_brokerage_"),
+    ("tpce_", "pgbench_brokerage_"),
     ("pgbench_h_", "pgbench_analytics_"),
     ("pgbench_ds_", "pgbench_retail_"),
 

@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-c (TPC-C-inspired) New-Order Transaction Script
+-- pgbench-order (TPC-C-inspired) New-Order Transaction Script
 --
 -- Features:
 --   - \keying_time and \think_time pacing
@@ -48,7 +48,7 @@
 \endif
 
 \try
-CALL pgbench_c_new_order(:w_id, :d_id, :c_id, :ol_cnt, :i_ids, :s_w_ids, :qtys);
+CALL pgbench_order_new_order(:w_id, :d_id, :c_id, :ol_cnt, :i_ids, :s_w_ids, :qtys);
 \catch 'P0001'
 \endtry
 \think_time random_exponential(1, 5, 2.0) ms

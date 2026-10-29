@@ -116,3 +116,75 @@ CREATE TABLE lineitem (
     l_comment       varchar(44) NOT NULL,
     PRIMARY KEY (l_orderkey, l_linenumber)
 );
+
+--
+-- RF1: Batch Insert Refresh Function
+--
+CREATE OR REPLACE PROCEDURE pgbench_analytics_rf1(
+    p_base_okey  bigint,
+    p_batch_size integer,
+    p_scale      integer
+) LANGUAGE plpgsql AS $$
+DECLARE
+    i       integer;
+    v_okey  bigint;
+    v_ckey  bigint;
+    v_pkey  bigint;
+    v_skey  bigint;
+    v_odate date;
+    v_sdate date;
+    v_cdate date;
+    v_rdate date;
+BEGIN
+    FOR i IN 1 .. p_batch_size LOOP
+        v_okey := p_base_okey + i;
+        v_ckey := 1 + floor(random() * (300 * p_scale))::bigint;
+        v_pkey := 1 + floor(random() * (400 * p_scale))::bigint;
+        v_skey := 1 + floor(random() * (100 * p_scale))::bigint;
+        v_odate := DATE '1995-01-01' + floor(random() * 1001)::integer;
+        v_sdate := v_odate + (1 + floor(random() * 30))::integer;
+        v_cdate := v_odate + 15;
+        v_rdate := v_sdate + 5;
+
+        INSERT INTO orders (
+            o_orderkey, o_custkey, o_orderstatus, o_totalprice,
+            o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment
+        ) VALUES (
+            v_okey, v_ckey, 'O', 1250.00,
+            v_odate, '3-MEDIUM', 'Clerk#' || lpad(i::text, 9, '0'), 0, 'RF1 refresh order'
+        ) ON CONFLICT (o_orderkey) DO NOTHING;
+
+        INSERT INTO lineitem (
+            l_orderkey, l_partkey, l_suppkey, l_linenumber,
+            l_quantity, l_extendedprice, l_discount, l_tax,
+            l_returnflag, l_linestatus,
+            l_shipdate, l_commitdate, l_receiptdate,
+            l_shipinstruct, l_shipmode, l_comment
+        ) VALUES (
+            v_okey, v_pkey, v_skey, 1,
+            10.00, 1250.00, 0.05, 0.02,
+            'N', 'O',
+            v_sdate, v_cdate, v_rdate,
+            'DELIVER IN PERSON', 'AIR', 'RF1 refresh lineitem'
+        ) ON CONFLICT (l_orderkey, l_linenumber) DO NOTHING;
+    END LOOP;
+END;
+$$;
+
+--
+-- RF2: Batch Delete Refresh Function
+--
+CREATE OR REPLACE PROCEDURE pgbench_analytics_rf2(
+    p_base_okey  bigint,
+    p_batch_size integer
+) LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM lineitem
+     WHERE l_orderkey > p_base_okey
+       AND l_orderkey <= p_base_okey + p_batch_size;
+
+    DELETE FROM orders
+     WHERE o_orderkey > p_base_okey
+       AND o_orderkey <= p_base_okey + p_batch_size;
+END;
+$$;

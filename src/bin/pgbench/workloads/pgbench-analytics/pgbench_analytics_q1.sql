@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 1: Pricing Summary Report Query
+-- pgbench-analytics (TPC-H-inspired) Query 1: Pricing Summary Report Query
 --
 
 \set delta random(60, 120)

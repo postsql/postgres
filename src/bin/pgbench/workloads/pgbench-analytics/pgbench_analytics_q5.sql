@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 5: Local Supplier Volume Query
+-- pgbench-analytics (TPC-H-inspired) Query 5: Local Supplier Volume Query
 --
 
 \set reg_idx random(0, 4)

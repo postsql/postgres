@@ -225,3 +225,44 @@ CREATE TABLE inventory (
     inv_quantity_on_hand integer,
     PRIMARY KEY (inv_date_sk, inv_item_sk, inv_warehouse_sk)
 );
+
+--
+-- Data Maintenance Batch Refresh Procedure
+--
+CREATE OR REPLACE PROCEDURE pgbench_retail_maintenance(
+    p_base_ticket bigint,
+    p_batch_size  integer,
+    p_scale       integer
+) LANGUAGE plpgsql AS $$
+DECLARE
+    i       integer;
+    v_t_num bigint;
+    v_d_sk  integer;
+    v_i_sk  bigint;
+    v_c_sk  bigint;
+BEGIN
+    FOR i IN 1 .. p_batch_size LOOP
+        v_t_num := p_base_ticket + i;
+        v_d_sk := 1 + floor(random() * 730)::integer;
+        v_i_sk := 1 + floor(random() * (200 * p_scale))::bigint;
+        v_c_sk := 1 + floor(random() * (200 * p_scale))::bigint;
+
+        INSERT INTO store_sales (
+            ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_cdemo_sk, ss_addr_sk,
+            ss_store_sk, ss_promo_sk, ss_ticket_number, ss_quantity,
+            ss_wholesale_cost, ss_list_price, ss_sales_price,
+            ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost,
+            ss_ext_list_price, ss_ext_tax, ss_coupon_amt, ss_net_paid, ss_net_profit
+        ) VALUES (
+            v_d_sk, v_i_sk, v_c_sk, v_c_sk, v_c_sk,
+            1, 1, v_t_num, 5,
+            20.00, 40.00, 35.00,
+            25.00, 175.00, 100.00,
+            200.00, 12.25, 0.00, 175.00, 75.00
+        ) ON CONFLICT (ss_item_sk, ss_ticket_number) DO NOTHING;
+
+        DELETE FROM store_sales
+         WHERE ss_item_sk = v_i_sk AND ss_ticket_number = v_t_num;
+    END LOOP;
+END;
+$$;

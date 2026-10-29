@@ -12,10 +12,10 @@
  */
 
 --
--- pgbench-e (TPC-E-inspired) Parallel In-Database Data Generation Script for pgbench
+-- pgbench-brokerage (TPC-E-inspired) Parallel In-Database Data Generation Script for pgbench
 --
 -- Usage:
---   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_e_init.sql
+--   pgbench -n -c <N> -j <N> -t 1 -D num_workers=<N> -s <scale> -f pgbench_brokerage_init.sql
 --
 -- Optional density overrides (via -D):
 --   brokers_per_scale    (default: 10)

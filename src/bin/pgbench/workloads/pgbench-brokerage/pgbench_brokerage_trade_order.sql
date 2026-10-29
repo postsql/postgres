@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-e (TPC-E-inspired) Trade-Order Transaction Script
+-- pgbench-brokerage (TPC-E-inspired) Trade-Order Transaction Script
 --
 -- Features:
 --   - Skewed Zipfian security selection via random_zipfian() and permute()
@@ -32,6 +32,6 @@
 \set roll_it_back (random(1, 100) = 1)
 
 \try
-CALL pgbench_e_trade_order(:ca_id, :s_symb, :tt_id, :qty, :is_lifo, :roll_it_back, NULL);
+CALL pgbench_brokerage_trade_order(:ca_id, :s_symb, :tt_id, :qty, :is_lifo, :roll_it_back, NULL);
 \catch 'P0002'
 \endtry

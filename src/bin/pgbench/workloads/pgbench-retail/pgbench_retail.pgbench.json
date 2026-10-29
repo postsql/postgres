@@ -1,5 +1,5 @@
 {
-  "suite": "pgbench-ds",
+  "suite": "pgbench-retail",
   "description": "TPC-DS-inspired multi-channel retail decision support star-schema reporting and maintenance workload",
   "scale": 1,
   "no_vacuum": true,

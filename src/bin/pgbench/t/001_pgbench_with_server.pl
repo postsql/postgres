@@ -2786,7 +2786,7 @@ is($node->safe_psql('wl_pgbench_banking', 'SELECT count(*) FROM pgbench_branches
 is($node->safe_psql('wl_pgbench_banking', 'SELECT count(*) FROM pgbench_tellers;'), '20', 'pgbench-banking tellers count');
 is($node->safe_psql('wl_pgbench_banking', 'SELECT count(*) FROM pgbench_accounts;'), '200000', 'pgbench-banking accounts count');
 
-my $b_json = $node->basedir . '/001_pgbench_b_report.json';
+my $b_json = $node->basedir . '/001_pgbench_banking_report.json';
 $node->pgbench(
 	"-n -d wl_pgbench_banking -c 2 -j 2 -t 5 -s 2 "
 	  . "-f $wl_dir/pgbench-banking/pgbench_banking_tx.sql\@70 "
@@ -2831,7 +2831,7 @@ is($node->safe_psql('wl_pgbench_order', 'SELECT count(*) FROM warehouse;'), '2',
 is($node->safe_psql('wl_pgbench_order', 'SELECT count(*) FROM district;'), '20', 'pgbench-order district count');
 is($node->safe_psql('wl_pgbench_order', 'SELECT count(*) FROM item;'), '1000', 'pgbench-order item count');
 
-my $c_json = $node->basedir . '/001_pgbench_c_report.json';
+my $c_json = $node->basedir . '/001_pgbench_order_report.json';
 $node->pgbench(
 	"-n -d wl_pgbench_order -c 2 -j 2 -t 5 -s 2 "
 	  . "-f $wl_dir/pgbench-order/pgbench_order_new_order.sql\@45 "

@@ -12,7 +12,7 @@
  */
 
 --
--- pgbench-h (TPC-H-inspired) Query 6: Forecasting Revenue Change Query
+-- pgbench-analytics (TPC-H-inspired) Query 6: Forecasting Revenue Change Query
 --
 
 \set yr_off random(0, 4)
