@@ -54,6 +54,8 @@ extern void AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 										   ObjectAddresses *objsMoved);
 
 extern void CheckTableNotInUse(Relation rel, const char *stmt);
+extern bool CheckRelationRewriteAllowed(Relation rel, const char *cmdname,
+										bool skip_ok);
 
 extern void ExecuteTruncate(TruncateStmt *stmt);
 extern void ExecuteTruncateGuts(List *explicit_rels,

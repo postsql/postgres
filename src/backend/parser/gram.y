@@ -2937,6 +2937,24 @@ replica_identity:
 					n->name = $3;
 					$$ = (Node *) n;
 				}
+			| IDENT
+				{
+					/*
+					 * ROWID is matched as an identifier rather than added as
+					 * a keyword, so that "rowid" remains usable everywhere.
+					 */
+					ReplicaIdentityStmt *n;
+
+					if (strcmp($1, "rowid") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("unrecognized replica identity \"%s\"", $1),
+								 parser_errposition(@1)));
+					n = makeNode(ReplicaIdentityStmt);
+					n->identity_type = REPLICA_IDENTITY_ROWID;
+					n->name = NULL;
+					$$ = (Node *) n;
+				}
 ;
 
 reloptions:

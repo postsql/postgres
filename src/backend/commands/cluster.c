@@ -409,6 +409,19 @@ cluster_rel(Oid tableOid, Oid indexOid, ClusterParams *params)
 	}
 
 	/*
+	 * Rewriting assigns new tuple identifiers.  When processing many tables,
+	 * skip those that must keep them.
+	 */
+	if (!CheckRelationRewriteAllowed(OldHeap,
+									 OidIsValid(indexOid) ?
+									 "CLUSTER" : "VACUUM FULL",
+									 recheck))
+	{
+		relation_close(OldHeap, AccessExclusiveLock);
+		goto out;
+	}
+
+	/*
 	 * We allow VACUUM FULL, but not CLUSTER, on shared catalogs.  CLUSTER
 	 * would work in most respects, but the index would only get marked as
 	 * indisclustered in the current database, leading to unexpected behavior

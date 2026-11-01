@@ -42,6 +42,7 @@
 #include "commands/async.h"
 #include "commands/cluster.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -2127,6 +2128,15 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 	if (params->options & VACOPT_FULL)
 	{
 		ClusterParams cluster_params = {0};
+		bool		rewrite_allowed;
+
+		/*
+		 * VACUUM FULL refuses to rewrite tables that must keep their tuple
+		 * identifiers (see cluster_rel()); skip those if they were not named
+		 * explicitly.
+		 */
+		rewrite_allowed = (relation != NULL ||
+						   CheckRelationRewriteAllowed(rel, "VACUUM FULL", true));
 
 		/* close relation before vacuuming, but hold lock until commit */
 		relation_close(rel, NoLock);
@@ -2136,7 +2146,8 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 			cluster_params.options |= CLUOPT_VERBOSE;
 
 		/* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
-		cluster_rel(relid, InvalidOid, &cluster_params);
+		if (rewrite_allowed)
+			cluster_rel(relid, InvalidOid, &cluster_params);
 	}
 	else
 		table_relation_vacuum(rel, params, vac_strategy);
