@@ -17952,6 +17952,11 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 			appendPQExpBuffer(q, "\nALTER TABLE ONLY %s REPLICA IDENTITY FULL;\n",
 							  qualrelname);
 		}
+		else if (tbinfo->relreplident == REPLICA_IDENTITY_ROWID)
+		{
+			appendPQExpBuffer(q, "\nALTER TABLE ONLY %s REPLICA IDENTITY ROWID;\n",
+							  qualrelname);
+		}
 	}
 
 	if (tbinfo->forcerowsec)

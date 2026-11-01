@@ -93,7 +93,7 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     OF <replaceable class="parameter">type_name</replaceable>
     NOT OF
     OWNER TO { <replaceable class="parameter">new_owner</replaceable> | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
-    REPLICA IDENTITY { DEFAULT | USING INDEX <replaceable class="parameter">index_name</replaceable> | FULL | NOTHING }
+    REPLICA IDENTITY { DEFAULT | USING INDEX <replaceable class="parameter">index_name</replaceable> | FULL | NOTHING | ROWID }
 
 <phrase>and <replaceable class="parameter">partition_bound_spec</replaceable> is:</phrase>
 
@@ -1025,6 +1025,30 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
         <para>
          Records no information about the old row. This is the default for
          system tables.
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry id="sql-altertable-replica-identity-rowid">
+       <term><literal>ROWID</literal></term>
+       <listitem>
+        <para>
+         Records no information about the old row; rows are instead
+         identified by their tuple identifier (see
+         <xref linkend="ddl-system-columns-ctid"/>), which is known from the
+         write-ahead log anyway.  This allows replicating
+         <command>UPDATE</command> and <command>DELETE</command> for tables
+         without a primary key at a lower cost than <literal>FULL</literal>.
+         Logical replication sends the tuple identifier as an additional key
+         column named <literal>.rowid</literal> of type <type>tid</type>.
+        </para>
+        <para>
+         Because rewriting the table would change the tuple identifiers of
+         its rows, <command>VACUUM FULL</command>, <command>CLUSTER</command>,
+         <command>REPACK</command> and forms of <command>ALTER TABLE</command>
+         that rewrite the table are refused while logical decoding is
+         possible.  Partitioned tables, and tables with a column
+         named <literal>.rowid</literal>, cannot use this setting.
         </para>
        </listitem>
       </varlistentry>
