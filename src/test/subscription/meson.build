@@ -41,6 +41,7 @@ tests += {
       't/032_subscribe_use_index.pl',
       't/033_run_as_table_owner.pl',
       't/034_replica_identity_rowid.pl',
+      't/035_index_only_rowid.pl',
       't/100_bugs.pl',
     ],
   },

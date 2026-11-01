@@ -1817,6 +1817,34 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
+   <varlistentry id="reloption-index-only-rowid" xreflabel="index_only_rowid">
+    <term><literal>index_only_rowid</literal> (<type>boolean</type>)
+    <indexterm>
+     <primary><varname>index_only_rowid</varname> storage parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      For a table that is the target of logical replication by tuple
+      identifier (see
+      <xref linkend="logical-replication-publication-replica-identity-rowid"/>),
+      store the column <literal>.rowid</literal> only in its index, not in
+      the table itself, if <xref linkend="guc-logical-replication-index-only-rowid"/>
+      is enabled.  This avoids storing the tuple identifiers of the
+      publisher's rows twice while migrating a table.  The column then reads
+      as null except through its index.  Therefore, rewriting the table
+      (<command>VACUUM FULL</command>, <command>CLUSTER</command> and forms
+      of <command>ALTER TABLE</command> that rewrite), building an index on <literal>.rowid</literal> from
+      existing rows (<command>REINDEX</command>, <command>CREATE
+      INDEX</command>), and publishing <command>UPDATE</command> or
+      <command>DELETE</command> of the table are refused, and
+      <application>pg_dump</application> does not dump the values of the
+      column.  The parameter can only be changed while the table is empty.
+      The default is <literal>false</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
    <varlistentry id="reloption-user-catalog-table" xreflabel="user_catalog_table">
     <term><literal>user_catalog_table</literal> (<type>boolean</type>)
     <indexterm>
