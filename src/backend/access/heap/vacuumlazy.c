@@ -2554,7 +2554,11 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		XLogBeginInsert();
 		XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
 
-		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+		/* keep the offsets for logical decoding if requested */
+		XLogRegisterBuffer(0, buffer,
+						   REGBUF_STANDARD |
+						   (heap_prune_log_keep_data(vacrel->rel) ?
+							REGBUF_KEEP_DATA : 0));
 		XLogRegisterBufData(0, (char *) unused, nunused * sizeof(OffsetNumber));
 
 		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);

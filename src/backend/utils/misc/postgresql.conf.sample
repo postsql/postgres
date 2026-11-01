@@ -324,6 +324,7 @@
 #max_slot_wal_keep_size = -1	# in megabytes; -1 disables
 #wal_sender_timeout = 60s	# in milliseconds; 0 disables
 #logical_decoding_expose_headers = off	# pass tuple identifiers to output plugins
+#logical_decoding_prune_records = off	# keep pruned line pointers in WAL
 #track_commit_timestamp = off	# collect timestamp of transaction commit
 				# (change requires restart)
 

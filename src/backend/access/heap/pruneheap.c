@@ -28,6 +28,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* GUC variable */
+bool		logical_decoding_prune_records = false;
+
 /* Working data for heap_page_prune and subroutines */
 typedef struct
 {
@@ -92,6 +95,24 @@ static void heap_prune_record_dead(PruneState *prstate, OffsetNumber offnum);
 static void heap_prune_record_unused(PruneState *prstate, OffsetNumber offnum);
 static void page_verify_redirects(Page page);
 
+
+/*
+ * Should the line pointer arrays of a WAL record changing line pointers of a
+ * page of this relation by pruning (XLOG_HEAP2_PRUNE or XLOG_HEAP2_VACUUM)
+ * be kept even if a full-page image is taken?
+ *
+ * Redo restores the page from the image, so they are normally left out.
+ * Keep them for logical decoding (see DecodePrune()) if both the server and
+ * the table ask for it.
+ */
+bool
+heap_prune_log_keep_data(Relation relation)
+{
+	return logical_decoding_prune_records &&
+		relation->rd_options != NULL &&
+		((StdRdOptions *) relation->rd_options)->logical_decoding_prune_records &&
+		RelationIsLogicallyLogged(relation);
+}
 
 /*
  * Optionally prune and repair fragmentation in the specified page.
@@ -432,12 +453,16 @@ heap_page_prune(Relation relation, Buffer buffer,
 			XLogBeginInsert();
 			XLogRegisterData((char *) &xlrec, SizeOfHeapPrune);
 
-			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+			XLogRegisterBuffer(0, buffer,
+							   REGBUF_STANDARD |
+							   (heap_prune_log_keep_data(relation) ?
+								REGBUF_KEEP_DATA : 0));
 
 			/*
 			 * The OffsetNumber arrays are not actually in the buffer, but we
 			 * pretend that they are.  When XLogInsert stores the whole
-			 * buffer, the offset arrays need not be stored too.
+			 * buffer, the offset arrays need not be stored too, unless they are
+			 * kept for logical decoding (see heap_prune_log_keep_data()).
 			 */
 			if (prstate.nredirected > 0)
 				XLogRegisterBufData(0, (char *) prstate.redirected,
