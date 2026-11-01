@@ -28,6 +28,7 @@ extern void Async_Notify(const char *channel, const char *payload);
 extern void Async_Listen(const char *channel);
 extern void Async_Unlisten(const char *channel);
 extern void Async_UnlistenAll(void);
+extern bool HasActiveListenChannels(void);
 
 /* perform (or cancel) outbound notify processing at transaction commit */
 extern void PreCommit_Notify(void);

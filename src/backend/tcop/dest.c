@@ -32,7 +32,9 @@
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "catalog/namespace.h"
+#include "commands/async.h"
 #include "commands/copy.h"
 #include "commands/createas.h"
 #include "commands/explain_dr.h"
@@ -323,6 +325,7 @@ append_builtin_ready_for_query_status(StringInfo buf)
 	bool		has_temp;
 	bool		has_cursors;
 	bool		has_prepared;
+	bool		has_listen;
 	uint64		lsn_nbo;
 
 	/* 1. Temporary tables ('T') */
@@ -337,9 +340,25 @@ append_builtin_ready_for_query_status(StringInfo buf)
 	has_prepared = HasActivePreparedStatements();
 	ready_for_query_append_kv(buf, "P", 1, has_prepared ? "1" : "0", 1);
 
-	/* 4. Last Commit LSN ('l') as 8-byte uint64 in network byte order */
-	lsn_nbo = pg_hton64((uint64) XactLastCommitEnd);
-	ready_for_query_append_kv(buf, "l", 1, (char *) &lsn_nbo, sizeof(lsn_nbo));
+	/* 4. Active LISTEN registrations ('L') */
+	has_listen = HasActiveListenChannels();
+	ready_for_query_append_kv(buf, "L", 1, has_listen ? "1" : "0", 1);
+
+	/*
+	 * 5. WAL position as 8-byte uint64 in network byte order:
+	 *    - 'r' (latest replayed LSN) during recovery on a standby
+	 *    - 'l' (last transaction commit LSN) on a primary
+	 */
+	if (RecoveryInProgress())
+	{
+		lsn_nbo = pg_hton64((uint64) GetXLogReplayRecPtr(NULL));
+		ready_for_query_append_kv(buf, "r", 1, (char *) &lsn_nbo, sizeof(lsn_nbo));
+	}
+	else
+	{
+		lsn_nbo = pg_hton64((uint64) XactLastCommitEnd);
+		ready_for_query_append_kv(buf, "l", 1, (char *) &lsn_nbo, sizeof(lsn_nbo));
+	}
 }
 
 /*

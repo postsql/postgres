@@ -14,7 +14,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('main');
-$node->init;
+$node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf',
 	"shared_preload_libraries = 'test_ready_for_query'\n"
 );
@@ -133,7 +133,9 @@ is($tx2, 'I', "transaction status is Idle ('I')");
 is($kv2->{'T'}, '0', "T=0 when no temp tables exist");
 is($kv2->{'H'}, '0', "H=0 when no with-hold cursors exist");
 is($kv2->{'P'}, '0', "P=0 when no prepared statements exist");
-ok(defined $kv2->{'l'}, "l (binary LSN) key is present in rich mode");
+is($kv2->{'L'}, '0', "L=0 when no LISTEN channels are active");
+ok(defined $kv2->{'l'}, "l (binary LSN) key is present in rich mode on primary");
+ok(!exists $kv2->{'r'}, "r (standby replay LSN) key is absent on primary");
 is(length($kv2->{'l'}), 8, "l key value is 8 bytes");
 
 # 4. Temporary table lifecycle: CREATE -> DROP -> DISCARD TEMP -> DISCARD ALL
@@ -206,6 +208,38 @@ send_query($sock, "DEALLOCATE ALL;");
 my ($len_dp, $tx_dp, $kv_dp) = read_until_ready_for_query($sock);
 is($kv_dp->{'P'}, '0', "P=0 after DEALLOCATE ALL");
 
+# 6b. Active LISTEN registrations 'L'
+send_query($sock, "BEGIN; LISTEN chan_a;");
+my ($len_l_tx, $tx_l_tx, $kv_l_tx) = read_until_ready_for_query($sock);
+is($tx_l_tx, 'T', "tx_status='T' during uncommitted LISTEN");
+is($kv_l_tx->{'L'}, '0', "L=0 before LISTEN transaction commits");
+
+send_query($sock, "ROLLBACK;");
+my ($len_l_rb, $tx_l_rb, $kv_l_rb) = read_until_ready_for_query($sock);
+is($kv_l_rb->{'L'}, '0', "L=0 after ROLLBACK of LISTEN");
+
+send_query($sock, "LISTEN chan_a;");
+my ($len_l1, $tx_l1, $kv_l1) = read_until_ready_for_query($sock);
+is($kv_l1->{'L'}, '1', "L=1 after committed LISTEN chan_a");
+
+send_query($sock, "UNLISTEN chan_a;");
+my ($len_lu1, $tx_lu1, $kv_lu1) = read_until_ready_for_query($sock);
+is($kv_lu1->{'L'}, '0', "L=0 after UNLISTEN chan_a");
+
+send_query($sock, "LISTEN chan_b;");
+read_until_ready_for_query($sock);
+send_query($sock, "UNLISTEN *;");
+my ($len_lua, $tx_lua, $kv_lua) = read_until_ready_for_query($sock);
+is($kv_lua->{'L'}, '0', "L=0 after UNLISTEN *");
+
+send_query($sock, "LISTEN chan_c;");
+read_until_ready_for_query($sock);
+send_query($sock, "DISCARD ALL;");
+read_until_ready_for_query($sock);
+send_query($sock, "SET ready_for_query_message = 'rich';");
+my ($len_lda, $tx_lda, $kv_lda) = read_until_ready_for_query($sock);
+is($kv_lda->{'L'}, '0', "L=0 after DISCARD ALL");
+
 # 7. Switch back to 'plain' mode
 send_query($sock, "SET ready_for_query_message = 'plain';");
 my ($len5, $tx5, $kv5) = read_until_ready_for_query($sock);
@@ -249,6 +283,34 @@ is($kv_post->{'T'}, '0', "T=0 after dropping pre-existing temp table");
 close($sock);
 close($sock2);
 close($sock3);
+
+# 10. Test Hot Standby 'r' (replay LSN) indicator
+$node->backup('my_backup');
+my $standby = PostgreSQL::Test::Cluster->new('standby');
+$standby->init_from_backup($node, 'my_backup', has_streaming => 1);
+$standby->start;
+
+my $sock_sb = $standby->raw_connect();
+my $startup_sb = pack('N', 196608) . "user\0$dbuser\0database\0postgres\0options\0-c ready_for_query_message=rich\0\0";
+$sock_sb->syswrite(pack('N', 4 + length($startup_sb)) . $startup_sb);
+
+my ($len_sb1, $tx_sb1, $kv_sb1) = read_until_ready_for_query($sock_sb);
+ok(defined $kv_sb1->{'r'}, "r (standby replay LSN) key is present on standby");
+ok(!exists $kv_sb1->{'l'}, "l (primary commit LSN) key is absent on standby");
+is(length($kv_sb1->{'r'}), 8, "r key value is 8 bytes");
+my $r_lsn1 = unpack('Q>', $kv_sb1->{'r'});
+cmp_ok($r_lsn1, '>', 0, "initial standby replay LSN is non-zero");
+
+$node->safe_psql('postgres', 'CREATE TABLE t_rep (x int); INSERT INTO t_rep VALUES (1);');
+$node->wait_for_catchup($standby);
+
+send_query($sock_sb, "SELECT x FROM t_rep;");
+my ($len_sb2, $tx_sb2, $kv_sb2) = read_until_ready_for_query($sock_sb);
+my $r_lsn2 = unpack('Q>', $kv_sb2->{'r'});
+cmp_ok($r_lsn2, '>', $r_lsn1, "standby replay LSN 'r' advances after primary commit and catchup");
+
+close($sock_sb);
+$standby->stop;
 $node->stop;
 
 alarm(0);

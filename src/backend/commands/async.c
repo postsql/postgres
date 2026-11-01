@@ -426,6 +426,16 @@ static HTAB *localChannelTable = NULL;
 	(localChannelTable == NULL || hash_get_num_entries(localChannelTable) == 0)
 
 /*
+ * HasActiveListenChannels
+ *		Return true if this backend currently has committed LISTEN registrations.
+ */
+bool
+HasActiveListenChannels(void)
+{
+	return !LocalChannelTableIsEmpty();
+}
+
+/*
  * State for pending LISTEN/UNLISTEN actions consists of an ordered list of
  * all actions requested in the current transaction.  As explained above,
  * we don't actually change listen state until we reach transaction commit.
