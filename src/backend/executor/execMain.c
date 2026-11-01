@@ -45,6 +45,7 @@
 #include "catalog/partition.h"
 #include "commands/matview.h"
 #include "commands/trigger.h"
+#include "replication/logicalworker.h"
 #include "executor/executor.h"
 #include "executor/nodeSubplan.h"
 #include "foreign/fdwapi.h"
@@ -1050,6 +1051,26 @@ CheckValidResultRelNew(ResultRelInfo *resultRelInfo, CmdType operation,
 			 */
 			if (onConflictAction == ONCONFLICT_UPDATE)
 				CheckCmdReplicaIdentity(resultRel, CMD_UPDATE);
+
+			/*
+			 * Rows of a table replicated by tuple identifier must only be
+			 * changed by logical replication: a locally changed row would no
+			 * longer match the publisher's row it is identified with.
+			 */
+			if ((operation == CMD_UPDATE || operation == CMD_DELETE ||
+				 operation == CMD_MERGE ||
+				 onConflictAction == ONCONFLICT_UPDATE) &&
+				resultRel->rd_rel->relkind == RELKIND_RELATION &&
+				!IsLogicalWorker() &&
+				SessionReplicationRole != SESSION_REPLICATION_ROLE_REPLICA &&
+				RelationIsRowidTarget(resultRel))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot update or delete rows of table \"%s\"",
+								RelationGetRelationName(resultRel)),
+						 errdetail("The table is the target of logical replication by tuple identifier."),
+						 errhint("Only logical replication can modify its rows, unless \"%s\" is set to \"%s\".",
+								 "session_replication_role", "replica")));
 			break;
 		case RELKIND_SEQUENCE:
 			ereport(ERROR,
