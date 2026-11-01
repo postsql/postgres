@@ -28,6 +28,7 @@
 
 #include "access/commit_ts.h"
 #include "access/gin.h"
+#include "access/heapam.h"
 #include "access/slru.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"
@@ -1072,6 +1073,15 @@ struct config_bool ConfigureNamesBool[] =
 			gettext_noop("Tuple identifiers are always passed for relations using REPLICA IDENTITY ROWID.")
 		},
 		&logical_decoding_expose_headers,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"logical_decoding_prune_records", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Keeps the line pointers changed by pruning in the WAL for logical decoding."),
+			gettext_noop("Takes effect only for tables with the storage parameter of the same name.")
+		},
+		&logical_decoding_prune_records,
 		false,
 		NULL, NULL, NULL
 	},

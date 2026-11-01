@@ -29,6 +29,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* GUC variable */
+bool		logical_decoding_prune_records = false;
+
 /* Working data for heap_page_prune_and_freeze() and subroutines */
 typedef struct
 {
@@ -2070,8 +2073,21 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 	xlhp_prune_items dead_items;
 	xlhp_prune_items unused_items;
 	OffsetNumber frz_offsets[MaxHeapTuplesPerPage];
+	uint8		regbuf_flags = REGBUF_STANDARD;
 
 	xlrec.flags = 0;
+
+	/*
+	 * If a full-page image is taken, the arrays of changed line pointers are
+	 * normally left out, as redo restores the page from the image.  Keep them
+	 * for logical decoding (see DecodePrune()) if both the server and the
+	 * table ask for it.
+	 */
+	if (logical_decoding_prune_records &&
+		relation->rd_options != NULL &&
+		((StdRdOptions *) relation->rd_options)->logical_decoding_prune_records &&
+		RelationIsLogicallyLogged(relation))
+		regbuf_flags |= REGBUF_KEEP_DATA;
 
 	/*
 	 * Prepare data for the buffer.  The arrays are not actually in the
@@ -2079,7 +2095,7 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 	 * page image, the arrays can be omitted.
 	 */
 	XLogBeginInsert();
-	XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+	XLogRegisterBuffer(0, buffer, regbuf_flags);
 	if (nfrozen > 0)
 	{
 		int			nplans;

@@ -353,6 +353,7 @@ typedef struct StdRdOptions
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
 
 	bool		index_only_rowid;	/* store ".rowid" only in its index */
+	bool		logical_decoding_prune_records; /* see pruneheap.c */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10

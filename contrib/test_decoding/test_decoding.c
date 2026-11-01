@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
 #include "catalog/pg_type.h"
 
 #include "replication/logical.h"
@@ -30,6 +31,7 @@ typedef struct
 	bool		include_xids;
 	bool		include_timestamp;
 	bool		include_tids;
+	bool		include_prunes;
 	bool		skip_empty_xacts;
 	bool		only_local;
 } TestDecodingData;
@@ -73,6 +75,9 @@ static void pg_decode_message(LogicalDecodingContext *ctx,
 							  ReorderBufferTXN *txn, XLogRecPtr lsn,
 							  bool transactional, const char *prefix,
 							  Size sz, const char *message);
+static void pg_decode_prune(LogicalDecodingContext *ctx, Relation relation,
+							XLogRecPtr prune_lsn,
+							const LogicalDecodePruneData *prune);
 static bool pg_decode_filter_prepare(LogicalDecodingContext *ctx,
 									 TransactionId xid,
 									 const char *gid);
@@ -172,6 +177,9 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 
 	ctx->output_plugin_private = data;
 
+	/* the prune callback is not part of OutputPluginCallbacks */
+	ctx->prune_cb = pg_decode_prune;
+
 	opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
 	opt->receive_rewrites = false;
 
@@ -197,6 +205,16 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 			if (elem->arg == NULL)
 				data->include_timestamp = true;
 			else if (!parse_bool(strVal(elem->arg), &data->include_timestamp))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+								strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-prunes") == 0)
+		{
+			if (elem->arg == NULL)
+				data->include_prunes = true;
+			else if (!parse_bool(strVal(elem->arg), &data->include_prunes))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -794,6 +812,61 @@ pg_decode_message(LogicalDecodingContext *ctx,
 	appendStringInfo(ctx->out, "message: transactional: %d prefix: %s, sz: %zu content:",
 					 transactional, prefix, sz);
 	appendBinaryStringInfo(ctx->out, message, sz);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+append_offsets(StringInfo out, const char *label, BlockNumber blkno,
+			   int n, const OffsetNumber *offsets)
+{
+	if (n == 0)
+		return;
+	appendStringInfo(out, " %s:", label);
+	for (int i = 0; i < n; i++)
+		appendStringInfo(out, " (%u,%u)", blkno, offsets[i]);
+}
+
+static void
+pg_decode_prune(LogicalDecodingContext *ctx, Relation relation,
+				XLogRecPtr prune_lsn, const LogicalDecodePruneData *prune)
+{
+	TestDecodingData *data = ctx->output_plugin_private;
+	MemoryContext old;
+
+	if (!data->include_prunes)
+		return;
+
+	old = MemoryContextSwitchTo(data->context);
+	OutputPluginPrepareWrite(ctx, true);
+
+	appendStringInfo(ctx->out, "table %s: PRUNE (%s) block %u:",
+					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(relation)),
+												RelationGetRelationName(relation)),
+					 prune->reason == XLOG_HEAP2_PRUNE_ON_ACCESS ? "on-access" :
+					 prune->reason == XLOG_HEAP2_PRUNE_VACUUM_SCAN ? "vacuum-scan" :
+					 "vacuum-cleanup",
+					 prune->blkno);
+	if (!prune->has_row_info)
+		appendStringInfoString(ctx->out, " (no-row-info)");
+	else
+	{
+		if (prune->nredirected > 0)
+		{
+			appendStringInfoString(ctx->out, " redirected:");
+			for (int i = 0; i < prune->nredirected; i++)
+				appendStringInfo(ctx->out, " (%u,%u)->(%u,%u)",
+								 prune->blkno, prune->redirected[2 * i],
+								 prune->blkno, prune->redirected[2 * i + 1]);
+		}
+		append_offsets(ctx->out, "dead", prune->blkno, prune->ndead,
+					   prune->nowdead);
+		append_offsets(ctx->out, "unused", prune->blkno, prune->nunused,
+					   prune->nowunused);
+	}
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(data->context);
+
 	OutputPluginWrite(ctx, true);
 }
 

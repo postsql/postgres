@@ -4704,6 +4704,28 @@ HINT:  If it is safe for all REPLICATION users to use this library as an output 
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-logical-decoding-prune-records" xreflabel="logical_decoding_prune_records">
+      <term><varname>logical_decoding_prune_records</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>logical_decoding_prune_records</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Keeps the line pointers changed by pruning a heap page in the
+        write-ahead log for logical decoding (see
+        <xref linkend="logicaldecoding-output-plugin-prune"/>) when a
+        full-page image of the page is taken, which normally makes them
+        unnecessary.  This takes effect only for tables with the storage
+        parameter <xref linkend="reloption-logical-decoding-prune-records"/>,
+        which the owner of the table can set, and while logical decoding is
+        possible.  This parameter can only be set in the
+        <filename>postgresql.conf</filename> file or on the server command
+        line.  The default is <literal>off</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-track-commit-timestamp" xreflabel="track_commit_timestamp">
       <term><varname>track_commit_timestamp</varname> (<type>boolean</type>)
       <indexterm>
