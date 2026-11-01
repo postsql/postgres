@@ -530,6 +530,19 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	lmode = RepackLockLevel(concurrent);
 
 	/*
+	 * Rewriting assigns new tuple identifiers.  When processing many tables,
+	 * skip those that must keep them.
+	 */
+	if (!CheckRelationRewriteAllowed(OldHeap,
+									 cmd == REPACK_COMMAND_VACUUMFULL ?
+									 "VACUUM FULL" : RepackCommandAsString(cmd),
+									 recheck))
+	{
+		relation_close(OldHeap, NoLock);
+		return;
+	}
+
+	/*
 	 * Check some preconditions in the concurrent case.  This also obtains the
 	 * replica index OID.
 	 */

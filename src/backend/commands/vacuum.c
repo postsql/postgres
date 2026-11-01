@@ -40,6 +40,7 @@
 #include "commands/async.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
+#include "commands/tablecmds.h"
 #include "commands/repack.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
@@ -2299,12 +2300,20 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 			if ((params.options & VACOPT_VERBOSE) != 0)
 				cluster_params.options |= CLUOPT_VERBOSE;
 
-			/* VACUUM FULL is a variant of REPACK; see repack.c */
-			cluster_rel(REPACK_COMMAND_VACUUMFULL, rel, InvalidOid,
-						&cluster_params, isTopLevel);
-			/* cluster_rel closes the relation, but keeps lock */
+			/*
+			 * VACUUM FULL is a variant of REPACK; see repack.c.  It refuses to
+			 * rewrite tables that must keep their tuple identifiers; skip
+			 * those if they were not named explicitly.
+			 */
+			if (relation != NULL ||
+				CheckRelationRewriteAllowed(rel, "VACUUM FULL", true))
+			{
+				cluster_rel(REPACK_COMMAND_VACUUMFULL, rel, InvalidOid,
+							&cluster_params, isTopLevel);
+				/* cluster_rel closes the relation, but keeps lock */
 
-			rel = NULL;
+				rel = NULL;
+			}
 		}
 		else
 			table_relation_vacuum(rel, &params, bstrategy);

@@ -1,0 +1,182 @@
+-- REPLICA IDENTITY ROWID: DDL, decoding and guards.
+-- This runs with wal_level = logical (see logical.conf).
+SET synchronous_commit = on;
+CREATE TABLE rowid_t (id int, val text) WITH (autovacuum_enabled = off);
+ALTER TABLE rowid_t REPLICA IDENTITY ROWID;
+SELECT relreplident FROM pg_class WHERE oid = 'rowid_t'::regclass;
+ relreplident 
+--------------
+ r
+(1 row)
+
+\d+ rowid_t
+                                  Table "public.rowid_t"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Stats target | Description 
+--------+---------+-----------+----------+---------+----------+--------------+-------------
+ id     | integer |           |          |         | plain    |              | 
+ val    | text    |           |          |         | extended |              | 
+Replica Identity: ROWID
+Options: autovacuum_enabled=off
+
+-- "rowid" is not a keyword
+CREATE TABLE rowid_kw (rowid int);
+ALTER TABLE rowid_kw REPLICA IDENTITY "rowid";
+ALTER TABLE rowid_kw REPLICA IDENTITY tid;          -- error
+ERROR:  unrecognized replica identity "tid"
+LINE 1: ALTER TABLE rowid_kw REPLICA IDENTITY tid;
+                                              ^
+DROP TABLE rowid_kw;
+-- not supported for partitioned tables, but for their partitions
+CREATE TABLE rowid_parted (id int) PARTITION BY RANGE (id);
+CREATE TABLE rowid_part1 PARTITION OF rowid_parted FOR VALUES FROM (0) TO (10);
+ALTER TABLE rowid_parted REPLICA IDENTITY ROWID;    -- error
+ERROR:  REPLICA IDENTITY ROWID is not supported for partitioned tables
+HINT:  Set REPLICA IDENTITY ROWID on the partitions instead.
+ALTER TABLE rowid_part1 REPLICA IDENTITY ROWID;
+DROP TABLE rowid_parted;
+-- the virtual column name ".rowid" is reserved
+CREATE TABLE rowid_named (id int, ".rowid" tid);
+ALTER TABLE rowid_named REPLICA IDENTITY ROWID;     -- error
+ERROR:  cannot use REPLICA IDENTITY ROWID for table "rowid_named"
+DETAIL:  The table has a column named ".rowid".
+DROP TABLE rowid_named;
+ALTER TABLE rowid_t ADD COLUMN ".rowid" tid;        -- error
+ERROR:  column name ".rowid" is reserved in table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID.
+ALTER TABLE rowid_t RENAME COLUMN val TO ".rowid";  -- error
+ERROR:  column name ".rowid" is reserved in table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID.
+-- only the owner can change the replica identity
+CREATE ROLE regress_rowid_user;
+SET ROLE regress_rowid_user;
+ALTER TABLE rowid_t REPLICA IDENTITY DEFAULT;       -- error
+ERROR:  must be owner of table rowid_t
+RESET ROLE;
+-- TIDs are passed to the output plugin for ROWID tables, even with
+-- logical_decoding_expose_headers off; and not for other tables.
+CREATE TABLE rowid_other (id int) WITH (autovacuum_enabled = off);
+SELECT 'init' FROM pg_create_logical_replication_slot('rowid_slot', 'test_decoding');
+ ?column? 
+----------
+ init
+(1 row)
+
+SHOW logical_decoding_expose_headers;
+ logical_decoding_expose_headers 
+---------------------------------
+ off
+(1 row)
+
+INSERT INTO rowid_t VALUES (1, 'one'), (2, 'two');
+UPDATE rowid_t SET val = 'one-upd' WHERE id = 1;
+DELETE FROM rowid_t WHERE id = 2;
+INSERT INTO rowid_other VALUES (1);
+SELECT data FROM pg_logical_slot_get_changes('rowid_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
+                                             data                                              
+-----------------------------------------------------------------------------------------------
+ BEGIN
+ table public.rowid_t: INSERT: new-tid: (0,1) id[integer]:1 val[text]:'one'
+ table public.rowid_t: INSERT: new-tid: (0,2) id[integer]:2 val[text]:'two'
+ COMMIT
+ BEGIN
+ table public.rowid_t: UPDATE: old-tid: (0,1) new-tid: (0,3) id[integer]:1 val[text]:'one-upd'
+ COMMIT
+ BEGIN
+ table public.rowid_t: DELETE: old-tid: (0,2) (no-tuple-data)
+ COMMIT
+ BEGIN
+ table public.rowid_other: INSERT: id[integer]:1
+ COMMIT
+(13 rows)
+
+SELECT ctid, * FROM rowid_t;
+ ctid  | id |   val   
+-------+----+---------
+ (0,3) |  1 | one-upd
+(1 row)
+
+-- UPDATE and DELETE are allowed on a ROWID table that publishes them
+CREATE PUBLICATION rowid_pub FOR TABLE rowid_t;
+UPDATE rowid_t SET val = 'one-upd2' WHERE id = 1;
+DELETE FROM rowid_t WHERE id = 99;
+-- but not if a row filter is used, which cannot be evaluated without the
+-- old row
+CREATE PUBLICATION rowid_pub_rf FOR TABLE rowid_t WHERE (id > 0);
+INSERT INTO rowid_t VALUES (3, 'three');            -- ok
+UPDATE rowid_t SET val = 'x' WHERE id = 3;          -- error
+ERROR:  cannot update table "rowid_t"
+DETAIL:  A publication that publishes UPDATE uses a row filter for this table, which is not supported with REPLICA IDENTITY ROWID.
+DELETE FROM rowid_t WHERE id = 3;                   -- error
+ERROR:  cannot delete from table "rowid_t"
+DETAIL:  A publication that publishes DELETE uses a row filter for this table, which is not supported with REPLICA IDENTITY ROWID.
+ALTER PUBLICATION rowid_pub_rf SET (publish = 'insert');
+UPDATE rowid_t SET val = 'x' WHERE id = 3;          -- ok now
+DELETE FROM rowid_t WHERE id = 3;                   -- ok now
+DROP PUBLICATION rowid_pub, rowid_pub_rf;
+-- Rewriting the table would assign new TIDs: refused
+CREATE INDEX rowid_t_id ON rowid_t (id);
+VACUUM FULL rowid_t;                                -- error
+ERROR:  cannot execute VACUUM FULL on table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+CLUSTER rowid_t USING rowid_t_id;                   -- error
+ERROR:  cannot execute CLUSTER on table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+REPACK rowid_t;                                     -- error
+ERROR:  cannot execute REPACK on table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+ALTER TABLE rowid_t ALTER COLUMN id TYPE bigint;    -- error
+ERROR:  cannot execute ALTER TABLE on table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+ALTER TABLE rowid_t ADD COLUMN extra int;           -- ok, no rewrite
+ALTER TABLE rowid_t ADD COLUMN extra2 int DEFAULT random()::int; -- error
+ERROR:  cannot execute ALTER TABLE on table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+-- the repack test leaves a table with an invalid expression index behind,
+-- which would make the database-wide VACUUM FULL below fail
+DROP TABLE IF EXISTS repack_conc_invidx;
+-- other tables are processed, ROWID tables skipped, when not named
+VACUUM FULL rowid_other, rowid_t;                   -- error (named)
+ERROR:  cannot execute VACUUM FULL on table "rowid_t"
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+VACUUM FULL;                                        -- warning, skipped
+WARNING:  skipping "rowid_t" --- cannot execute VACUUM FULL on a table using REPLICA IDENTITY ROWID
+DETAIL:  The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.
+-- the TIDs are unchanged
+SELECT ctid, id, val FROM rowid_t;
+ ctid  | id |   val    
+-------+----+----------
+ (0,4) |  1 | one-upd2
+(1 row)
+
+-- after changing the replica identity, rewriting is allowed again
+ALTER TABLE rowid_t REPLICA IDENTITY DEFAULT;
+VACUUM FULL rowid_t;
+ALTER TABLE rowid_t REPLICA IDENTITY ROWID;
+-- the changes above are decoded with TIDs
+SELECT data FROM pg_logical_slot_get_changes('rowid_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
+                                              data                                              
+------------------------------------------------------------------------------------------------
+ BEGIN
+ table public.rowid_t: UPDATE: old-tid: (0,3) new-tid: (0,4) id[integer]:1 val[text]:'one-upd2'
+ COMMIT
+ BEGIN
+ table public.rowid_t: INSERT: new-tid: (0,5) id[integer]:3 val[text]:'three'
+ COMMIT
+ BEGIN
+ table public.rowid_t: UPDATE: old-tid: (0,5) new-tid: (0,6) id[integer]:3 val[text]:'x'
+ COMMIT
+ BEGIN
+ table public.rowid_t: DELETE: old-tid: (0,6) (no-tuple-data)
+ COMMIT
+(12 rows)
+
+SELECT pg_drop_replication_slot('rowid_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+DROP TABLE rowid_t, rowid_other;
+DROP ROLE regress_rowid_user;

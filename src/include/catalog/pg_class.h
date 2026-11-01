@@ -195,6 +195,12 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
  * has the same meaning as 'n'.
  */
 #define		  REPLICA_IDENTITY_INDEX	'i'
+/*
+ * the tuple identifier (TID) of the row is used as replica identity; logical
+ * replication sends it as an additional virtual column with this name
+ */
+#define		  REPLICA_IDENTITY_ROWID	'r'
+#define		  REPLICA_IDENTITY_ROWID_ATTNAME	".rowid"
 
 /*
  * Relation kinds that have physical storage. These relations normally have
