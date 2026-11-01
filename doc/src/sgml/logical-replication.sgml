@@ -227,7 +227,7 @@ CREATE TABLE t (a int, b text, ".rowid" tid PRIMARY KEY);
     A row keeps its tuple identifier until it is updated or deleted, both of
     which are replicated.  Rewriting the table, however, would assign new
     tuple identifiers to all rows, so <command>VACUUM FULL</command>,
-    <command>CLUSTER</command>, <command>REPACK</command> and forms of
+    <command>CLUSTER</command> and forms of
     <command>ALTER TABLE</command> that rewrite the table are refused for
     tables using <literal>ROWID</literal> while logical decoding is possible.
     Row filters are not supported for publications that publish
@@ -236,6 +236,29 @@ CREATE TABLE t (a int, b text, ".rowid" tid PRIMARY KEY);
     replica identity <literal>ROWID</literal>; their partitions can, but they
     cannot be published via the partition root
     (see <link linkend="sql-createpublication-params-with-publish-via-partition-root"><literal>publish_via_partition_root</literal></link>).
+   </para>
+
+   <para>
+    During the initial data synchronization, the rows are copied together
+    with their tuple identifiers.  The subscriber's table must be empty at
+    that time, because rows that already exist could not be matched by later
+    changes; otherwise the synchronization fails.  (Subscribers of releases
+    that do not support replica identity <literal>ROWID</literal> do not
+    fetch the tuple identifiers, so they must be created with
+    <literal>copy_data = false</literal>.)
+   </para>
+
+   <para>
+    On the subscriber, a table whose replica identity index (by default, its
+    primary key) consists of a single column <literal>".rowid" tid</literal>
+    is the target of replication by tuple identifier.  To prevent its rows
+    from diverging from the publisher's rows they are identified with,
+    <command>UPDATE</command>, <command>DELETE</command>,
+    <command>MERGE</command> and <command>INSERT ... ON CONFLICT DO
+    UPDATE</command> on it are refused, except by logical replication or
+    when <xref linkend="guc-session-replication-role"/> is set to
+    <literal>replica</literal>.  Once the migration is complete, drop the
+    primary key and the <literal>.rowid</literal> column.
    </para>
   </sect2>
 
