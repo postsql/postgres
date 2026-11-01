@@ -737,6 +737,17 @@ typedef void (*LogicalDecodeChangeCB) (struct LogicalDecodingContext *ctx,
       in.
      </para>
 
+     <para>
+      The tuple identifier (<acronym>TID</acronym>) of the new row version is
+      available in <literal>change-&gt;data.tp.newtuple-&gt;tuple.t_self</literal>, and
+      that of the old row version of an <command>UPDATE</command> or
+      <command>DELETE</command> in <literal>change-&gt;old_tid</literal>; the
+      latter is known even if no old tuple data was logged.  These are valid
+      only if the relation uses <literal>REPLICA IDENTITY ROWID</literal>
+      or <xref linkend="guc-logical-decoding-expose-headers"/> is enabled;
+      otherwise they are invalid.
+     </para>
+
      <note>
       <para>
        Only changes in user defined tables that are not unlogged
