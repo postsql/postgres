@@ -7277,6 +7277,22 @@ CheckRelationRewriteAllowed(Relation rel, const char *cmdname, bool skip_ok)
 		return false;
 	}
 
+	/* the values of ".rowid" cannot be copied from the heap */
+	if (RelationHasIndexOnlyRowid(rel))
+	{
+		ereport(skip_ok ? WARNING : ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 skip_ok ?
+				 errmsg("skipping \"%s\" --- cannot execute %s on a table storing \"%s\" only in its index",
+						RelationGetRelationName(rel), cmdname,
+						REPLICA_IDENTITY_ROWID_ATTNAME) :
+				 errmsg("cannot execute %s on table \"%s\"",
+						cmdname, RelationGetRelationName(rel)),
+				 errdetail("The table has the storage parameter \"%s\", so the values of column \"%s\" are not stored in the table itself.",
+						   "index_only_rowid", REPLICA_IDENTITY_ROWID_ATTNAME)));
+		return false;
+	}
+
 	return true;
 }
 
@@ -14651,6 +14667,28 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 	if (defList == NIL && operation != AT_ReplaceRelOptions)
 		return;					/* nothing to do */
+
+	/*
+	 * Whether ".rowid" is stored in the table cannot change once it has rows:
+	 * existing rows would then be treated wrongly.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_RELATION &&
+		RelationGetNumberOfBlocks(rel) > 0)
+	{
+		ListCell   *cell;
+
+		foreach(cell, defList)
+		{
+			DefElem    *def = lfirst_node(DefElem, cell);
+
+			if (def->defnamespace == NULL &&
+				strcmp(def->defname, "index_only_rowid") == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot change storage parameter \"%s\" of table \"%s\" because it is not empty",
+								def->defname, RelationGetRelationName(rel))));
+		}
+	}
 
 	pgclass = table_open(RelationRelationId, RowExclusiveLock);
 

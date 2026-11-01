@@ -648,6 +648,23 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 						RelationGetRelationName(rel)),
 				 errdetail("Column list used by the publication does not cover the replica identity.")));
 
+	/*
+	 * A ".rowid" replica identity stored only in the index cannot be logged
+	 * as the old key (see ExtractReplicaIdentity()).
+	 */
+	if (RelationHasIndexOnlyRowid(rel) &&
+		((cmd == CMD_UPDATE && pubdesc.pubactions.pubupdate) ||
+		 (cmd == CMD_DELETE && pubdesc.pubactions.pubdelete)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 cmd == CMD_UPDATE ?
+				 errmsg("cannot update table \"%s\" because it publishes updates",
+						RelationGetRelationName(rel)) :
+				 errmsg("cannot delete from table \"%s\" because it publishes deletes",
+						RelationGetRelationName(rel)),
+				 errdetail("The table has the storage parameter \"%s\", so its replica identity is not stored in the table itself.",
+						   "index_only_rowid")));
+
 	/* If relation has replica identity we are always good. */
 	if (OidIsValid(RelationGetReplicaIndex(rel)))
 		return;

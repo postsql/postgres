@@ -250,8 +250,10 @@ typedef struct RelationData
 	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
 
 	/*
-	 * Cached result of RelationIsRowidTarget(): 0 if not computed yet.  Kept
-	 * last so that the offsets of the other members do not change.
+	 * Cached result of RelationIsRowidTarget(): 0 if not computed yet, 'n' if
+	 * not a target, 'y' if it is, 'l' if it is and ".rowid" is the last
+	 * column.  Kept last so that the offsets of the other members do not
+	 * change.
 	 */
 	char		rd_rowidtarget;
 } RelationData;
@@ -332,6 +334,8 @@ typedef struct StdRdOptions
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+
+	bool		index_only_rowid;	/* store ".rowid" only in its index */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -697,6 +701,9 @@ RelationGetSmgr(Relation rel)
 	 !IsCatalogRelation(relation))
 
 /* routines in utils/cache/relcache.c */
+/* GUC: may tables with index_only_rowid omit ".rowid" from new rows? */
+extern PGDLLIMPORT bool logical_replication_index_only_rowid;
+
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
 

@@ -2335,6 +2335,47 @@ heap_prepare_insert(Relation relation, HeapTuple tup, TransactionId xid,
 }
 
 /*
+ * Copy the first natts attributes of a tuple descriptor (without
+ * constraints or defaults, which heap_form_tuple() does not need).
+ */
+static TupleDesc
+heap_truncated_tupdesc(TupleDesc tupdesc, int natts)
+{
+	TupleDesc	desc = CreateTemplateTupleDesc(natts);
+
+	for (int i = 1; i <= natts; i++)
+		TupleDescCopyEntry(desc, i, tupdesc, i);
+	desc->tdtypeid = tupdesc->tdtypeid;
+	desc->tdtypmod = tupdesc->tdtypmod;
+
+	return desc;
+}
+
+/*
+ * heap_form_tuple_omit_last - form a heap tuple from a slot, leaving out the
+ * last attribute
+ *
+ * Used for tables that store ".rowid" only in its index (see
+ * RelationOmitsRowid()).  The slot keeps the value, so index entries built
+ * from the slot include it.
+ */
+HeapTuple
+heap_form_tuple_omit_last(TupleDesc tupdesc, TupleTableSlot *slot)
+{
+	TupleDesc	truncdesc;
+	HeapTuple	tuple;
+
+	Assert(tupdesc->natts > 1);
+
+	truncdesc = heap_truncated_tupdesc(tupdesc, tupdesc->natts - 1);
+	slot_getallattrs(slot);
+	tuple = heap_form_tuple(truncdesc, slot->tts_values, slot->tts_isnull);
+	FreeTupleDesc(truncdesc);
+
+	return tuple;
+}
+
+/*
  *	heap_multi_insert	- insert multiple tuples into a heap
  *
  * This is like heap_insert(), but inserts multiple tuples in one operation.
@@ -2360,6 +2401,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	Size		saveFreeSpace;
 	bool		need_tuple_data = RelationIsLogicallyLogged(relation);
 	bool		need_cids = RelationIsAccessibleInLogicalDecoding(relation);
+	bool		omit_rowid;
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	AssertArg(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -2372,11 +2414,16 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	/* Toast and set header data in all the slots */
 	heaptuples = palloc(ntuples * sizeof(HeapTuple));
+	omit_rowid = RelationOmitsRowid(relation);
 	for (i = 0; i < ntuples; i++)
 	{
 		HeapTuple	tuple;
 
-		tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
+		if (omit_rowid)
+			tuple = heap_form_tuple_omit_last(RelationGetDescr(relation),
+											  slots[i]);
+		else
+			tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
 		slots[i]->tts_tableOid = RelationGetRelid(relation);
 		tuple->t_tableOid = slots[i]->tts_tableOid;
 		heaptuples[i] = heap_prepare_insert(relation, tuple, xid, cid,
@@ -3973,8 +4020,14 @@ l2:
 		 * Since the new tuple is going into the same page, we might be able
 		 * to do a HOT update.  Check if any of the index columns have been
 		 * changed.
+		 *
+		 * If ".rowid" is stored only in its index, both heap tuples lack it,
+		 * so a change of it cannot be detected here; it changes with every
+		 * replicated UPDATE anyway.  TODO: allow HOT if the new value is the
+		 * same as the old one, which the caller found the row by.
 		 */
-		if (!bms_overlap(modified_attrs, hot_attrs))
+		if (!bms_overlap(modified_attrs, hot_attrs) &&
+			!RelationOmitsRowid(relation))
 			use_hot_update = true;
 	}
 	else
@@ -9134,6 +9187,14 @@ ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
 	/* with ROWID, the decoded change carries the tuple identifier instead */
 	if (replident == REPLICA_IDENTITY_NOTHING ||
 		replident == REPLICA_IDENTITY_ROWID)
+		return NULL;
+
+	/*
+	 * A ".rowid" replica identity stored only in the index cannot be read
+	 * from the heap; publishing UPDATE and DELETE of such tables is refused
+	 * (see CheckCmdReplicaIdentity()).
+	 */
+	if (RelationHasIndexOnlyRowid(relation))
 		return NULL;
 
 	if (replident == REPLICA_IDENTITY_FULL)

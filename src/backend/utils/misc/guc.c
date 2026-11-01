@@ -109,6 +109,7 @@
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/queryjumble.h"
+#include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/tzparser.h"
@@ -2179,6 +2180,16 @@ static struct config_bool ConfigureNamesBool[] =
 			gettext_noop("Sets whether a WAL receiver should create a temporary replication slot if no permanent slot is configured."),
 		},
 		&wal_receiver_create_temp_slot,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"logical_replication_index_only_rowid", PGC_SUSET, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Allows tables with storage parameter index_only_rowid to store the column \".rowid\" only in its index."),
+			NULL
+		},
+		&logical_replication_index_only_rowid,
 		false,
 		NULL, NULL, NULL
 	},
