@@ -34,6 +34,8 @@ static void logicalrep_write_attrs(StringInfo out, Relation rel,
 static void logicalrep_write_tuple(StringInfo out, Relation rel,
 								   TupleTableSlot *slot,
 								   bool binary, Bitmapset *columns);
+static void logicalrep_write_value(StringInfo out, Oid typid, Datum value,
+								   bool binary);
 static void logicalrep_read_attrs(StringInfo in, LogicalRepRelation *rel);
 static void logicalrep_read_tuple(StringInfo in, LogicalRepTupleData *tuple);
 
@@ -463,7 +465,8 @@ logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX ||
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID);
 
 	/* transaction ID (if not valid, we're not streaming) */
 	if (TransactionIdIsValid(xid))
@@ -536,7 +539,8 @@ logicalrep_write_delete(StringInfo out, TransactionId xid, Relation rel,
 {
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX ||
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID);
 
 	pq_sendbyte(out, LOGICAL_REP_MSG_DELETE);
 
@@ -764,16 +768,22 @@ logicalrep_read_typ(StringInfo in, LogicalRepTyp *ltyp)
 
 /*
  * Write a tuple to the outputstream, in the most efficient format possible.
+ *
+ * For REPLICA IDENTITY ROWID, the tuple identifier in slot->tts_tid is
+ * appended as the value of the virtual ".rowid" column.  The key of an
+ * UPDATE or DELETE is then sent from an empty slot: only the tuple
+ * identifier, with all other columns null.
  */
 static void
 logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 					   bool binary, Bitmapset *columns)
 {
 	TupleDesc	desc;
-	Datum	   *values;
-	bool	   *isnull;
+	Datum	   *values = NULL;
+	bool	   *isnull = NULL;
 	int			i;
 	uint16		nliveatts = 0;
+	bool		rowid = (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID);
 
 	desc = RelationGetDescr(rel);
 
@@ -789,17 +799,20 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 
 		nliveatts++;
 	}
+	if (rowid)
+		nliveatts++;
 	pq_sendint16(out, nliveatts);
 
-	slot_getallattrs(slot);
-	values = slot->tts_values;
-	isnull = slot->tts_isnull;
+	if (!(rowid && TTS_EMPTY(slot)))
+	{
+		slot_getallattrs(slot);
+		values = slot->tts_values;
+		isnull = slot->tts_isnull;
+	}
 
 	/* Write the values */
 	for (i = 0; i < desc->natts; i++)
 	{
-		HeapTuple	typtup;
-		Form_pg_type typclass;
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 
 		if (att->attisdropped || att->attgenerated)
@@ -808,7 +821,7 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 		if (!column_in_column_list(att->attnum, columns))
 			continue;
 
-		if (isnull[i])
+		if (values == NULL || isnull[i])
 		{
 			pq_sendbyte(out, LOGICALREP_COLUMN_NULL);
 			continue;
@@ -825,38 +838,58 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 			continue;
 		}
 
-		typtup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(att->atttypid));
-		if (!HeapTupleIsValid(typtup))
-			elog(ERROR, "cache lookup failed for type %u", att->atttypid);
-		typclass = (Form_pg_type) GETSTRUCT(typtup);
-
-		/*
-		 * Send in binary if requested and type has suitable send function.
-		 */
-		if (binary && OidIsValid(typclass->typsend))
-		{
-			bytea	   *outputbytes;
-			int			len;
-
-			pq_sendbyte(out, LOGICALREP_COLUMN_BINARY);
-			outputbytes = OidSendFunctionCall(typclass->typsend, values[i]);
-			len = VARSIZE(outputbytes) - VARHDRSZ;
-			pq_sendint(out, len, 4);	/* length */
-			pq_sendbytes(out, VARDATA(outputbytes), len);	/* data */
-			pfree(outputbytes);
-		}
-		else
-		{
-			char	   *outputstr;
-
-			pq_sendbyte(out, LOGICALREP_COLUMN_TEXT);
-			outputstr = OidOutputFunctionCall(typclass->typoutput, values[i]);
-			pq_sendcountedtext(out, outputstr, strlen(outputstr), false);
-			pfree(outputstr);
-		}
-
-		ReleaseSysCache(typtup);
+		logicalrep_write_value(out, att->atttypid, values[i], binary);
 	}
+
+	if (rowid)
+	{
+		/* the caller set this from the decoded change, never from a column */
+		if (!ItemPointerIsValid(&slot->tts_tid))
+			elog(ERROR, "missing tuple identifier for table \"%s\" using REPLICA IDENTITY ROWID",
+				 RelationGetRelationName(rel));
+		logicalrep_write_value(out, TIDOID, ItemPointerGetDatum(&slot->tts_tid),
+							   binary);
+	}
+}
+
+/*
+ * Write a non-null column value: in binary if requested and the type has a
+ * send function, else in text.
+ */
+static void
+logicalrep_write_value(StringInfo out, Oid typid, Datum value, bool binary)
+{
+	HeapTuple	typtup;
+	Form_pg_type typclass;
+
+	typtup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (!HeapTupleIsValid(typtup))
+		elog(ERROR, "cache lookup failed for type %u", typid);
+	typclass = (Form_pg_type) GETSTRUCT(typtup);
+
+	if (binary && OidIsValid(typclass->typsend))
+	{
+		bytea	   *outputbytes;
+		int			len;
+
+		pq_sendbyte(out, LOGICALREP_COLUMN_BINARY);
+		outputbytes = OidSendFunctionCall(typclass->typsend, value);
+		len = VARSIZE(outputbytes) - VARHDRSZ;
+		pq_sendint(out, len, 4);	/* length */
+		pq_sendbytes(out, VARDATA(outputbytes), len);	/* data */
+		pfree(outputbytes);
+	}
+	else
+	{
+		char	   *outputstr;
+
+		pq_sendbyte(out, LOGICALREP_COLUMN_TEXT);
+		outputstr = OidOutputFunctionCall(typclass->typoutput, value);
+		pq_sendcountedtext(out, outputstr, strlen(outputstr), false);
+		pfree(outputstr);
+	}
+
+	ReleaseSysCache(typtup);
 }
 
 /*
@@ -946,6 +979,8 @@ logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns)
 
 		nliveatts++;
 	}
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+		nliveatts++;
 	pq_sendint16(out, nliveatts);
 
 	/* fetch bitmap of REPLICATION IDENTITY attributes */
@@ -981,6 +1016,19 @@ logicalrep_write_attrs(StringInfo out, Relation rel, Bitmapset *columns)
 
 		/* attribute mode */
 		pq_sendint32(out, att->atttypmod);
+	}
+
+	/*
+	 * With REPLICA IDENTITY ROWID, the tuple identifier is sent as an
+	 * additional key column.  Any subscriber can then match rows using an
+	 * index on a column of that name.
+	 */
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+	{
+		pq_sendbyte(out, LOGICALREP_IS_REPLICA_IDENTITY);
+		pq_sendstring(out, REPLICA_IDENTITY_ROWID_ATTNAME);
+		pq_sendint32(out, (int) TIDOID);
+		pq_sendint32(out, -1);
 	}
 
 	bms_free(idattrs);

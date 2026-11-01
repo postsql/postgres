@@ -168,6 +168,53 @@
    transactional; so the table will start or stop replicating at the correct
    snapshot once the transaction has committed.
   </para>
+
+  <sect2 id="logical-replication-publication-replica-identity-rowid">
+   <title>Replica Identity <literal>ROWID</literal></title>
+
+   <para>
+    A table without a suitable key can also be set to replica identity
+    <literal>ROWID</literal>.  Rows are then identified by their tuple
+    identifier (see <xref linkend="ddl-system-columns-ctid"/>), which the
+    publisher knows from the write-ahead log without logging any old column
+    values.  This is intended for migrating such tables, for example to a
+    newer major version, without the cost of replica identity
+    <literal>FULL</literal>.
+   </para>
+
+   <para>
+    The tuple identifier is sent as an additional column named
+    <literal>.rowid</literal> of type <type>tid</type>, after all published
+    columns, and marked as the replica identity: for an
+    <command>INSERT</command> the tuple identifier of the new row, and for an
+    <command>UPDATE</command> or <command>DELETE</command> the tuple identifier
+    of the old row as the key (with all other key columns null), and for an
+    <command>UPDATE</command> also the tuple identifier of the new row
+    version.  Because it is an ordinary column as far as the protocol is
+    concerned, any subscriber whose table has a column
+    <literal>".rowid" tid</literal> with a primary key or replica identity
+    index on it can apply the changes:
+<programlisting>
+CREATE TABLE t (a int, b text, ".rowid" tid PRIMARY KEY);
+</programlisting>
+   </para>
+
+   <para>
+    A row keeps its tuple identifier until it is updated or deleted, both of
+    which are replicated.  Rewriting the table, however, would assign new
+    tuple identifiers to all rows, so <command>VACUUM FULL</command>,
+    <command>CLUSTER</command> and forms of
+    <command>ALTER TABLE</command> that rewrite the table are refused for
+    tables using <literal>ROWID</literal> while logical decoding is possible.
+    Row filters are not supported for publications that publish
+    <command>UPDATE</command> or <command>DELETE</command> of such tables,
+    because the old row is not available.  Partitioned tables cannot use
+    replica identity <literal>ROWID</literal>; their partitions can, but they
+    cannot be published via the partition root
+    (see <link linkend="sql-createpublication-with-publish-via-partition-root"><literal>publish_via_partition_root</literal></link>).
+   </para>
+  </sect2>
+
  </sect1>
 
  <sect1 id="logical-replication-subscription">

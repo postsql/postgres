@@ -1483,9 +1483,11 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			/*
 			 * This is only possible if deletes are allowed even when replica
 			 * identity is not defined for a table. Since the DELETE action
-			 * can't be published, we simply return.
+			 * can't be published, we simply return.  (With REPLICA IDENTITY
+			 * ROWID, the tuple identifier identifies the row.)
 			 */
-			if (!change->data.tp.oldtuple)
+			if (!change->data.tp.oldtuple &&
+				relation->rd_rel->relreplident != REPLICA_IDENTITY_ROWID)
 			{
 				elog(DEBUG1, "didn't send DELETE change because of missing oldtuple");
 				return;
@@ -1502,6 +1504,15 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	if (relentry->publish_as_relid != RelationGetRelid(relation))
 	{
 		Assert(relation->rd_rel->relispartition);
+
+		/* tuple identifiers are only unique within a partition */
+		if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot publish changes of partition \"%s\" via its partition root",
+							RelationGetRelationName(relation)),
+					 errdetail("The partition uses REPLICA IDENTITY ROWID.")));
+
 		ancestor = RelationIdGetRelation(relentry->publish_as_relid);
 		targetrel = ancestor;
 	}
@@ -1537,6 +1548,31 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	}
 
 	/*
+	 * With REPLICA IDENTITY ROWID, no old tuple is logged: the key of an
+	 * UPDATE or DELETE is just the old tuple identifier, sent from an empty
+	 * slot.  A row filter cannot be evaluated without the old row; UPDATE
+	 * and DELETE are refused when one is defined (see
+	 * CheckCmdReplicaIdentity()), but the publication might have been
+	 * changed since.
+	 */
+	if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID &&
+		action != REORDER_BUFFER_CHANGE_INSERT)
+	{
+		if (relentry->exprstate[action == REORDER_BUFFER_CHANGE_UPDATE ?
+								PUBACTION_UPDATE : PUBACTION_DELETE] != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot apply the row filter of table \"%s\" to %s",
+							RelationGetRelationName(relation),
+							action == REORDER_BUFFER_CHANGE_UPDATE ? "UPDATE" : "DELETE"),
+					 errdetail("The table uses REPLICA IDENTITY ROWID.")));
+
+		Assert(change->data.tp.oldtuple == NULL);
+		old_slot = relentry->old_slot;
+		ExecClearTuple(old_slot);
+	}
+
+	/*
 	 * Check row filter.
 	 *
 	 * Updates could be transformed to inserts or deletes based on the results
@@ -1544,6 +1580,20 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 */
 	if (!pgoutput_row_filter(targetrel, old_slot, &new_slot, relentry, &action))
 		goto cleanup;
+
+	/*
+	 * Attach the tuple identifiers of the decoded change, which come from
+	 * the WAL record, to the slots; logicalrep_write_tuple() sends them as
+	 * the ".rowid" column.  Do this last, as slot copies made above do not
+	 * preserve them.
+	 */
+	if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+	{
+		if (new_slot != NULL)
+			new_slot->tts_tid = change->data.tp.newtuple->tuple.t_self;
+		if (old_slot != NULL)
+			old_slot->tts_tid = change->old_tid;
+	}
 
 	/*
 	 * Send BEGIN if we haven't yet.
