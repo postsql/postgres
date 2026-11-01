@@ -364,6 +364,7 @@
 #idle_replication_slot_timeout = 0      # in seconds; 0 disables
 #wal_sender_timeout = 60s       # in milliseconds; 0 disables
 #logical_decoding_expose_headers = off  # pass tuple identifiers to output plugins
+#logical_decoding_prune_records = off   # keep pruned line pointers in WAL
 #wal_sender_shutdown_timeout = -1      # in milliseconds
                                 # -1 disables the timeout and waits for catch-up
                                 # 0 does not wait for catch-up
