@@ -1257,6 +1257,15 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"logical_decoding_expose_headers", PGC_USERSET, REPLICATION_SENDING,
+			gettext_noop("Passes tuple identifiers of decoded changes to logical decoding output plugins."),
+			gettext_noop("Tuple identifiers are always passed for relations using REPLICA IDENTITY ROWID.")
+		},
+		&logical_decoding_expose_headers,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"ssl", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Enables SSL connections."),
 			NULL
