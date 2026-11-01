@@ -149,6 +149,9 @@ extern void ReleaseBulkInsertStatePin(BulkInsertState bistate);
 
 extern void heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 						int options, BulkInsertState bistate);
+/* in heap/pruneheap.c */
+extern PGDLLIMPORT bool logical_decoding_prune_records;
+
 extern HeapTuple heap_form_tuple_omit_last(TupleDesc tupdesc,
 										   struct TupleTableSlot *slot);
 extern void heap_multi_insert(Relation relation, struct TupleTableSlot **slots,
@@ -195,6 +198,7 @@ extern TransactionId heap_index_delete_tuples(Relation rel,
 /* in heap/pruneheap.c */
 struct GlobalVisState;
 extern void heap_page_prune_opt(Relation relation, Buffer buffer);
+extern bool heap_prune_log_keep_data(Relation relation);
 extern int	heap_page_prune(Relation relation, Buffer buffer,
 							TransactionId oldest_xmin,
 							struct GlobalVisState *vistest,

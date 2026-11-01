@@ -708,6 +708,66 @@ typedef void (*LogicalDecodeChangeCB) (struct LogicalDecodingContext *ctx,
      </note>
     </sect3>
 
+    <sect3 id="logicaldecoding-output-plugin-prune">
+     <title>Prune Callback</title>
+
+     <para>
+      The optional <function>prune_cb</function> callback is called when
+      pruning (by <command>VACUUM</command>, or opportunistically when a page
+      is accessed) has changed line pointers of a page of a logically logged
+      table: line pointers that were redirected to another one, marked dead,
+      or marked unused and thus available for new rows.  Together with the
+      tuple identifiers of row changes (see
+      <xref linkend="logicaldecoding-output-plugin-change"/>), this allows
+      consumers to track which tuple identifiers are in use, for example to
+      maintain a copy of a table keyed by tuple identifier.  Pruning is not
+      part of any transaction; the callback is called when the pruning is
+      decoded.
+     </para>
+
+     <para>
+      Unlike the other callbacks, <function>prune_cb</function> is not a
+      member of <structname>OutputPluginCallbacks</structname>, so that
+      output plugins compiled for earlier minor releases keep working.  An
+      output plugin that wants to receive it sets
+      <literal>ctx-&gt;prune_cb</literal> in its startup callback:
+<programlisting>
+ctx->prune_cb = my_prune_cb;
+</programlisting>
+      The callback receives:
+<programlisting>
+typedef struct LogicalDecodePruneData
+{
+    BlockNumber blkno;
+    uint8       reason;         /* XLOG_HEAP2_PRUNE or XLOG_HEAP2_VACUUM */
+    bool        has_row_info;
+    int         nredirected;
+    const OffsetNumber *redirected;     /* pairs of (from, to) */
+    int         ndead;
+    const OffsetNumber *nowdead;
+    int         nunused;
+    const OffsetNumber *nowunused;
+} LogicalDecodePruneData;
+
+typedef void (*LogicalDecodePruneCB) (struct LogicalDecodingContext *ctx,
+                                      Relation relation,
+                                      XLogRecPtr prune_lsn,
+                                      const LogicalDecodePruneData *prune);
+</programlisting>
+      If the write-ahead log record has a full-page image, the changed line
+      pointers are only available if
+      <xref linkend="guc-logical-decoding-prune-records"/> and the table's
+      storage parameter of the same name are enabled; otherwise
+      <structfield>has_row_info</structfield> is false.
+      <structfield>reason</structfield> is the type of the write-ahead log
+      record: <literal>XLOG_HEAP2_PRUNE</literal> when a page is pruned
+      (opportunistically or by the first pass of <command>VACUUM</command>),
+      which can redirect line pointers, mark them dead, or mark them unused;
+      <literal>XLOG_HEAP2_VACUUM</literal> when the second pass of
+      <command>VACUUM</command> marks dead line pointers unused.
+     </para>
+    </sect3>
+
     <sect3 id="logicaldecoding-output-plugin-truncate">
      <title>Truncate Callback</title>
 

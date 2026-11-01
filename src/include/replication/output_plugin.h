@@ -209,6 +209,44 @@ typedef void (*LogicalDecodeStreamTruncateCB) (struct LogicalDecodingContext *ct
 											   ReorderBufferChange *change);
 
 /*
+ * Line pointers of a heap page changed by pruning, see LogicalDecodePruneCB.
+ * The offsets are of block 'blkno'.  'redirected' has pairs of (from, to)
+ * offsets.  has_row_info is false if the WAL record did not keep them (it
+ * had a full-page image, and logical_decoding_prune_records was not in
+ * effect); the counts are then zero.
+ *
+ * 'reason' is the info code of the WAL record: XLOG_HEAP2_PRUNE for pruning
+ * (opportunistically or by the first pass of VACUUM), which redirects line
+ * pointers, marks them dead, or marks them unused; XLOG_HEAP2_VACUUM for the
+ * second pass of VACUUM, which marks dead line pointers unused.
+ */
+typedef struct LogicalDecodePruneData
+{
+	BlockNumber blkno;
+	uint8		reason;			/* XLOG_HEAP2_PRUNE or XLOG_HEAP2_VACUUM */
+	bool		has_row_info;
+	int			nredirected;
+	const OffsetNumber *redirected;
+	int			ndead;
+	const OffsetNumber *nowdead;
+	int			nunused;
+	const OffsetNumber *nowunused;
+} LogicalDecodePruneData;
+
+/*
+ * Called when pruning has changed line pointers of a page of a relation.
+ * This happens outside of any transaction.
+ *
+ * To keep OutputPluginCallbacks unchanged, this callback is not part of it:
+ * an output plugin that wants it sets LogicalDecodingContext.prune_cb in its
+ * startup callback.
+ */
+typedef void (*LogicalDecodePruneCB) (struct LogicalDecodingContext *ctx,
+									  Relation relation,
+									  XLogRecPtr prune_lsn,
+									  const LogicalDecodePruneData *prune);
+
+/*
  * Output plugin callbacks
  */
 typedef struct OutputPluginCallbacks

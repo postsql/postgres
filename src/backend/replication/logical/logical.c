@@ -75,6 +75,9 @@ static void change_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 							  Relation relation, ReorderBufferChange *change);
 static void truncate_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 								int nrelations, Relation relations[], ReorderBufferChange *change);
+static void prune_cb_wrapper(ReorderBuffer *cache, Relation relation,
+							 XLogRecPtr prune_lsn,
+							 const LogicalDecodePruneData *prune);
 static void message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 							   XLogRecPtr message_lsn, bool transactional,
 							   const char *prefix, Size message_size, const char *message);
@@ -288,6 +291,7 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->reorder->apply_truncate = truncate_cb_wrapper;
 	ctx->reorder->commit = commit_cb_wrapper;
 	ctx->reorder->message = message_cb_wrapper;
+	ctx->reorder->prune = prune_cb_wrapper;
 
 	/*
 	 * To support streaming, we require start/stop/abort/commit/change
@@ -1270,6 +1274,41 @@ message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	/* do the actual work: call callback */
 	ctx->callbacks.message_cb(ctx, txn, message_lsn, transactional, prefix,
 							  message_size, message);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
+}
+
+static void
+prune_cb_wrapper(ReorderBuffer *cache, Relation relation, XLogRecPtr prune_lsn,
+				 const LogicalDecodePruneData *prune)
+{
+	LogicalDecodingContext *ctx = cache->private_data;
+	LogicalErrorCallbackState state;
+	ErrorContextCallback errcallback;
+
+	Assert(!ctx->fast_forward);
+
+	if (ctx->prune_cb == NULL)
+		return;
+
+	/* Push callback + info on the error context stack */
+	state.ctx = ctx;
+	state.callback_name = "prune";
+	state.report_location = prune_lsn;
+	errcallback.callback = output_plugin_error_callback;
+	errcallback.arg = &state;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = InvalidTransactionId;
+	ctx->write_location = prune_lsn;
+	ctx->end_xact = false;
+
+	/* do the actual work: call callback */
+	ctx->prune_cb(ctx, relation, prune_lsn, prune);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
