@@ -185,6 +185,12 @@ DECLARE_INDEX(pg_class_tblspc_relfilenode_index, 3455, ClassTblspcRelfilenodeInd
  * has the same meaning as 'n'.
  */
 #define		  REPLICA_IDENTITY_INDEX	'i'
+/*
+ * the tuple identifier (TID) of the row is used as replica identity; logical
+ * replication sends it as an additional virtual column with this name
+ */
+#define		  REPLICA_IDENTITY_ROWID	'r'
+#define		  REPLICA_IDENTITY_ROWID_ATTNAME	".rowid"
 
 /*
  * Relation kinds that have physical storage. These relations normally have

@@ -9241,7 +9241,9 @@ ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
 	if (!RelationIsLogicallyLogged(relation))
 		return NULL;
 
-	if (replident == REPLICA_IDENTITY_NOTHING)
+	/* with ROWID, the decoded change carries the tuple identifier instead */
+	if (replident == REPLICA_IDENTITY_NOTHING ||
+		replident == REPLICA_IDENTITY_ROWID)
 		return NULL;
 
 	if (replident == REPLICA_IDENTITY_FULL)

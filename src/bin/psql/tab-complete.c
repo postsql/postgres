@@ -2559,7 +2559,7 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches("ALTER", "TABLE", MatchAny, "REPLICA", "IDENTITY", "USING"))
 		COMPLETE_WITH("INDEX");
 	else if (Matches("ALTER", "TABLE", MatchAny, "REPLICA", "IDENTITY"))
-		COMPLETE_WITH("FULL", "NOTHING", "DEFAULT", "USING");
+		COMPLETE_WITH("FULL", "NOTHING", "DEFAULT", "ROWID", "USING");
 	else if (Matches("ALTER", "TABLE", MatchAny, "REPLICA"))
 		COMPLETE_WITH("IDENTITY");
 
