@@ -970,6 +970,22 @@ fetch_remote_table_info(char *nspname, char *relname, LogicalRepRelation *lrel,
 	}
 	ExecDropSingleTupleTableSlot(slot);
 
+	/*
+	 * If the publisher relation uses REPLICA IDENTITY ROWID, append the
+	 * virtual ".rowid" column so initial table sync (COPY TO STDOUT) and
+	 * relation mapping include the tuple identifier.
+	 */
+	if (lrel->replident == REPLICA_IDENTITY_ROWID)
+	{
+		if (natt >= MaxTupleAttributeNumber)
+			elog(ERROR, "too many columns in remote table \"%s.%s\"",
+				 nspname, relname);
+		lrel->attnames[natt] = pstrdup(".rowid");
+		lrel->atttyps[natt] = TIDOID;
+		lrel->attkeys = bms_add_member(lrel->attkeys, natt);
+		natt++;
+	}
+
 	lrel->natts = natt;
 
 	walrcv_clear_result(res);

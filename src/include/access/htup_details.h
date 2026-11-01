@@ -810,6 +810,18 @@ extern void heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest);
 extern Datum heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc);
 extern HeapTuple heap_form_tuple(TupleDesc tupleDescriptor,
 								 const Datum *values, const bool *isnull);
+extern HeapTuple heap_form_tuple_natts(TupleDesc tupleDescriptor,
+									   const Datum *values, const bool *isnull,
+									   int numberOfAttributes);
+extern Size heap_compute_data_size_natts(TupleDesc tupleDesc,
+										 const Datum *values,
+										 const bool *isnull,
+										 int numberOfAttributes);
+extern void heap_fill_tuple_natts(TupleDesc tupleDesc,
+								  const Datum *values, const bool *isnull,
+								  char *data, Size data_size,
+								  uint16 *infomask, uint8 *bit,
+								  int numberOfAttributes);
 extern HeapTuple heap_modify_tuple(HeapTuple tuple,
 								   TupleDesc tupleDesc,
 								   const Datum *replValues,

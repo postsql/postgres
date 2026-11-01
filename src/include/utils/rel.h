@@ -356,6 +356,7 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+	pg_ternary	index_only_rowid;	/* enables index-only storage for .rowid */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -727,5 +728,8 @@ RelationCloseSmgr(Relation relation)
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
+
+extern bool logical_replication_index_only_rowid;
+extern bool RelationIsIndexOnlyRowid(Relation rel);
 
 #endif							/* REL_H */
