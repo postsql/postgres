@@ -1815,6 +1815,16 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"logical_replication_index_only_rowid", PGC_USERSET, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Skips physical heap storage for .rowid primary key columns during logical replication."),
+			NULL
+		},
+		&logical_replication_index_only_rowid,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"in_hot_standby", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows whether hot standby is currently active."),
 			NULL,

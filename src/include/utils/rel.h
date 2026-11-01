@@ -342,6 +342,7 @@ typedef struct StdRdOptions
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+	StdRdOptIndexCleanup index_only_rowid;	/* enables index-only storage for .rowid */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -708,5 +709,8 @@ RelationCloseSmgr(Relation relation)
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
+
+extern bool logical_replication_index_only_rowid;
+extern bool RelationIsIndexOnlyRowid(Relation rel);
 
 #endif							/* REL_H */
