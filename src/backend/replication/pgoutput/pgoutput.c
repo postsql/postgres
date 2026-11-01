@@ -584,6 +584,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	RelationSyncEntry *relentry;
 	TransactionId xid = InvalidTransactionId;
 	Relation	ancestor = NULL;
+	HeapTupleData rowid_key;
 
 	update_replication_progress(ctx);
 
@@ -618,6 +619,30 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			break;
 		default:
 			Assert(false);
+	}
+
+	/* tuple identifiers are only unique within a partition */
+	if (relentry->publish_as_relid != RelationGetRelid(relation) &&
+		relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot publish changes of partition \"%s\" via its partition root",
+						RelationGetRelationName(relation)),
+				 errdetail("The partition uses REPLICA IDENTITY ROWID.")));
+
+	/*
+	 * With REPLICA IDENTITY ROWID, no old tuple is logged: the key of an
+	 * UPDATE or DELETE is just the old tuple identifier, sent from a tuple
+	 * without data; see logicalrep_write_tuple().  The tuple identifiers of
+	 * the decoded change come from the WAL record.
+	 */
+	if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID &&
+		change->action != REORDER_BUFFER_CHANGE_INSERT)
+	{
+		Assert(change->data.tp.oldtuple == NULL);
+		memset(&rowid_key, 0, sizeof(rowid_key));
+		rowid_key.t_self = change->old_tid;
+		rowid_key.t_tableOid = RelationGetRelid(relation);
 	}
 
 	/* Avoid leaking memory by using and resetting our own context */
@@ -655,6 +680,9 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				&change->data.tp.oldtuple->tuple : NULL;
 				HeapTuple	newtuple = &change->data.tp.newtuple->tuple;
 
+				if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+					oldtuple = &rowid_key;
+
 				/* Switch relation if publishing via root. */
 				if (relentry->publish_as_relid != RelationGetRelid(relation))
 				{
@@ -679,9 +707,20 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				break;
 			}
 		case REORDER_BUFFER_CHANGE_DELETE:
-			if (change->data.tp.oldtuple)
+
+			/*
+			 * With REPLICA IDENTITY ROWID, no old tuple is logged; the tuple
+			 * identifier identifies the row.
+			 */
+			if (change->data.tp.oldtuple ||
+				relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
 			{
-				HeapTuple	oldtuple = &change->data.tp.oldtuple->tuple;
+				HeapTuple	oldtuple;
+
+				if (relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
+					oldtuple = &rowid_key;
+				else
+					oldtuple = &change->data.tp.oldtuple->tuple;
 
 				/* Switch relation if publishing via root. */
 				if (relentry->publish_as_relid != RelationGetRelid(relation))
