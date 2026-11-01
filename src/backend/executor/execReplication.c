@@ -592,8 +592,12 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 	if (cmd != CMD_UPDATE && cmd != CMD_DELETE)
 		return;
 
-	/* If relation has replica identity we are always good. */
+	/*
+	 * If relation has replica identity we are always good.  REPLICA IDENTITY
+	 * ROWID is also good for UPDATE/DELETE.
+	 */
 	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
+		rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID ||
 		OidIsValid(RelationGetReplicaIndex(rel)))
 		return;
 
