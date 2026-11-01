@@ -1,0 +1,207 @@
+-- Tuple identifiers (TIDs) in logical decoding.
+--
+-- Tables are created fresh with autovacuum disabled, so TIDs are
+-- deterministic.
+SET synchronous_commit = on;
+SELECT 'init' FROM pg_create_logical_replication_slot('tids_slot', 'test_decoding');
+ ?column? 
+----------
+ init
+(1 row)
+
+CREATE TABLE tids_t (id int PRIMARY KEY, val text) WITH (autovacuum_enabled = off);
+CREATE TABLE tids_nokey (val text) WITH (autovacuum_enabled = off);
+ALTER TABLE tids_nokey REPLICA IDENTITY NOTHING;
+SELECT count(*) > 0 FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL);
+ ?column? 
+----------
+ t
+(1 row)
+
+-- By default, TIDs are not passed to the output plugin.
+SHOW logical_decoding_expose_headers;
+ logical_decoding_expose_headers 
+---------------------------------
+ off
+(1 row)
+
+INSERT INTO tids_t VALUES (1, 'one');
+UPDATE tids_t SET val = 'one-upd' WHERE id = 1;
+DELETE FROM tids_t WHERE id = 1;
+SELECT data FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
+                              data                              
+----------------------------------------------------------------
+ BEGIN
+ table public.tids_t: INSERT: id[integer]:1 val[text]:'one'
+ COMMIT
+ BEGIN
+ table public.tids_t: UPDATE: id[integer]:1 val[text]:'one-upd'
+ COMMIT
+ BEGIN
+ table public.tids_t: DELETE: id[integer]:1
+ COMMIT
+(9 rows)
+
+-- The setting is evaluated by the decoding session, not when the change
+-- was made: the changes below are made with the setting off.
+INSERT INTO tids_t VALUES (2, 'two');                    -- single insert
+INSERT INTO tids_t VALUES (3, 'three'), (4, 'four');     -- multi-row insert
+UPDATE tids_t SET val = 'two-upd' WHERE id = 2;          -- HOT update
+UPDATE tids_t SET id = 20 WHERE id = 2;                  -- non-HOT update
+DELETE FROM tids_t WHERE id = 3;
+INSERT INTO tids_t VALUES (4, 'dup') ON CONFLICT (id) DO UPDATE SET val = 'four-upd';
+INSERT INTO tids_t VALUES (5, 'five') ON CONFLICT (id) DO NOTHING;
+INSERT INTO tids_nokey VALUES ('hello');
+DELETE FROM tids_nokey;                                  -- no old tuple data logged
+COPY tids_t FROM stdin;                                  -- heap_multi_insert
+SET logical_decoding_expose_headers = on;
+SELECT data FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
+                                                              data                                                               
+---------------------------------------------------------------------------------------------------------------------------------
+ BEGIN
+ table public.tids_t: INSERT: new-tid: (0,3) id[integer]:2 val[text]:'two'
+ COMMIT
+ BEGIN
+ table public.tids_t: INSERT: new-tid: (0,4) id[integer]:3 val[text]:'three'
+ table public.tids_t: INSERT: new-tid: (0,5) id[integer]:4 val[text]:'four'
+ COMMIT
+ BEGIN
+ table public.tids_t: UPDATE: old-tid: (0,3) new-tid: (0,6) id[integer]:2 val[text]:'two-upd'
+ COMMIT
+ BEGIN
+ table public.tids_t: UPDATE: old-tid: (0,6) new-tid: (0,7) old-key: id[integer]:2 new-tuple: id[integer]:20 val[text]:'two-upd'
+ COMMIT
+ BEGIN
+ table public.tids_t: DELETE: old-tid: (0,4) id[integer]:3
+ COMMIT
+ BEGIN
+ table public.tids_t: UPDATE: old-tid: (0,5) new-tid: (0,8) id[integer]:4 val[text]:'four-upd'
+ COMMIT
+ BEGIN
+ table public.tids_t: INSERT: new-tid: (0,9) id[integer]:5 val[text]:'five'
+ COMMIT
+ BEGIN
+ table public.tids_nokey: INSERT: new-tid: (0,1) val[text]:'hello'
+ COMMIT
+ BEGIN
+ table public.tids_nokey: DELETE: old-tid: (0,1) (no-tuple-data)
+ COMMIT
+ BEGIN
+ table public.tids_t: INSERT: new-tid: (0,10) id[integer]:6 val[text]:'six'
+ table public.tids_t: INSERT: new-tid: (0,11) id[integer]:7 val[text]:'seven'
+ COMMIT
+(32 rows)
+
+-- The TIDs match the actual tuple locations
+SELECT ctid, id FROM tids_t ORDER BY id;
+  ctid  | id 
+--------+----
+ (0,8)  |  4
+ (0,9)  |  5
+ (0,10) |  6
+ (0,11) |  7
+ (0,7)  | 20
+(5 rows)
+
+-- Rows placed on new pages, and an UPDATE moving a row to another page
+CREATE TABLE tids_wide (id int, pad text) WITH (autovacuum_enabled = off, fillfactor = 10);
+SELECT count(*) > 0 FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL);
+ ?column? 
+----------
+ t
+(1 row)
+
+INSERT INTO tids_wide SELECT g, repeat('x', 500) FROM generate_series(1, 3) g;
+UPDATE tids_wide SET pad = repeat('y', 500) WHERE id = 1;
+SELECT data FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
+                                                                                                                                                                                                                                                                                                     data                                                                                                                                                                                                                                                                                                     
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ BEGIN
+ table public.tids_wide: INSERT: new-tid: (0,1) id[integer]:1 pad[text]:'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+ table public.tids_wide: INSERT: new-tid: (1,1) id[integer]:2 pad[text]:'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+ table public.tids_wide: INSERT: new-tid: (2,1) id[integer]:3 pad[text]:'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+ COMMIT
+ BEGIN
+ table public.tids_wide: UPDATE: old-tid: (0,1) new-tid: (0,2) id[integer]:1 pad[text]:'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'
+ COMMIT
+(8 rows)
+
+SELECT ctid, id FROM tids_wide ORDER BY id;
+ ctid  | id 
+-------+----
+ (0,2) |  1
+ (1,1) |  2
+ (2,1) |  3
+(3 rows)
+
+-- COPY into an empty table initializes the page (XLOG_HEAP_INIT_PAGE)
+CREATE TABLE tids_copy (id int) WITH (autovacuum_enabled = off);
+SELECT count(*) > 0 FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL);
+ ?column? 
+----------
+ t
+(1 row)
+
+COPY tids_copy FROM stdin;
+SELECT data FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
+                             data                             
+--------------------------------------------------------------
+ BEGIN
+ table public.tids_copy: INSERT: new-tid: (0,1) id[integer]:1
+ table public.tids_copy: INSERT: new-tid: (0,2) id[integer]:2
+ table public.tids_copy: INSERT: new-tid: (0,3) id[integer]:3
+ COMMIT
+(5 rows)
+
+SELECT ctid, id FROM tids_copy ORDER BY id;
+ ctid  | id 
+-------+----
+ (0,1) |  1
+ (0,2) |  2
+ (0,3) |  3
+(3 rows)
+
+-- Spilled transactions keep their TIDs
+SET logical_decoding_work_mem = '64kB';
+CREATE TABLE tids_spill (id int) WITH (autovacuum_enabled = off);
+SELECT count(*) > 0 FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL);
+ ?column? 
+----------
+ t
+(1 row)
+
+INSERT INTO tids_spill SELECT g FROM generate_series(1, 5000) g;
+SELECT count(*) AS changes,
+	   count(*) FILTER (WHERE data ~ 'new-tid: \(\d+,\d+\)') AS with_tid,
+	   count(DISTINCT substring(data FROM 'new-tid: (\(\d+,\d+\))')) AS distinct_tids
+FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1')
+WHERE data LIKE 'table %';
+ changes | with_tid | distinct_tids 
+---------+----------+---------------
+    5000 |     5000 |          5000
+(1 row)
+
+SELECT count(DISTINCT ctid) FROM tids_spill;
+ count 
+-------
+  5000
+(1 row)
+
+RESET logical_decoding_work_mem;
+-- Invalid option value
+SELECT data FROM pg_logical_slot_get_changes('tids_slot', NULL, NULL, 'include-tids', 'maybe');
+ERROR:  could not parse value "maybe" for parameter "include-tids"
+CONTEXT:  slot "tids_slot", output plugin "test_decoding", in the startup callback
+RESET logical_decoding_expose_headers;
+DROP TABLE tids_t, tids_nokey, tids_wide, tids_copy, tids_spill;
+SELECT pg_drop_replication_slot('tids_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+

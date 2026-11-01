@@ -4801,6 +4801,28 @@ HINT:  If it is safe for all REPLICATION users to use this library as an output 
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-logical-decoding-expose-headers" xreflabel="logical_decoding_expose_headers">
+      <term><varname>logical_decoding_expose_headers</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>logical_decoding_expose_headers</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Pass the tuple identifier (<acronym>TID</acronym>, see
+        <xref linkend="ddl-system-columns-ctid"/>) of every decoded row change
+        to logical decoding output plugins: the location of the new row
+        version of an <command>INSERT</command> or <command>UPDATE</command>
+        and of the old row version of an <command>UPDATE</command> or
+        <command>DELETE</command>.  The setting is evaluated by the session
+        that performs the decoding, so it affects all changes it decodes,
+        including those made while it was off.  For tables using
+        <literal>REPLICA IDENTITY ROWID</literal> tuple identifiers are always
+        passed.  The default is <literal>off</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-track-commit-timestamp" xreflabel="track_commit_timestamp">
       <term><varname>track_commit_timestamp</varname> (<type>boolean</type>)
       <indexterm>
