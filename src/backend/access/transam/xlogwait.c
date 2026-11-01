@@ -419,6 +419,54 @@ RegisterWaitLSNShmemExit(void)
 }
 
 /*
+ * Return the current commit-visibility LSN for this node:
+ * standby replay LSN during recovery, or WAL flush LSN on a primary.
+ */
+XLogRecPtr
+WaitLSNGetVisibleLSN(WaitLSNType *lsnType)
+{
+	WaitLSNType type = RecoveryInProgress() ?
+		WAIT_LSN_TYPE_STANDBY_REPLAY : WAIT_LSN_TYPE_PRIMARY_FLUSH;
+
+	if (lsnType != NULL)
+		*lsnType = type;
+	return GetCurrentLSNForWaitType(type);
+}
+
+/*
+ * Arm MyLatch via WaitLSNState to wake up once the node's visible LSN advances
+ * past afterLSN (or recovery ends).  Returns true if the LSN has already
+ * advanced (leaving nothing armed); returns false when armed for sleep.
+ */
+bool
+WaitLSNArmIdleWakeup(XLogRecPtr afterLSN)
+{
+	WaitLSNType lsnType;
+	XLogRecPtr	currentLSN;
+
+	if (waitLSNState == NULL || MyProcNumber < 0)
+		return false;
+
+	WaitLSNCleanup();
+	RegisterWaitLSNShmemExit();
+
+	lsnType = RecoveryInProgress() ?
+		WAIT_LSN_TYPE_STANDBY_REPLAY : WAIT_LSN_TYPE_PRIMARY_FLUSH;
+	addLSNWaiter(afterLSN + 1, lsnType);
+
+	/* Re-check after registering to close any check-then-sleep race */
+	currentLSN = GetCurrentLSNForWaitType(lsnType);
+	if (currentLSN > afterLSN ||
+		(lsnType == WAIT_LSN_TYPE_STANDBY_REPLAY && !RecoveryInProgress()))
+	{
+		WaitLSNCleanup();
+		return true;
+	}
+
+	return false;
+}
+
+/*
  * Check if the given LSN type requires recovery to be in progress.
  * Standby wait types (replay, write, flush) require recovery;
  * primary wait types (flush) do not.

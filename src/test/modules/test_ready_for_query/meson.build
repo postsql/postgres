@@ -33,6 +33,7 @@ tests += {
   'tap': {
     'tests': [
       't/001_ready_for_query.pl',
+      't/002_commits_visible_notify.pl',
     ],
   },
 }

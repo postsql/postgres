@@ -325,17 +325,23 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 			}
 
 		case T_ListenStmt:
+			{
+				ListenStmt *stmt = (ListenStmt *) parsetree;
+
+				if (IsCommitsVisibleLSNChannel(stmt->conditionname, NULL))
+					return COMMAND_OK_IN_RECOVERY | COMMAND_OK_IN_READ_ONLY_TXN;
+				return COMMAND_OK_IN_READ_ONLY_TXN;
+			}
+
 		case T_NotifyStmt:
 			{
 				/*
 				 * NOTIFY requires an XID assignment, so it can't be permitted
-				 * on a standby. Perhaps LISTEN could, since without NOTIFY it
-				 * would be OK to just do nothing, at least until promotion,
-				 * but we currently prohibit it lest the user get the wrong
-				 * idea.
+				 * on a standby.
 				 *
-				 * (We do allow T_UnlistenStmt on a standby, though, because
-				 * it's a no-op.)
+				 * (We do allow T_UnlistenStmt on a standby, though, and
+				 * T_ListenStmt for built-in "Commits visible at LSN ..."
+				 * channels.)
 				 */
 				return COMMAND_OK_IN_READ_ONLY_TXN;
 			}

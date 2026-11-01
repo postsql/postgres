@@ -38,6 +38,7 @@ typedef enum
 } LogStmtLevel;
 
 extern PGDLLIMPORT bool Log_disconnections;
+extern PGDLLIMPORT bool DoingCommandRead;
 extern PGDLLIMPORT int log_statement;
 
 /* Flags for restrict_nonsystem_relation_kind value */

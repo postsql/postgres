@@ -29,6 +29,9 @@ extern void Async_Listen(const char *channel);
 extern void Async_Unlisten(const char *channel);
 extern void Async_UnlistenAll(void);
 extern bool HasActiveListenChannels(void);
+extern bool IsCommitsVisibleLSNChannel(const char *channel, int *idx_out);
+extern void ProcessCommitsVisibleLSNNotify(void);
+extern long CommitsVisibleLSNIdlePoll(int *waitfor);
 
 /* perform (or cancel) outbound notify processing at transaction commit */
 extern void PreCommit_Notify(void);

@@ -148,7 +148,7 @@ static bool xact_started = false;
  * as opposed to any random read from client that might happen within
  * commands like COPY FROM STDIN.
  */
-static bool DoingCommandRead = false;
+bool		DoingCommandRead = false;
 
 /*
  * Flags to implement skip-till-Sync-after-error behavior for messages of
@@ -4785,6 +4785,7 @@ PostgresMain(const char *dbname, const char *username)
 				 */
 				if (notifyInterruptPending)
 					ProcessNotifyInterrupt(false);
+				ProcessCommitsVisibleLSNNotify();
 
 				/*
 				 * Check if we need to report stats. If pgstat_report_stat()

@@ -117,6 +117,28 @@ LISTEN <replaceable class="parameter">channel</replaceable>
    discussion of the use of <command>LISTEN</command> and
    <command>NOTIFY</command>.
   </para>
+
+  <para>
+   In addition to user-defined channels, <productname>PostgreSQL</productname>
+   provides seven built-in read-only system channels that report the LSN up to
+   which committed transactions are visible (the WAL flush LSN on a primary, or
+   the WAL replay LSN on a hot standby replica):
+   <literal>"Commits visible at LSN 10 ms"</literal>,
+   <literal>"Commits visible at LSN 20 ms"</literal>,
+   <literal>"Commits visible at LSN 50 ms"</literal>,
+   <literal>"Commits visible at LSN 100 ms"</literal>,
+   <literal>"Commits visible at LSN 200 ms"</literal>,
+   <literal>"Commits visible at LSN 500 ms"</literal>, and
+   <literal>"Commits visible at LSN 1 s"</literal>.
+   Subscribing to any of these channels is permitted on both primary servers and
+   hot standbys in recovery.  Upon committing <command>LISTEN</command>, an
+   immediate notification is sent with payload formatted as an ISO-8601 UTC
+   timestamp and LSN pair (for example,
+   <literal>2026-11-01T10:47:59.123456Z 0/0306EE20</literal>), followed by
+   coalesced updates at most once per channel interval whenever the LSN
+   advances.  User <command>NOTIFY</command> commands on channels beginning
+   with <literal>Commits visible at LSN </literal> are rejected.
+  </para>
  </refsect1>
 
  <refsect1>

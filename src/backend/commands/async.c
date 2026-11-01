@@ -166,6 +166,7 @@
 #include "access/slru.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlogwait.h"
 #include "catalog/pg_database.h"
 #include "commands/async.h"
 #include "common/hashfn.h"
@@ -174,6 +175,7 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -568,6 +570,60 @@ static bool unlistenExitRegistered = false;
 static bool amRegisteredListener = false;
 
 /*
+ * Built-in coalescing system channels: "Commits visible at LSN <interval>".
+ * These bypass globalChannelTable and pg_notify SLRU completely, reusing
+ * localChannelTable for session introspection and WaitLSNState for wakeups.
+ */
+#define COMMITS_VISIBLE_LSN_PREFIX "Commits visible at LSN "
+#define COMMITS_VISIBLE_LSN_NUM_CHANNELS 7
+
+typedef struct CommitsVisibleLSNChannelDef
+{
+	const char *name;
+	int64		interval_us;
+} CommitsVisibleLSNChannelDef;
+
+static const CommitsVisibleLSNChannelDef CommitsVisibleChannels[COMMITS_VISIBLE_LSN_NUM_CHANNELS] =
+{
+	{"Commits visible at LSN 10 ms", 10000},
+	{"Commits visible at LSN 20 ms", 20000},
+	{"Commits visible at LSN 50 ms", 50000},
+	{"Commits visible at LSN 100 ms", 100000},
+	{"Commits visible at LSN 200 ms", 200000},
+	{"Commits visible at LSN 500 ms", 500000},
+	{"Commits visible at LSN 1 s", 1000000},
+};
+
+static uint32 commits_visible_mask = 0;
+static uint32 commits_visible_initial_pending = 0;
+static XLogRecPtr commits_visible_last_lsn[COMMITS_VISIBLE_LSN_NUM_CHANNELS];
+static TimestampTz commits_visible_next_due[COMMITS_VISIBLE_LSN_NUM_CHANNELS];
+
+#define HasStandardListenChannels() \
+	(localChannelTable != NULL && \
+	 hash_get_num_entries(localChannelTable) > pg_popcount32(commits_visible_mask))
+
+bool
+IsCommitsVisibleLSNChannel(const char *channel, int *idx_out)
+{
+	if (channel == NULL ||
+		strncmp(channel, COMMITS_VISIBLE_LSN_PREFIX,
+				strlen(COMMITS_VISIBLE_LSN_PREFIX)) != 0)
+		return false;
+
+	for (int i = 0; i < COMMITS_VISIBLE_LSN_NUM_CHANNELS; i++)
+	{
+		if (strcmp(channel, CommitsVisibleChannels[i].name) == 0)
+		{
+			if (idx_out != NULL)
+				*idx_out = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * Queue head positions for direct advancement.
  * These are captured during PreCommit_Notify while holding the heavyweight
  * lock on database 0, ensuring no other backend can insert notifications
@@ -935,6 +991,13 @@ Async_Notify(const char *channel, const char *payload)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("payload string too long")));
 
+	if (strncmp(channel, COMMITS_VISIBLE_LSN_PREFIX,
+				strlen(COMMITS_VISIBLE_LSN_PREFIX)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("channel name \"%s\" is reserved for system LSN notifications",
+						channel)));
+
 	/*
 	 * We must construct the Notification entry, even if we end up not using
 	 * it, in order to compare it cheaply to existing list entries.
@@ -1070,7 +1133,7 @@ Async_Unlisten(const char *channel)
 		elog(DEBUG1, "Async_Unlisten(%s,%d)", channel, MyProcPid);
 
 	/* If we couldn't possibly be listening, no need to queue anything */
-	if (pendingActions == NULL && !unlistenExitRegistered)
+	if (pendingActions == NULL && !unlistenExitRegistered && commits_visible_mask == 0)
 		return;
 
 	queue_listen(LISTEN_UNLISTEN, channel);
@@ -1088,7 +1151,7 @@ Async_UnlistenAll(void)
 		elog(DEBUG1, "Async_UnlistenAll(%d)", MyProcPid);
 
 	/* If we couldn't possibly be listening, no need to queue anything */
-	if (pendingActions == NULL && !unlistenExitRegistered)
+	if (pendingActions == NULL && !unlistenExitRegistered && commits_visible_mask == 0)
 		return;
 
 	queue_listen(LISTEN_UNLISTEN_ALL, "");
@@ -1202,8 +1265,8 @@ PreCommit_Notify(void)
 	if (Trace_notify)
 		elog(DEBUG1, "PreCommit_Notify");
 
-	/* Preflight for any pending listen/unlisten actions */
-	initGlobalChannelTable();
+	if (pendingNotifies != NULL)
+		initGlobalChannelTable();
 
 	if (pendingActions != NULL)
 	{
@@ -1220,7 +1283,11 @@ PreCommit_Notify(void)
 			switch (actrec->action)
 			{
 				case LISTEN_LISTEN:
-					BecomeRegisteredListener();
+					if (!IsCommitsVisibleLSNChannel(actrec->channel, NULL))
+					{
+						initGlobalChannelTable();
+						BecomeRegisteredListener();
+					}
 					PrepareTableEntriesForListen(actrec->channel);
 					break;
 				case LISTEN_UNLISTEN:
@@ -1400,8 +1467,8 @@ AtCommit_Notify(void)
 	/* Apply staged listen/unlisten changes */
 	ApplyPendingListenActions(true);
 
-	/* If no longer listening to anything, get out of listener array */
-	if (amRegisteredListener && LocalChannelTableIsEmpty())
+	/* If no longer listening to any standard channel, get out of listener array */
+	if (amRegisteredListener && !HasStandardListenChannels())
 		asyncQueueUnregister();
 
 	/*
@@ -1565,6 +1632,10 @@ PrepareTableEntriesForListen(const char *channel)
 	 * PrepareTableEntriesForUnlisten and PrepareTableEntriesForUnlistenAll.
 	 */
 	(void) hash_search(localChannelTable, channel, HASH_ENTER, NULL);
+
+	/* System LSN channels bypass globalChannelTable and pg_notify SLRU */
+	if (IsCommitsVisibleLSNChannel(channel, NULL))
+		return;
 
 	/* Pre-allocate entry in shared globalChannelTable */
 	GlobalChannelKeyInit(&key, MyDatabaseId, channel);
@@ -1735,10 +1806,6 @@ ApplyPendingListenActions(bool isCommit)
 	if (pendingListenActions == NULL)
 		return;
 
-	/* We made a globalChannelTable before building pendingListenActions */
-	if (globalChannelTable == NULL)
-		elog(PANIC, "global channel table missing post-commit/abort");
-
 	/* For each staged action ... */
 	hash_seq_init(&seq, pendingListenActions);
 	while ((pending = (PendingListenEntry *) hash_seq_search(&seq)) != NULL)
@@ -1747,6 +1814,48 @@ ApplyPendingListenActions(bool isCommit)
 		GlobalChannelEntry *entry;
 		bool		removeLocal = true;
 		bool		foundListener = false;
+		int			sys_idx;
+
+		if (IsCommitsVisibleLSNChannel(pending->channel, &sys_idx))
+		{
+			uint32		bit = (1U << sys_idx);
+
+			if (isCommit)
+			{
+				if (pending->action == PENDING_LISTEN)
+				{
+					if ((commits_visible_mask & bit) == 0)
+					{
+						commits_visible_mask |= bit;
+						commits_visible_initial_pending |= bit;
+						commits_visible_last_lsn[sys_idx] = InvalidXLogRecPtr;
+						commits_visible_next_due[sys_idx] = 0;
+					}
+					removeLocal = false;
+				}
+				else
+				{
+					commits_visible_mask &= ~bit;
+					commits_visible_initial_pending &= ~bit;
+					if (commits_visible_mask == 0)
+						WaitLSNCleanup();
+				}
+			}
+			else if ((commits_visible_mask & bit) != 0)
+			{
+				/* Entry predates this aborted transaction; keep local entry */
+				removeLocal = false;
+			}
+
+			if (removeLocal && localChannelTable != NULL)
+				(void) hash_search(localChannelTable, pending->channel,
+								   HASH_REMOVE, NULL);
+			continue;
+		}
+
+		/* We made a globalChannelTable before staging standard channels */
+		if (globalChannelTable == NULL)
+			elog(PANIC, "global channel table missing post-commit/abort");
 
 		/*
 		 * Find the global entry for this channel.  If isCommit, it had better
@@ -2432,8 +2541,8 @@ AtAbort_Notify(void)
 	/* Revert staged listen/unlisten changes */
 	ApplyPendingListenActions(false);
 
-	/* If we're no longer listening on anything, unregister */
-	if (amRegisteredListener && LocalChannelTableIsEmpty())
+	/* If we're no longer listening on any standard channel, unregister */
+	if (amRegisteredListener && !HasStandardListenChannels())
 		asyncQueueUnregister();
 
 	/* And clean up */
@@ -3306,4 +3415,191 @@ bool
 check_notify_buffers(int *newval, void **extra, GucSource source)
 {
 	return check_slru_buffers("notify_buffers", newval);
+}
+
+static TimestampTz
+NextCommitsVisibleTick(TimestampTz now, int64 interval_us)
+{
+	int64		rem = now % interval_us;
+
+	if (rem < 0)
+		rem += interval_us;
+	return now - rem + interval_us;
+}
+
+static void
+FormatCommitsVisiblePayload(TimestampTz ts, XLogRecPtr lsn,
+							char *buf, size_t buflen)
+{
+	struct pg_tm tm;
+	fsec_t		fsec = 0;
+
+	if (timestamp2tm(ts, NULL, &tm, &fsec, NULL, NULL) == 0)
+		snprintf(buf, buflen,
+				 "%04d-%02d-%02dT%02d:%02d:%02d.%06dZ %X/%08X",
+				 tm.tm_year, tm.tm_mon, tm.tm_mday,
+				 tm.tm_hour, tm.tm_min, tm.tm_sec,
+				 (int) fsec, LSN_FORMAT_ARGS(lsn));
+	else
+		snprintf(buf, buflen,
+				 "1970-01-01T00:00:00.000000Z %X/%08X",
+				 LSN_FORMAT_ARGS(lsn));
+}
+
+/*
+ * Emit any due "Commits visible at LSN ..." notifications.
+ * Returns false if non-blocking socket flush encountered an I/O error.
+ */
+static bool
+EmitDueCommitsVisibleLSN(bool flush_nonblock, int *waitfor,
+						 XLogRecPtr *current_lsn_out, TimestampTz *now_out)
+{
+	XLogRecPtr	current_lsn = WaitLSNGetVisibleLSN(NULL);
+	TimestampTz now = GetCurrentTimestamp();
+	bool		any_due = false;
+	char		payload[64];
+	int32		src_pid = PostmasterPid ? PostmasterPid : MyProcPid;
+
+	if (current_lsn_out != NULL)
+		*current_lsn_out = current_lsn;
+	if (now_out != NULL)
+		*now_out = now;
+
+	for (int i = 0; i < COMMITS_VISIBLE_LSN_NUM_CHANNELS; i++)
+	{
+		uint32		bit = (1U << i);
+
+		if ((commits_visible_mask & bit) == 0)
+			continue;
+		if ((commits_visible_initial_pending & bit) != 0 ||
+			(current_lsn > commits_visible_last_lsn[i] &&
+			 now >= commits_visible_next_due[i]))
+		{
+			any_due = true;
+			break;
+		}
+	}
+
+	if (!any_due)
+		return true;
+
+	if (flush_nonblock)
+	{
+		bool		save_noblock = MyProcPort ? MyProcPort->noblock : false;
+		int			rc = pq_flush_if_writable();
+
+		if (MyProcPort)
+			MyProcPort->noblock = save_noblock;
+		if (rc != 0)
+			return false;
+		if (pq_is_send_pending())
+		{
+			if (waitfor != NULL)
+				*waitfor |= WL_SOCKET_WRITEABLE;
+			return true;
+		}
+	}
+
+	FormatCommitsVisiblePayload(now, current_lsn, payload, sizeof(payload));
+
+	for (int i = 0; i < COMMITS_VISIBLE_LSN_NUM_CHANNELS; i++)
+	{
+		uint32		bit = (1U << i);
+
+		if ((commits_visible_mask & bit) == 0)
+			continue;
+		if ((commits_visible_initial_pending & bit) != 0 ||
+			(current_lsn > commits_visible_last_lsn[i] &&
+			 now >= commits_visible_next_due[i]))
+		{
+			NotifyMyFrontEnd(CommitsVisibleChannels[i].name, payload, src_pid);
+			commits_visible_initial_pending &= ~bit;
+			commits_visible_last_lsn[i] = current_lsn;
+			commits_visible_next_due[i] =
+				NextCommitsVisibleTick(now, CommitsVisibleChannels[i].interval_us);
+		}
+	}
+
+	if (flush_nonblock)
+	{
+		bool		save_noblock = MyProcPort ? MyProcPort->noblock : false;
+		int			rc = pq_flush_if_writable();
+
+		if (MyProcPort)
+			MyProcPort->noblock = save_noblock;
+		if (rc != 0)
+			return false;
+		if (pq_is_send_pending() && waitfor != NULL)
+			*waitfor |= WL_SOCKET_WRITEABLE;
+	}
+
+	return true;
+}
+
+void
+ProcessCommitsVisibleLSNNotify(void)
+{
+	if (commits_visible_mask == 0 || IsTransactionOrTransactionBlock())
+		return;
+	(void) EmitDueCommitsVisibleLSN(false, NULL, NULL, NULL);
+}
+
+/*
+ * Prepare idle wait in secure_read() for "Commits visible at LSN ..." channels.
+ * Emits any already-due notifications without blocking, arms WaitLSNState when
+ * caught up, or returns the millisecond timeout until the next cadence tick.
+ */
+long
+CommitsVisibleLSNIdlePoll(int *waitfor)
+{
+	XLogRecPtr	current_lsn;
+	TimestampTz now;
+
+	if (commits_visible_mask == 0 || !DoingCommandRead ||
+		IsTransactionOrTransactionBlock())
+		return -1;
+
+	for (;;)
+	{
+		TimestampTz earliest_due = PG_INT64_MAX;
+		XLogRecPtr	min_last_lsn = PG_UINT64_MAX;
+		bool		any_pending_cooldown = false;
+
+		if (!EmitDueCommitsVisibleLSN(true, waitfor, &current_lsn, &now))
+			return -1;
+
+		if (waitfor != NULL && (*waitfor & WL_SOCKET_WRITEABLE) != 0)
+			return -1;
+
+		for (int i = 0; i < COMMITS_VISIBLE_LSN_NUM_CHANNELS; i++)
+		{
+			uint32		bit = (1U << i);
+
+			if ((commits_visible_mask & bit) == 0)
+				continue;
+			if ((commits_visible_initial_pending & bit) != 0 ||
+				current_lsn > commits_visible_last_lsn[i])
+			{
+				any_pending_cooldown = true;
+				if (commits_visible_next_due[i] < earliest_due)
+					earliest_due = commits_visible_next_due[i];
+			}
+			else if (commits_visible_last_lsn[i] < min_last_lsn)
+			{
+				min_last_lsn = commits_visible_last_lsn[i];
+			}
+		}
+
+		if (any_pending_cooldown)
+		{
+			int64		diff_us = earliest_due - now;
+
+			if (diff_us <= 0)
+				return 1;
+			return (long) ((diff_us + 999) / 1000);
+		}
+
+		if (!WaitLSNArmIdleWakeup(min_last_lsn))
+			return -1;
+	}
 }

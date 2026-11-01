@@ -27,6 +27,8 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+#include "access/xlogwait.h"
+#include "commands/async.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -214,13 +216,18 @@ retry:
 	if (n < 0 && !port->noblock && (errno == EWOULDBLOCK || errno == EAGAIN))
 	{
 		WaitEvent	event;
+		long		timeout_ms;
 
 		Assert(waitfor);
 
+		timeout_ms = CommitsVisibleLSNIdlePoll(&waitfor);
+
 		ModifyWaitEvent(FeBeWaitSet, FeBeWaitSetSocketPos, waitfor, NULL);
 
-		WaitEventSetWait(FeBeWaitSet, -1 /* no timeout */ , &event, 1,
+		WaitEventSetWait(FeBeWaitSet, timeout_ms, &event, 1,
 						 WAIT_EVENT_CLIENT_READ);
+
+		WaitLSNCleanup();
 
 		/*
 		 * If the postmaster has died, it's not safe to continue running,

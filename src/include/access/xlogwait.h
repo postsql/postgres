@@ -101,6 +101,8 @@ typedef struct WaitLSNState
 extern PGDLLIMPORT WaitLSNState *waitLSNState;
 
 extern XLogRecPtr GetCurrentLSNForWaitType(WaitLSNType lsnType);
+extern XLogRecPtr WaitLSNGetVisibleLSN(WaitLSNType *lsnType);
+extern bool WaitLSNArmIdleWakeup(XLogRecPtr afterLSN);
 extern void WaitLSNWakeup(WaitLSNType lsnType, XLogRecPtr currentLSN);
 extern void WaitLSNCleanup(void);
 extern WaitLSNResult WaitForLSN(WaitLSNType lsnType, XLogRecPtr targetLSN,
