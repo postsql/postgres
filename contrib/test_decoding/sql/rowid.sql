@@ -84,5 +84,48 @@ SELECT data FROM pg_logical_slot_get_changes('rowid_slot', NULL, NULL,
 	'include-xids', '0', 'skip-empty-xacts', '1', 'include-tids', '1');
 
 SELECT pg_drop_replication_slot('rowid_slot');
-DROP TABLE rowid_t, rowid_other;
+
+-- pgoutput sends the tuple identifier as the virtual key column ".rowid"
+CREATE TABLE rowid_po (id int, val text) WITH (autovacuum_enabled = off);
+ALTER TABLE rowid_po REPLICA IDENTITY ROWID;
+CREATE PUBLICATION rowid_po_pub FOR TABLE rowid_po;
+SELECT 'init' FROM pg_create_logical_replication_slot('rowid_po_slot', 'pgoutput');
+INSERT INTO rowid_po VALUES (1, 'one');
+UPDATE rowid_po SET val = 'one-upd';
+DELETE FROM rowid_po;
+-- message type; whether the message contains the column name ".rowid", and
+-- the tuple identifiers (0,1) and (0,2) in text format
+SELECT chr(get_byte(data, 0)) AS msg,
+	   position('\x2e726f77696400'::bytea IN data) > 0 AS rowid_attr,
+	   position(convert_to('(0,1)', 'UTF8') IN data) > 0 AS tid_0_1,
+	   position(convert_to('(0,2)', 'UTF8') IN data) > 0 AS tid_0_2
+FROM pg_logical_slot_get_binary_changes('rowid_po_slot', NULL, NULL,
+	'proto_version', '4', 'publication_names', 'rowid_po_pub')
+WHERE chr(get_byte(data, 0)) IN ('R', 'I', 'U', 'D');
+-- binary mode sends the tuple identifier in binary
+INSERT INTO rowid_po VALUES (2, 'two');
+SELECT chr(get_byte(data, 0)) AS msg,
+	   position('\x6200000006000000000003'::bytea IN data) > 0 AS binary_tid_0_3
+FROM pg_logical_slot_get_binary_changes('rowid_po_slot', NULL, NULL,
+	'proto_version', '4', 'publication_names', 'rowid_po_pub', 'binary', 'true')
+WHERE chr(get_byte(data, 0)) = 'I';
+SELECT pg_drop_replication_slot('rowid_po_slot');
+DROP PUBLICATION rowid_po_pub;
+
+-- a ROWID partition cannot be published via its partition root
+CREATE TABLE rowid_root (id int) PARTITION BY RANGE (id);
+CREATE TABLE rowid_leaf PARTITION OF rowid_root FOR VALUES FROM (0) TO (10);
+ALTER TABLE rowid_leaf REPLICA IDENTITY ROWID;
+CREATE PUBLICATION rowid_root_pub FOR TABLE rowid_root WITH (publish_via_partition_root = true);
+SELECT 'init' FROM pg_create_logical_replication_slot('rowid_root_slot', 'pgoutput');
+INSERT INTO rowid_root VALUES (1);
+\set VERBOSITY terse
+SELECT count(*) FROM pg_logical_slot_get_binary_changes('rowid_root_slot', NULL, NULL,
+	'proto_version', '4', 'publication_names', 'rowid_root_pub');
+\set VERBOSITY default
+SELECT pg_drop_replication_slot('rowid_root_slot');
+DROP PUBLICATION rowid_root_pub;
+DROP TABLE rowid_root;
+
+DROP TABLE rowid_t, rowid_other, rowid_po;
 DROP ROLE regress_rowid_user;

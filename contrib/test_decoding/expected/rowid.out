@@ -175,5 +175,79 @@ SELECT pg_drop_replication_slot('rowid_slot');
  
 (1 row)
 
-DROP TABLE rowid_t, rowid_other;
+-- pgoutput sends the tuple identifier as the virtual key column ".rowid"
+CREATE TABLE rowid_po (id int, val text) WITH (autovacuum_enabled = off);
+ALTER TABLE rowid_po REPLICA IDENTITY ROWID;
+CREATE PUBLICATION rowid_po_pub FOR TABLE rowid_po;
+SELECT 'init' FROM pg_create_logical_replication_slot('rowid_po_slot', 'pgoutput');
+ ?column? 
+----------
+ init
+(1 row)
+
+INSERT INTO rowid_po VALUES (1, 'one');
+UPDATE rowid_po SET val = 'one-upd';
+DELETE FROM rowid_po;
+-- message type; whether the message contains the column name ".rowid", and
+-- the tuple identifiers (0,1) and (0,2) in text format
+SELECT chr(get_byte(data, 0)) AS msg,
+	   position('\x2e726f77696400'::bytea IN data) > 0 AS rowid_attr,
+	   position(convert_to('(0,1)', 'UTF8') IN data) > 0 AS tid_0_1,
+	   position(convert_to('(0,2)', 'UTF8') IN data) > 0 AS tid_0_2
+FROM pg_logical_slot_get_binary_changes('rowid_po_slot', NULL, NULL,
+	'proto_version', '4', 'publication_names', 'rowid_po_pub')
+WHERE chr(get_byte(data, 0)) IN ('R', 'I', 'U', 'D');
+ msg | rowid_attr | tid_0_1 | tid_0_2 
+-----+------------+---------+---------
+ R   | t          | f       | f
+ I   | f          | t       | f
+ U   | f          | t       | t
+ D   | f          | f       | t
+(4 rows)
+
+-- binary mode sends the tuple identifier in binary
+INSERT INTO rowid_po VALUES (2, 'two');
+SELECT chr(get_byte(data, 0)) AS msg,
+	   position('\x6200000006000000000003'::bytea IN data) > 0 AS binary_tid_0_3
+FROM pg_logical_slot_get_binary_changes('rowid_po_slot', NULL, NULL,
+	'proto_version', '4', 'publication_names', 'rowid_po_pub', 'binary', 'true')
+WHERE chr(get_byte(data, 0)) = 'I';
+ msg | binary_tid_0_3 
+-----+----------------
+ I   | t
+(1 row)
+
+SELECT pg_drop_replication_slot('rowid_po_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+DROP PUBLICATION rowid_po_pub;
+-- a ROWID partition cannot be published via its partition root
+CREATE TABLE rowid_root (id int) PARTITION BY RANGE (id);
+CREATE TABLE rowid_leaf PARTITION OF rowid_root FOR VALUES FROM (0) TO (10);
+ALTER TABLE rowid_leaf REPLICA IDENTITY ROWID;
+CREATE PUBLICATION rowid_root_pub FOR TABLE rowid_root WITH (publish_via_partition_root = true);
+SELECT 'init' FROM pg_create_logical_replication_slot('rowid_root_slot', 'pgoutput');
+ ?column? 
+----------
+ init
+(1 row)
+
+INSERT INTO rowid_root VALUES (1);
+\set VERBOSITY terse
+SELECT count(*) FROM pg_logical_slot_get_binary_changes('rowid_root_slot', NULL, NULL,
+	'proto_version', '4', 'publication_names', 'rowid_root_pub');
+ERROR:  cannot publish changes of partition "rowid_leaf" via its partition root
+\set VERBOSITY default
+SELECT pg_drop_replication_slot('rowid_root_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+DROP PUBLICATION rowid_root_pub;
+DROP TABLE rowid_root;
+DROP TABLE rowid_t, rowid_other, rowid_po;
 DROP ROLE regress_rowid_user;
