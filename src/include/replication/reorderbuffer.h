@@ -18,6 +18,7 @@
 #include "utils/timestamp.h"
 
 extern PGDLLIMPORT int logical_decoding_work_mem;
+extern PGDLLIMPORT bool logical_decoding_expose_headers;
 
 /* an individual tuple, stored in one chunk of memory */
 typedef struct ReorderBufferTupleBuf
@@ -165,6 +166,20 @@ typedef struct ReorderBufferChange
 	 * otherwise it's the preallocated list.
 	 */
 	dlist_node	node;
+
+	/*
+	 * Tuple identifier (TID) of the old row version of an UPDATE or DELETE.
+	 * It is known even when no old tuple data was logged.  The TID of the new
+	 * row version of an INSERT or UPDATE is in data.tp.newtuple->tuple.t_self.
+	 *
+	 * Output plugins see valid TIDs only for relations using REPLICA
+	 * IDENTITY ROWID, or when logical_decoding_expose_headers is enabled;
+	 * otherwise they are invalid, as they always were before.
+	 *
+	 * This member is deliberately placed last, so that the offsets of all
+	 * other members are the same as in older releases.
+	 */
+	ItemPointerData old_tid;
 } ReorderBufferChange;
 
 /* ReorderBufferTXN txn_flags */

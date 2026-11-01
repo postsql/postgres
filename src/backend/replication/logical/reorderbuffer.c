@@ -221,6 +221,9 @@ typedef struct ReorderBufferDiskChange
 int			logical_decoding_work_mem;
 static const Size max_changes_in_memory = 4096; /* XXX for restore only */
 
+/* GUC variable */
+bool		logical_decoding_expose_headers = false;
+
 /* ---------------------------------------
  * primary reorderbuffer support routines
  * ---------------------------------------
@@ -478,6 +481,32 @@ ReorderBufferReturnTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	Assert(txn->size == 0);
 
 	pfree(txn);
+}
+
+/*
+ * Should tuple identifiers of changes to this relation be passed to the
+ * output plugin?
+ *
+ * Decoding always records them, but historically output plugins saw an
+ * invalid t_self.  Keep it that way unless the TIDs are needed.
+ */
+static bool
+ReorderBufferExposeTids(Relation relation)
+{
+	return logical_decoding_expose_headers;
+}
+
+/*
+ * Invalidate the tuple identifiers of a change.
+ */
+static void
+ReorderBufferHideTids(ReorderBufferChange *change)
+{
+	if (change->data.tp.newtuple != NULL)
+		ItemPointerSetInvalid(&change->data.tp.newtuple->tuple.t_self);
+	if (change->data.tp.oldtuple != NULL)
+		ItemPointerSetInvalid(&change->data.tp.oldtuple->tuple.t_self);
+	ItemPointerSetInvalid(&change->old_tid);
 }
 
 /*
@@ -2234,6 +2263,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					/* user-triggered change */
 					if (!IsToastRelation(relation))
 					{
+						if (!ReorderBufferExposeTids(relation))
+							ReorderBufferHideTids(change);
 						ReorderBufferToastReplace(rb, txn, relation, change);
 						ReorderBufferApplyChange(rb, txn, relation, change,
 												 streaming);
