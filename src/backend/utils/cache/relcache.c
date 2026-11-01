@@ -5048,6 +5048,9 @@ RelationGetReplicaIndex(Relation relation)
 	return relation->rd_replidindex;
 }
 
+/* GUC variable */
+bool		logical_replication_index_only_rowid = false;
+
 /*
  * RelationIsRowidTarget -- is this table a target of logical replication by
  * tuple identifier?
@@ -5066,6 +5069,7 @@ RelationIsRowidTarget(Relation relation)
 	if (relation->rd_rowidtarget == 0)
 	{
 		bool		result = false;
+		bool		last = false;
 		Oid			replidindex;
 
 		if (relation->rd_rel->relkind == RELKIND_RELATION &&
@@ -5086,14 +5090,49 @@ RelationIsRowidTarget(Relation relation)
 					result = (attr->atttypid == TIDOID &&
 							  strcmp(NameStr(attr->attname),
 									 REPLICA_IDENTITY_ROWID_ATTNAME) == 0);
+					last = (attr->attnum == RelationGetNumberOfAttributes(relation));
 				}
 				RelationClose(indexrel);
 			}
 		}
-		relation->rd_rowidtarget = result ? 'y' : 'n';
+		relation->rd_rowidtarget = !result ? 'n' : last ? 'l' : 'y';
 	}
 
-	return relation->rd_rowidtarget == 'y';
+	return relation->rd_rowidtarget != 'n';
+}
+
+/*
+ * RelationHasIndexOnlyRowid -- may the table contain rows whose ".rowid" is
+ * stored only in its index?
+ *
+ * That is the case for ROWID replication targets with the storage parameter
+ * index_only_rowid.  The value of ".rowid" then reads as null from the heap,
+ * so nothing must build it from there: rewriting the table, building an
+ * index on ".rowid" from existing rows, and logging it as the old key are
+ * refused.  Because these restrictions depend on what may already be stored,
+ * they are based on the persistent storage parameter only.
+ */
+bool
+RelationHasIndexOnlyRowid(Relation relation)
+{
+	return RelationIsRowidTarget(relation) &&
+		relation->rd_options != NULL &&
+		((StdRdOptions *) relation->rd_options)->index_only_rowid;
+}
+
+/*
+ * RelationOmitsRowid -- should new row versions leave out ".rowid"?
+ *
+ * Only a trailing ".rowid" column can be left out, by storing one attribute
+ * less than the tuple descriptor has; and only if the server allows it
+ * (logical_replication_index_only_rowid).
+ */
+bool
+RelationOmitsRowid(Relation relation)
+{
+	return logical_replication_index_only_rowid &&
+		RelationHasIndexOnlyRowid(relation) &&
+		relation->rd_rowidtarget == 'l';
 }
 
 /*
