@@ -1034,7 +1034,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
          <command>UPDATE</command> and <command>DELETE</command> for tables
          without a primary key at a lower cost than <literal>FULL</literal>.
          Logical replication sends the tuple identifier as an additional key
-         column named <literal>.rowid</literal> of type <type>tid</type>.
+         column named <literal>.rowid</literal> of type <type>tid</type>; see
+         <xref linkend="logical-replication-publication-replica-identity-rowid"/>.
         </para>
         <para>
          Because rewriting the table would change the tuple identifiers of
