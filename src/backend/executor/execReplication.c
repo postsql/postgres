@@ -702,6 +702,24 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 	 * complexity.
 	 */
 	RelationBuildPublicationDesc(rel, &pubdesc);
+
+	/*
+	 * With REPLICA IDENTITY ROWID, no old column values are logged, so row
+	 * filters cannot be evaluated for UPDATE and DELETE.
+	 */
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID &&
+		((cmd == CMD_UPDATE && !pubdesc.rf_valid_for_update) ||
+		 (cmd == CMD_DELETE && !pubdesc.rf_valid_for_delete)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 cmd == CMD_UPDATE ?
+				 errmsg("cannot update table \"%s\"",
+						RelationGetRelationName(rel)) :
+				 errmsg("cannot delete from table \"%s\"",
+						RelationGetRelationName(rel)),
+				 errdetail("A publication that publishes %s uses a row filter for this table, which is not supported with REPLICA IDENTITY ROWID.",
+						   cmd == CMD_UPDATE ? "UPDATE" : "DELETE")));
+
 	if (cmd == CMD_UPDATE && !pubdesc.rf_valid_for_update)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
@@ -731,8 +749,9 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 	if (OidIsValid(RelationGetReplicaIndex(rel)))
 		return;
 
-	/* REPLICA IDENTITY FULL is also good for UPDATE/DELETE. */
-	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+	/* REPLICA IDENTITY FULL and ROWID are also good for UPDATE/DELETE. */
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
+		rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID)
 		return;
 
 	/*

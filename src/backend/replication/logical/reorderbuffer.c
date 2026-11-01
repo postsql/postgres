@@ -507,7 +507,8 @@ ReorderBufferReturnTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 static bool
 ReorderBufferExposeTids(Relation relation)
 {
-	return logical_decoding_expose_headers;
+	return logical_decoding_expose_headers ||
+		relation->rd_rel->relreplident == REPLICA_IDENTITY_ROWID;
 }
 
 /*
