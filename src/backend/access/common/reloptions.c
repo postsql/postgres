@@ -100,6 +100,15 @@ static relopt_bool boolRelOpts[] =
 {
 	{
 		{
+			"index_only_rowid",
+			"Stores the \".rowid\" column of a REPLICA IDENTITY ROWID replication target only in its index",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		false
+	},
+	{
+		{
 			"autosummarize",
 			"Enables automatic summarization on this BRIN index",
 			RELOPT_KIND_BRIN,
@@ -2025,7 +2034,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 		offsetof(StdRdOptions, vacuum_truncate)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
+		{"index_only_rowid", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, index_only_rowid)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

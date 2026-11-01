@@ -1958,6 +1958,12 @@
   max => 'MAX_KILOBYTES',
 },
 
+{ name => 'logical_replication_index_only_rowid', type => 'bool', context => 'PGC_SUSET', group => 'REPLICATION_SUBSCRIBERS',
+  short_desc => 'Allows tables with storage parameter index_only_rowid to store the column ".rowid" only in its index.',
+  variable => 'logical_replication_index_only_rowid',
+  boot_val => 'false',
+},
+
 { name => 'maintenance_io_concurrency', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
   short_desc => 'A variant of "effective_io_concurrency" that is used for maintenance work.',
   long_desc => '0 disables simultaneous requests.',

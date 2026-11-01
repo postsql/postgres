@@ -146,12 +146,28 @@ heapam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  * ----------------------------------------------------------------------------
  */
 
+/*
+ * Get the heap tuple to store for a slot.  Tables storing ".rowid" only in
+ * its index leave it out (see RelationOmitsRowid()).
+ */
+static inline HeapTuple
+heapam_tuple_to_store(Relation relation, TupleTableSlot *slot,
+					  bool *shouldFree)
+{
+	if (unlikely(RelationOmitsRowid(relation)))
+	{
+		*shouldFree = true;
+		return heap_form_tuple_omit_last(RelationGetDescr(relation), slot);
+	}
+	return ExecFetchSlotHeapTuple(slot, true, shouldFree);
+}
+
 static void
 heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 					uint32 options, BulkInsertState bistate)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	HeapTuple	tuple = heapam_tuple_to_store(relation, slot, &shouldFree);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -171,7 +187,7 @@ heapam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 								BulkInsertState bistate, uint32 specToken)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	HeapTuple	tuple = heapam_tuple_to_store(relation, slot, &shouldFree);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -222,7 +238,7 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
 	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	HeapTuple	tuple = heapam_tuple_to_store(relation, slot, &shouldFree);
 	TM_Result	result;
 
 	/* Update the tuple with table oid */

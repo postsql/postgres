@@ -49,6 +49,7 @@ tests += {
       't/037_except.pl',
       't/038_walsnd_shutdown_timeout.pl',
       't/039_replica_identity_rowid.pl',
+      't/040_index_only_rowid.pl',
       't/100_bugs.pl',
     ],
   },
