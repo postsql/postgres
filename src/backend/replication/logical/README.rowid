@@ -1,0 +1,90 @@
+Logical replication by tuple identifier (REPLICA IDENTITY ROWID)
+================================================================
+
+Purpose
+-------
+
+Tables without a primary key can only replicate UPDATE and DELETE with
+REPLICA IDENTITY FULL, which logs the whole old row and makes the subscriber
+search for a matching row.  REPLICA IDENTITY ROWID instead identifies rows by
+their tuple identifier (TID, the ctid system column).  The publisher logs no
+old column values at all: the WAL record of every heap INSERT, UPDATE and
+DELETE already contains the block number and line pointer offset of the row
+versions involved, because redo needs them.  The intended use is migrating
+such tables, typically to a newer major version.
+
+Overview
+--------
+
+Publisher:
+
+  decode.c        records the TID of the new row version in newtuple->t_self
+                  and of the old row version in ReorderBufferChange.old_tid
+                  (always; the latter even if no old tuple data is logged).
+  reorderbuffer.c passes them to output plugins only for ROWID tables, or if
+                  logical_decoding_expose_headers is on; otherwise they are
+                  invalidated, as output plugins always saw them before.
+  proto.c,        send the TID as an additional virtual column ".rowid" of
+  pgoutput.c      type tid, marked as replica identity.  UPDATE always sends
+                  a key tuple ('K') with just the old TID; DELETE likewise.
+  tablecmds.c,    refuse to rewrite ROWID tables while logical decoding is
+  repack.c,       possible (CheckRelationRewriteAllowed()).
+  vacuum.c
+
+Subscriber:
+
+  tablesync.c     fetches the TID as ctid with COPY (SELECT ..., ctid ...),
+                  and refuses to synchronize into a non-empty table.
+  execMain.c      refuses UPDATE/DELETE/MERGE/ON CONFLICT DO UPDATE on
+                  "ROWID targets" (RelationIsRowidTarget(): the replica
+                  identity index is the single column ".rowid" tid), except
+                  by logical replication workers or with
+                  session_replication_role = replica.
+
+Applying changes needs no new code: the apply worker finds rows using the
+replica identity index on ".rowid", like for any other key.
+
+Why a virtual column
+--------------------
+
+Modelling the TID as an ordinary key column means nothing is new as far as
+the protocol is concerned.  Any subscriber, including older releases, can
+apply the changes to a table with a column ".rowid" tid that has a primary
+key or replica identity index on it.  Newer subscribers add correct initial
+synchronization and protection of the target table.
+
+Correctness of the TIDs
+-----------------------
+
+The TIDs come only from the WAL record of the committed operation: the same
+block reference and offset number that redo uses.  They never come from a
+column value; a ROWID table cannot have a column named ".rowid".  Aborted
+transactions and subtransactions are never decoded (in streaming mode their
+changes are discarded by the subscriber on STREAM ABORT).
+
+A live row keeps its TID until it is updated or deleted, and both are
+replicated (UPDATE as old TID -> new TID).  HOT pruning turns the root line
+pointer of a HOT chain into a redirect but never moves the line pointer of a
+live tuple; page defragmentation moves tuple data but keeps offsets.  A TID
+becomes reusable only after the DELETE (or UPDATE) that freed it has
+committed and its tuple has been pruned; as decoding follows commit order,
+the subscriber applies that DELETE before any INSERT reusing the TID.
+
+Only rewriting the table (VACUUM FULL, CLUSTER, REPACK, ALTER TABLE forms
+that rewrite) assigns new TIDs without decoded changes, so it is refused.
+TRUNCATE is replicated, so it is safe.
+
+The initial COPY runs with the snapshot exported when the replication slot
+was created, so the copied TIDs agree with the changes that follow.
+
+Restrictions and future work
+----------------------------
+
+- Partitioned tables: TIDs are only unique within a partition.  Partitions
+  can use ROWID but cannot be published via the partition root.  A key of
+  (tableoid, ctid) would lift this.
+- Row filters cannot be evaluated for UPDATE and DELETE without the old row.
+  This could be lifted by logging the columns the filters need.
+- REPACK, including REPACK (CONCURRENTLY), and VACUUM FULL could be allowed
+  if they emitted a logical message mapping old to new TIDs, which
+  subscribers would apply to ".rowid".
