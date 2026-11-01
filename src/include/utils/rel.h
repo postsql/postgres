@@ -248,6 +248,12 @@ typedef struct RelationData
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
 	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
+
+	/*
+	 * Cached result of RelationIsRowidTarget(): 0 if not computed yet.  Kept
+	 * last so that the offsets of the other members do not change.
+	 */
+	char		rd_rowidtarget;
 } RelationData;
 
 
