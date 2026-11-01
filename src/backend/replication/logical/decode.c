@@ -40,6 +40,9 @@
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
 #include "storage/standbydefs.h"
+#include "utils/inval.h"
+#include "utils/relfilenumbermap.h"
+#include "utils/snapmgr.h"
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -48,6 +51,7 @@ static void DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeSpecConfirm(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
+static void DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 
 static void DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 						 xl_xact_parsed_commit *parsed, TransactionId xid,
@@ -471,6 +475,9 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		case XLOG_HEAP2_PRUNE_ON_ACCESS:
 		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
 		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
+			if (!ctx->fast_forward)
+				DecodePrune(ctx, buf);
+			break;
 		case XLOG_HEAP2_LOCK_UPDATED:
 			break;
 		default:
@@ -1254,6 +1261,125 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		data += datalen;
 	}
 	Assert(data == tupledata + tuplelen);
+}
+
+/*
+ * Parse XLOG_HEAP2_PRUNE_* records, and pass the line pointers changed by
+ * pruning to the output plugin's prune callback.
+ *
+ * Pruning is not part of any transaction; it is reported when it is
+ * decoded.  The record keeps the changed line pointers unless it has a
+ * full-page image; see logical_decoding_prune_records.
+ */
+static void
+DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	XLogReaderState *r = buf->record;
+	xl_heap_prune *xlrec = (xl_heap_prune *) XLogRecGetData(r);
+	RelFileLocator rlocator;
+	LogicalDecodePruneData prune = {0};
+	char	   *data;
+	Size		datalen;
+	MemoryContext ccxt = CurrentMemoryContext;
+	ResourceOwner cowner = CurrentResourceOwner;
+	bool		using_subtxn;
+
+	/* cheap checks first */
+	if (ctx->callbacks.prune_cb == NULL)
+		return;
+
+	XLogRecGetBlockTag(r, 0, &rlocator, NULL, &prune.blkno);
+	if (rlocator.dbOid != ctx->slot->data.database)
+		return;
+
+	if (SnapBuildCurrentState(ctx->snapshot_builder) != SNAPBUILD_CONSISTENT ||
+		SnapBuildXactNeedsSkip(ctx->snapshot_builder, buf->origptr))
+		return;
+
+	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
+		return;
+
+	prune.reason = XLogRecGetInfo(r) & XLOG_HEAP_OPMASK;
+	data = XLogRecGetBlockData(r, 0, &datalen);
+	if (data != NULL && datalen > 0)
+	{
+		int			nplans;
+		xlhp_freeze_plan *plans;
+		OffsetNumber *frz_offsets;
+		OffsetNumber *redirected;
+		OffsetNumber *nowdead;
+		OffsetNumber *nowunused;
+
+		heap_xlog_deserialize_prune_and_freeze(data, xlrec->flags,
+											   &nplans, &plans, &frz_offsets,
+											   &prune.nredirected, &redirected,
+											   &prune.ndead, &nowdead,
+											   &prune.nunused, &nowunused);
+		/* only freezing or visibility changes: nothing was pruned */
+		if (prune.nredirected == 0 && prune.ndead == 0 && prune.nunused == 0)
+			return;
+		prune.has_row_info = true;
+		prune.redirected = redirected;
+		prune.nowdead = nowdead;
+		prune.nowunused = nowunused;
+	}
+	else if (!XLogRecHasBlockImage(r, 0))
+		return;					/* only visibility map changes */
+
+	/*
+	 * Map the relfilenumber to the relation, under the historic snapshot, in
+	 * a transaction of its own (or a subtransaction, when called through the
+	 * SQL functions); see ReorderBufferProcessTXN().
+	 */
+	using_subtxn = IsTransactionOrTransactionBlock();
+	PG_TRY();
+	{
+		Oid			reloid;
+
+		if (using_subtxn)
+			BeginInternalSubTransaction("prune");
+		else
+			StartTransactionCommand();
+		SetupHistoricSnapshot(SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder),
+							  NULL);
+
+		reloid = RelidByRelfilenumber(rlocator.spcOid, rlocator.relNumber);
+		if (OidIsValid(reloid))
+		{
+			Relation	relation = RelationIdGetRelation(reloid);
+
+			if (RelationIsValid(relation))
+			{
+				if (RelationIsLogicallyLogged(relation) &&
+					!IsToastRelation(relation) &&
+					relation->rd_rel->relkind != RELKIND_SEQUENCE &&
+					(!relation->rd_rel->relrewrite || ctx->reorder->output_rewrites))
+					ctx->reorder->prune(ctx->reorder, relation, buf->origptr,
+										&prune);
+				RelationClose(relation);
+			}
+		}
+
+		TeardownHistoricSnapshot(false);
+		if (using_subtxn)
+			RollbackAndReleaseCurrentSubTransaction();
+		else
+			AbortCurrentTransaction();
+		MemoryContextSwitchTo(ccxt);
+		CurrentResourceOwner = cowner;
+	}
+	PG_CATCH();
+	{
+		TeardownHistoricSnapshot(true);
+		if (using_subtxn)
+		{
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(ccxt);
+			CurrentResourceOwner = cowner;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*

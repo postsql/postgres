@@ -31,6 +31,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* GUC variable */
+bool		logical_decoding_prune_records = false;
+
 /* Working data for heap_page_prune_and_freeze() and subroutines */
 typedef struct
 {
@@ -2613,6 +2616,18 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 
 	xlrec.flags = 0;
 	regbuf_flags_heap = REGBUF_STANDARD;
+
+	/*
+	 * If a full-page image is taken, the arrays of changed line pointers are
+	 * normally left out, as redo restores the page from the image.  Keep them
+	 * for logical decoding (see DecodePrune()) if both the server and the
+	 * table ask for it.
+	 */
+	if (logical_decoding_prune_records &&
+		relation->rd_options != NULL &&
+		((StdRdOptions *) relation->rd_options)->logical_decoding_prune_records &&
+		RelationIsLogicallyLogged(relation))
+		regbuf_flags_heap |= REGBUF_KEEP_DATA;
 
 	/*
 	 * We can avoid an FPI of the heap page if the only modification we are

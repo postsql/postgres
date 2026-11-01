@@ -515,6 +515,14 @@ typedef void (*ReorderBufferMessageCB) (ReorderBuffer *rb,
 										const char *prefix, Size sz,
 										const char *message);
 
+struct LogicalDecodePruneData;
+
+/* prune callback signature */
+typedef void (*ReorderBufferPruneCB) (ReorderBuffer *rb,
+									  Relation relation,
+									  XLogRecPtr prune_lsn,
+									  const struct LogicalDecodePruneData *prune);
+
 /* begin prepare callback signature */
 typedef void (*ReorderBufferBeginPrepareCB) (ReorderBuffer *rb,
 											 ReorderBufferTXN *txn);
@@ -714,6 +722,13 @@ struct ReorderBuffer
 	 */
 	int64		totalTxns;		/* total number of transactions sent */
 	int64		totalBytes;		/* total amount of data decoded */
+
+	/*
+	 * Callback for pruned heap pages, not part of any transaction.  Unlike
+	 * the other callbacks, it is placed last, so that the offsets of the
+	 * other members do not change.
+	 */
+	ReorderBufferPruneCB prune;
 };
 
 

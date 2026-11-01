@@ -1948,6 +1948,13 @@
   boot_val => 'false',
 },
 
+{ name => 'logical_decoding_prune_records', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_SENDING',
+  short_desc => 'Keeps the line pointers changed by pruning in the WAL for logical decoding.',
+  long_desc => 'Takes effect only for tables with the storage parameter of the same name.',
+  variable => 'logical_decoding_prune_records',
+  boot_val => 'false',
+},
+
 { name => 'logical_decoding_work_mem', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
   short_desc => 'Sets the maximum memory to be used for logical decoding.',
   long_desc => 'This much memory can be used by each internal reorder buffer before spilling to disk.',

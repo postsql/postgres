@@ -376,6 +376,9 @@ extern void ReleaseBulkInsertStatePin(BulkInsertState bistate);
 
 extern void heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 						uint32 options, BulkInsertState bistate);
+/* in heap/pruneheap.c */
+extern PGDLLIMPORT bool logical_decoding_prune_records;
+
 extern HeapTuple heap_form_tuple_omit_last(TupleDesc tupdesc,
 										   TupleTableSlot *slot);
 extern void heap_multi_insert(Relation relation, TupleTableSlot **slots,
