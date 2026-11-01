@@ -2863,6 +2863,81 @@ PGTransactionStatusType PQtransactionStatus(const PGconn *conn);
      </listitem>
     </varlistentry>
 
+    <varlistentry id="libpq-PQsessionHasTempTables">
+     <term><function>PQsessionHasTempTables</function><indexterm><primary>PQsessionHasTempTables</primary></indexterm></term>
+     <term><function>PQsessionHasHoldCursors</function><indexterm><primary>PQsessionHasHoldCursors</primary></indexterm></term>
+     <term><function>PQsessionHasPreparedStatements</function><indexterm><primary>PQsessionHasPreparedStatements</primary></indexterm></term>
+     <term><function>PQsessionHasListenChannels</function><indexterm><primary>PQsessionHasListenChannels</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Return whether the server reported active session-scoped objects in
+       the most recent extended <literal>ReadyForQuery</literal> message
+       (when <varname>ready_for_query_message</varname> is set to
+       <literal>rich</literal>).
+
+<synopsis>
+int PQsessionHasTempTables(const PGconn *conn);
+int PQsessionHasHoldCursors(const PGconn *conn);
+int PQsessionHasPreparedStatements(const PGconn *conn);
+int PQsessionHasListenChannels(const PGconn *conn);
+</synopsis>
+
+       Each function returns <literal>1</literal> if active objects exist,
+       <literal>0</literal> if none exist, or <literal>-1</literal> if the
+       connection is invalid or the server did not include that indicator in
+       the most recent <literal>ReadyForQuery</literal> message.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQlastCommitLSN">
+     <term><function>PQlastCommitLSN</function><indexterm><primary>PQlastCommitLSN</primary></indexterm></term>
+     <term><function>PQlastReplayLSN</function><indexterm><primary>PQlastReplayLSN</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Return the highest primary commit <acronym>LSN</acronym>
+       (<literal>l</literal> key) or standby replay <acronym>LSN</acronym>
+       (<literal>r</literal> key) observed on the connection, or
+       <literal>0</literal> if none has been reported.
+
+<synopsis>
+uint64_t PQlastCommitLSN(const PGconn *conn);
+uint64_t PQlastReplayLSN(const PGconn *conn);
+</synopsis>
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQreadyForQueryValue">
+     <term><function>PQreadyForQueryValue</function><indexterm><primary>PQreadyForQueryValue</primary></indexterm></term>
+     <term><function>PQreadyForQueryFieldCount</function><indexterm><primary>PQreadyForQueryFieldCount</primary></indexterm></term>
+     <term><function>PQreadyForQueryField</function><indexterm><primary>PQreadyForQueryField</primary></indexterm></term>
+     <term><function>PQsetReadyForQueryHook</function><indexterm><primary>PQsetReadyForQueryHook</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Inspect arbitrary built-in or extension-supplied key-value pairs from
+       the most recent <literal>ReadyForQuery</literal> message, or register
+       a callback invoked each time a <literal>ReadyForQuery</literal>
+       message is processed.
+
+<synopsis>
+const char *PQreadyForQueryValue(const PGconn *conn, const char *key, int *val_len);
+int PQreadyForQueryFieldCount(const PGconn *conn);
+int PQreadyForQueryField(const PGconn *conn, int field_idx,
+                         const char **key, int *key_len,
+                         const char **val, int *val_len);
+typedef void (*PQreadyForQueryHook) (PGconn *conn, void *passthrough);
+PQreadyForQueryHook PQsetReadyForQueryHook(PGconn *conn,
+                                           PQreadyForQueryHook hook,
+                                           void *passthrough);
+</synopsis>
+      </para>
+     </listitem>
+    </varlistentry>
+
     <varlistentry id="libpq-PQparameterStatus">
      <term><function>PQparameterStatus</function><indexterm><primary>PQparameterStatus</primary></indexterm></term>
 

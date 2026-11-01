@@ -68,6 +68,8 @@ extern "C"
 #define LIBPQ_HAS_GET_THREAD_LOCK 1
 /* Indicates presence of the PQAUTHDATA_OAUTH_BEARER_TOKEN_V2 authdata hook */
 #define LIBPQ_HAS_OAUTH_BEARER_TOKEN_V2 1
+/* Indicates presence of extended ReadyForQuery inspection functions */
+#define LIBPQ_HAS_EXTENDED_READY_FOR_QUERY 1
 
 /*
  * Option flags for PQcopyResult
@@ -419,6 +421,24 @@ extern char *PQtty(const PGconn *conn);
 extern char *PQoptions(const PGconn *conn);
 extern ConnStatusType PQstatus(const PGconn *conn);
 extern PGTransactionStatusType PQtransactionStatus(const PGconn *conn);
+extern int	PQsessionHasTempTables(const PGconn *conn);
+extern int	PQsessionHasHoldCursors(const PGconn *conn);
+extern int	PQsessionHasPreparedStatements(const PGconn *conn);
+extern int	PQsessionHasListenChannels(const PGconn *conn);
+extern uint64_t PQlastCommitLSN(const PGconn *conn);
+extern uint64_t PQlastReplayLSN(const PGconn *conn);
+extern const char *PQreadyForQueryValue(const PGconn *conn,
+										const char *key,
+										int *val_len);
+extern int	PQreadyForQueryFieldCount(const PGconn *conn);
+extern int	PQreadyForQueryField(const PGconn *conn,
+								 int field_idx,
+								 const char **key, int *key_len,
+								 const char **val, int *val_len);
+typedef void (*PQreadyForQueryHook) (PGconn *conn, void *passthrough);
+extern PQreadyForQueryHook PQsetReadyForQueryHook(PGconn *conn,
+												  PQreadyForQueryHook hook,
+												  void *passthrough);
 extern const char *PQparameterStatus(const PGconn *conn,
 									 const char *paramName);
 extern int	PQprotocolVersion(const PGconn *conn);

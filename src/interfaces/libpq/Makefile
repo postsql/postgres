@@ -9,7 +9,7 @@
 #
 #-------------------------------------------------------------------------
 
-EXTRA_INSTALL=src/test/modules/injection_points
+EXTRA_INSTALL=src/test/modules/injection_points src/test/modules/test_ready_for_query
 
 subdir = src/interfaces/libpq
 top_builddir = ../../..

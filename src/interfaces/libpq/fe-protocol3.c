@@ -228,6 +228,8 @@ pqParseInput3(PGconn *conn)
 				case PqMsg_ReadyForQuery:
 					if (getReadyForQuery(conn, msgLength))
 						return;
+					if (conn->status == CONNECTION_BAD)
+						break;
 					if (conn->pipelineStatus != PQ_PIPELINE_OFF)
 					{
 						conn->result = PQmakeEmptyPGresult(conn,
@@ -459,6 +461,9 @@ pqParseInput3(PGconn *conn)
 		{
 			/* Normal case: parsing agrees with specified length */
 			pqParseDone(conn, conn->inCursor);
+			if (id == PqMsg_ReadyForQuery && conn->rfq_hook &&
+				conn->status != CONNECTION_BAD)
+				conn->rfq_hook(conn, conn->rfq_hook_passthrough);
 		}
 		else if (conn->error_result && conn->status == CONNECTION_BAD)
 		{
@@ -1776,9 +1781,90 @@ static int
 getReadyForQuery(PGconn *conn, int msgLength)
 {
 	char		xact_status;
+	int			ext_len;
+	const char *raw;
+	int			pos = 0;
+	int			nfields = 0;
+
+	if (msgLength < 1)
+	{
+		libpq_append_conn_error(conn, "insufficient data in \"Z\" message");
+		handleFatalError(conn);
+		return 0;
+	}
 
 	if (pqGetc(&xact_status, conn))
 		return EOF;
+
+	ext_len = msgLength - 1;
+	raw = conn->inBuffer + conn->inCursor;
+
+	/* Validate all [klen][key][vlen][val] frames before mutating state. */
+	while (pos < ext_len)
+	{
+		int			klen = (unsigned char) raw[pos++];
+		int			vlen;
+
+		if (klen == 0 || pos + klen + 1 > ext_len)
+		{
+			libpq_append_conn_error(conn, "malformed key-value data in \"Z\" message");
+			handleFatalError(conn);
+			return 0;
+		}
+		pos += klen;
+		vlen = (unsigned char) raw[pos++];
+		if (pos + vlen > ext_len)
+		{
+			libpq_append_conn_error(conn, "malformed key-value data in \"Z\" message");
+			handleFatalError(conn);
+			return 0;
+		}
+		pos += vlen;
+		nfields++;
+	}
+
+	if (nfields > conn->rfq_fields_cap)
+	{
+		int			new_cap = conn->rfq_fields_cap ? conn->rfq_fields_cap * 2 : 8;
+		pgRfqField *new_fields;
+
+		if (new_cap < nfields)
+			new_cap = nfields;
+		new_fields = realloc(conn->rfq_fields,
+							 (size_t) new_cap * sizeof(pgRfqField));
+		if (!new_fields)
+		{
+			libpq_append_conn_error(conn, "out of memory");
+			handleFatalError(conn);
+			return 0;
+		}
+		conn->rfq_fields = new_fields;
+		conn->rfq_fields_cap = new_cap;
+	}
+
+	if (nfields > 0)
+	{
+		size_t		need_buf = (size_t) ext_len + 2 * (size_t) nfields + 1;
+
+		if (need_buf > conn->rfq_raw_buf_cap)
+		{
+			size_t		new_cap = conn->rfq_raw_buf_cap ? conn->rfq_raw_buf_cap * 2 : 128;
+			char	   *new_buf;
+
+			if (new_cap < need_buf)
+				new_cap = need_buf;
+			new_buf = realloc(conn->rfq_raw_buf, new_cap);
+			if (!new_buf)
+			{
+				libpq_append_conn_error(conn, "out of memory");
+				handleFatalError(conn);
+				return 0;
+			}
+			conn->rfq_raw_buf = new_buf;
+			conn->rfq_raw_buf_cap = new_cap;
+		}
+	}
+
 	switch (xact_status)
 	{
 		case 'I':
@@ -1795,13 +1881,89 @@ getReadyForQuery(PGconn *conn, int msgLength)
 			break;
 	}
 
-	/*
-	 * Skip any extension data so clients ignore payload they are not
-	 * prepared to receive.
-	 */
-	if (msgLength > 1)
-		conn->inCursor += (msgLength - 1);
+	conn->rfq_has_temp_tables = PG_BOOL_UNKNOWN;
+	conn->rfq_has_hold_cursors = PG_BOOL_UNKNOWN;
+	conn->rfq_has_prepared_stmts = PG_BOOL_UNKNOWN;
+	conn->rfq_has_listen_channels = PG_BOOL_UNKNOWN;
+	conn->rfq_nfields = nfields;
 
+	if (nfields > 0)
+	{
+		int			out_off = 0;
+
+		pos = 0;
+		for (int i = 0; i < nfields; i++)
+		{
+			int			klen = (unsigned char) raw[pos++];
+			const char *kptr = raw + pos;
+			int			vlen;
+			const char *vptr;
+
+			pos += klen;
+			vlen = (unsigned char) raw[pos++];
+			vptr = raw + pos;
+			pos += vlen;
+
+			conn->rfq_fields[i].key_offset = out_off;
+			conn->rfq_fields[i].key_len = klen;
+			memcpy(conn->rfq_raw_buf + out_off, kptr, klen);
+			out_off += klen;
+			conn->rfq_raw_buf[out_off++] = '\0';
+
+			conn->rfq_fields[i].val_offset = out_off;
+			conn->rfq_fields[i].val_len = vlen;
+			if (vlen > 0)
+				memcpy(conn->rfq_raw_buf + out_off, vptr, vlen);
+			out_off += vlen;
+			conn->rfq_raw_buf[out_off++] = '\0';
+
+			if (klen == 1)
+			{
+				if (vlen == 1 && (vptr[0] == '0' || vptr[0] == '1'))
+				{
+					PGTernaryBool b = (vptr[0] == '1') ? PG_BOOL_YES : PG_BOOL_NO;
+
+					switch (kptr[0])
+					{
+						case 'T':
+							conn->rfq_has_temp_tables = b;
+							break;
+						case 'H':
+							conn->rfq_has_hold_cursors = b;
+							break;
+						case 'P':
+							conn->rfq_has_prepared_stmts = b;
+							break;
+						case 'L':
+							conn->rfq_has_listen_channels = b;
+							break;
+						default:
+							break;
+					}
+				}
+				else if (vlen == 8 && (kptr[0] == 'l' || kptr[0] == 'r'))
+				{
+					uint64		lsn_be;
+					uint64		lsn;
+
+					memcpy(&lsn_be, vptr, sizeof(lsn_be));
+					lsn = pg_ntoh64(lsn_be);
+					if (kptr[0] == 'l')
+					{
+						if (lsn > conn->rfq_last_commit_lsn)
+							conn->rfq_last_commit_lsn = lsn;
+					}
+					else
+					{
+						if (lsn > conn->rfq_last_replay_lsn)
+							conn->rfq_last_replay_lsn = lsn;
+					}
+				}
+			}
+		}
+	}
+
+	conn->inCursor += ext_len;
 	return 0;
 }
 

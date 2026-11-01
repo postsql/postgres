@@ -612,7 +612,8 @@ pqTraceOutput_CopyBothResponse(FILE *f, const char *message, int *cursor, int le
 }
 
 static void
-pqTraceOutput_ReadyForQuery(FILE *f, const char *message, int *cursor, int length)
+pqTraceOutput_ReadyForQuery(FILE *f, const char *message, int *cursor,
+							int length, bool regress)
 {
 	fprintf(f, "ReadyForQuery\t");
 	pqTraceOutputByte1(f, message, cursor);
@@ -620,15 +621,35 @@ pqTraceOutput_ReadyForQuery(FILE *f, const char *message, int *cursor, int lengt
 	while (*cursor - 1 < length)
 	{
 		int			klen = (unsigned char) message[(*cursor)++];
+		char		key_ch;
+		int			vlen;
 
+		if (*cursor - 1 + klen > length)
+			break;
+		key_ch = (klen == 1) ? message[*cursor] : '\0';
 		pqTraceOutputNchar(f, klen, message, cursor, false);
-		if (*cursor - 1 < length)
-		{
-			int			vlen = (unsigned char) message[(*cursor)++];
+		if (*cursor - 1 >= length)
+			break;
 
-			if (vlen > 0)
-				pqTraceOutputNchar(f, vlen, message, cursor, false);
+		vlen = (unsigned char) message[(*cursor)++];
+		if (*cursor - 1 + vlen > length)
+			break;
+
+		if (klen == 1 && (key_ch == 'l' || key_ch == 'r') && vlen == 8 && !regress)
+		{
+			uint64		lsn_be;
+			uint64		lsn;
+
+			memcpy(&lsn_be, message + *cursor, sizeof(lsn_be));
+			lsn = pg_ntoh64(lsn_be);
+			fprintf(f, " '%X/%08X'", (uint32) (lsn >> 32), (uint32) lsn);
+			*cursor += 8;
 		}
+		else if (vlen > 0)
+			pqTraceOutputNchar(f, vlen, message, cursor,
+							   regress && klen == 1 && (key_ch == 'l' || key_ch == 'r'));
+		else
+			fprintf(f, " ''");
 	}
 }
 
@@ -829,7 +850,8 @@ pqTraceOutputMessage(PGconn *conn, const char *message, bool toServer)
 			/* No message content */
 			break;
 		case PqMsg_ReadyForQuery:
-			pqTraceOutput_ReadyForQuery(conn->Pfdebug, message, &logCursor, length);
+			pqTraceOutput_ReadyForQuery(conn->Pfdebug, message, &logCursor,
+										length, regress);
 			break;
 		default:
 			fprintf(conn->Pfdebug, "Unknown message: %02x", id);

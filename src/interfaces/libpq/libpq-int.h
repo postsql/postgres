@@ -275,6 +275,15 @@ typedef struct pgParameterStatus
 	/* Note: name and value are stored in same malloc block as struct is */
 } pgParameterStatus;
 
+/* Entry in PGconn's decoded ReadyForQuery ('Z') key-value array */
+typedef struct pgRfqField
+{
+	int			key_offset;
+	int			key_len;
+	int			val_offset;
+	int			val_len;
+} pgRfqField;
+
 /* large-object-access data ... allocated only if large-object code is used. */
 typedef struct pgLobjfuncs
 {
@@ -558,6 +567,21 @@ struct pg_conn
 	bool		std_strings;	/* standard_conforming_strings */
 	PGTernaryBool default_transaction_read_only;	/* default_transaction_read_only */
 	PGTernaryBool in_hot_standby;	/* in_hot_standby */
+
+	/* Extended ReadyForQuery ('Z') session & LSN state */
+	PGTernaryBool rfq_has_temp_tables;
+	PGTernaryBool rfq_has_hold_cursors;
+	PGTernaryBool rfq_has_prepared_stmts;
+	PGTernaryBool rfq_has_listen_channels;
+	uint64		rfq_last_commit_lsn;
+	uint64		rfq_last_replay_lsn;
+	pgRfqField *rfq_fields;
+	int			rfq_nfields;
+	int			rfq_fields_cap;
+	char	   *rfq_raw_buf;
+	size_t		rfq_raw_buf_cap;
+	PQreadyForQueryHook rfq_hook;
+	void	   *rfq_hook_passthrough;
 	PGVerbosity verbosity;		/* error/notice message verbosity */
 	PGContextVisibility show_context;	/* whether to show CONTEXT field */
 	PGlobjfuncs *lobjfuncs;		/* private state for large-object access fns */

@@ -689,6 +689,13 @@ pqDropServerData(PGconn *conn)
 	conn->std_strings = false;
 	conn->default_transaction_read_only = PG_BOOL_UNKNOWN;
 	conn->in_hot_standby = PG_BOOL_UNKNOWN;
+	conn->rfq_has_temp_tables = PG_BOOL_UNKNOWN;
+	conn->rfq_has_hold_cursors = PG_BOOL_UNKNOWN;
+	conn->rfq_has_prepared_stmts = PG_BOOL_UNKNOWN;
+	conn->rfq_has_listen_channels = PG_BOOL_UNKNOWN;
+	conn->rfq_last_commit_lsn = 0;
+	conn->rfq_last_replay_lsn = 0;
+	conn->rfq_nfields = 0;
 	conn->scram_sha_256_iterations = SCRAM_SHA_256_DEFAULT_ITERATIONS;
 	conn->sversion = 0;
 
@@ -5017,6 +5024,13 @@ pqMakeEmptyPGconn(void)
 	conn->std_strings = false;	/* unless server says differently */
 	conn->default_transaction_read_only = PG_BOOL_UNKNOWN;
 	conn->in_hot_standby = PG_BOOL_UNKNOWN;
+	conn->rfq_has_temp_tables = PG_BOOL_UNKNOWN;
+	conn->rfq_has_hold_cursors = PG_BOOL_UNKNOWN;
+	conn->rfq_has_prepared_stmts = PG_BOOL_UNKNOWN;
+	conn->rfq_has_listen_channels = PG_BOOL_UNKNOWN;
+	conn->rfq_last_commit_lsn = 0;
+	conn->rfq_last_replay_lsn = 0;
+	conn->rfq_nfields = 0;
 	conn->scram_sha_256_iterations = SCRAM_SHA_256_DEFAULT_ITERATIONS;
 	conn->verbosity = PQERRORS_DEFAULT;
 	conn->show_context = PQSHOW_CONTEXT_ERRORS;
@@ -5156,6 +5170,8 @@ freePGconn(PGconn *conn)
 	free(conn->inBuffer);
 	free(conn->outBuffer);
 	free(conn->rowBuf);
+	free(conn->rfq_fields);
+	free(conn->rfq_raw_buf);
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 
@@ -7683,6 +7699,122 @@ PQtransactionStatus(const PGconn *conn)
 	if (conn->asyncStatus != PGASYNC_IDLE)
 		return PQTRANS_ACTIVE;
 	return conn->xactStatus;
+}
+
+static int
+pqTernaryToInt(const PGconn *conn, PGTernaryBool val)
+{
+	if (!conn)
+		return -1;
+	if (val == PG_BOOL_YES)
+		return 1;
+	if (val == PG_BOOL_NO)
+		return 0;
+	return -1;
+}
+
+int
+PQsessionHasTempTables(const PGconn *conn)
+{
+	return pqTernaryToInt(conn, conn ? conn->rfq_has_temp_tables : PG_BOOL_UNKNOWN);
+}
+
+int
+PQsessionHasHoldCursors(const PGconn *conn)
+{
+	return pqTernaryToInt(conn, conn ? conn->rfq_has_hold_cursors : PG_BOOL_UNKNOWN);
+}
+
+int
+PQsessionHasPreparedStatements(const PGconn *conn)
+{
+	return pqTernaryToInt(conn, conn ? conn->rfq_has_prepared_stmts : PG_BOOL_UNKNOWN);
+}
+
+int
+PQsessionHasListenChannels(const PGconn *conn)
+{
+	return pqTernaryToInt(conn, conn ? conn->rfq_has_listen_channels : PG_BOOL_UNKNOWN);
+}
+
+uint64_t
+PQlastCommitLSN(const PGconn *conn)
+{
+	return conn ? conn->rfq_last_commit_lsn : 0;
+}
+
+uint64_t
+PQlastReplayLSN(const PGconn *conn)
+{
+	return conn ? conn->rfq_last_replay_lsn : 0;
+}
+
+const char *
+PQreadyForQueryValue(const PGconn *conn, const char *key, int *val_len)
+{
+	size_t		klen;
+
+	if (val_len)
+		*val_len = 0;
+	if (!conn || !key || !conn->rfq_raw_buf)
+		return NULL;
+
+	klen = strlen(key);
+	for (int i = 0; i < conn->rfq_nfields; i++)
+	{
+		const pgRfqField *f = &conn->rfq_fields[i];
+
+		if ((size_t) f->key_len == klen &&
+			memcmp(conn->rfq_raw_buf + f->key_offset, key, klen) == 0)
+		{
+			if (val_len)
+				*val_len = f->val_len;
+			return conn->rfq_raw_buf + f->val_offset;
+		}
+	}
+	return NULL;
+}
+
+int
+PQreadyForQueryFieldCount(const PGconn *conn)
+{
+	return conn ? conn->rfq_nfields : 0;
+}
+
+int
+PQreadyForQueryField(const PGconn *conn, int field_idx,
+					 const char **key, int *key_len,
+					 const char **val, int *val_len)
+{
+	const pgRfqField *f;
+
+	if (!conn || !conn->rfq_raw_buf || field_idx < 0 ||
+		field_idx >= conn->rfq_nfields)
+		return 0;
+
+	f = &conn->rfq_fields[field_idx];
+	if (key)
+		*key = conn->rfq_raw_buf + f->key_offset;
+	if (key_len)
+		*key_len = f->key_len;
+	if (val)
+		*val = conn->rfq_raw_buf + f->val_offset;
+	if (val_len)
+		*val_len = f->val_len;
+	return 1;
+}
+
+PQreadyForQueryHook
+PQsetReadyForQueryHook(PGconn *conn, PQreadyForQueryHook hook, void *passthrough)
+{
+	PQreadyForQueryHook prev;
+
+	if (!conn)
+		return NULL;
+	prev = conn->rfq_hook;
+	conn->rfq_hook = hook;
+	conn->rfq_hook_passthrough = passthrough;
+	return prev;
 }
 
 const char *

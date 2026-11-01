@@ -211,3 +211,13 @@ PQdefaultAuthDataHook     208
 PQfullProtocolVersion     209
 appendPQExpBufferVA       210
 PQgetThreadLock           211
+PQsessionHasTempTables    212
+PQsessionHasHoldCursors   213
+PQsessionHasPreparedStatements 214
+PQsessionHasListenChannels 215
+PQlastCommitLSN           216
+PQlastReplayLSN           217
+PQreadyForQueryValue      218
+PQreadyForQueryFieldCount 219
+PQreadyForQueryField      220
+PQsetReadyForQueryHook    221

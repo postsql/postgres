@@ -161,6 +161,7 @@ tests += {
       't/004_load_balance_dns.pl',
       't/005_negotiate_encryption.pl',
       't/006_service.pl',
+      't/007_ready_for_query.pl',
     ],
     'env': {
       'with_ssl': ssl_library,
