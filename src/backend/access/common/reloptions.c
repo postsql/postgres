@@ -522,6 +522,17 @@ static relopt_enum enumRelOpts[] =
 	},
 	{
 		{
+			"index_only_rowid",
+			"Enables skipping physical heap storage for .rowid primary key columns during logical replication",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		StdRdOptIndexCleanupValues,
+		STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO,
+		gettext_noop("Valid values are \"on\", \"off\", and \"auto\".")
+	},
+	{
+		{
 			"buffering",
 			"Enables buffering build for this GiST index",
 			RELOPT_KIND_GIST,
@@ -1893,6 +1904,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, parallel_workers)},
 		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
+		{"index_only_rowid", RELOPT_TYPE_ENUM,
+		offsetof(StdRdOptions, index_only_rowid)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, vacuum_truncate)}
 	};
