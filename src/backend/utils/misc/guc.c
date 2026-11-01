@@ -2135,6 +2135,16 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"logical_replication_index_only_rowid", PGC_SUSET, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Allows tables with storage parameter index_only_rowid to store the column \".rowid\" only in its index."),
+			NULL
+		},
+		&logical_replication_index_only_rowid,
+		false,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL

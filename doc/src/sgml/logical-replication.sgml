@@ -224,6 +224,18 @@ CREATE TABLE t (a int, b text, ".rowid" tid PRIMARY KEY);
     <literal>replica</literal>.  Once the migration is complete, drop the
     primary key and the <literal>.rowid</literal> column.
    </para>
+
+   <para>
+    To avoid storing the tuple identifiers of the publisher's rows in both
+    the table and its index during a migration, a target table can be
+    created with the storage parameter
+    <xref linkend="reloption-index-only-rowid"/>, which stores
+    <literal>.rowid</literal> only in the index, if
+    <xref linkend="guc-logical-replication-index-only-rowid"/> is enabled:
+<programlisting>
+CREATE TABLE t (a int, b text, ".rowid" tid PRIMARY KEY) WITH (index_only_rowid = true);
+</programlisting>
+   </para>
   </sect2>
  </sect1>
 
