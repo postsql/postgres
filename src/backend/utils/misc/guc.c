@@ -2136,6 +2136,16 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"logical_replication_index_only_rowid", PGC_USERSET, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Skips physical heap storage for .rowid primary key columns during logical replication."),
+			NULL
+		},
+		&logical_replication_index_only_rowid,
+		true,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL

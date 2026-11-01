@@ -827,6 +827,22 @@ fetch_remote_table_info(char *nspname, char *relname,
 	}
 	ExecDropSingleTupleTableSlot(slot);
 
+	/*
+	 * If the publisher relation uses REPLICA IDENTITY ROWID, append the
+	 * virtual ".rowid" column so initial table sync (COPY TO STDOUT) and
+	 * relation mapping include the tuple identifier.
+	 */
+	if (lrel->replident == REPLICA_IDENTITY_ROWID)
+	{
+		if (natt >= MaxTupleAttributeNumber)
+			elog(ERROR, "too many columns in remote table \"%s.%s\"",
+				 nspname, relname);
+		lrel->attnames[natt] = pstrdup(".rowid");
+		lrel->atttyps[natt] = TIDOID;
+		lrel->attkeys = bms_add_member(lrel->attkeys, natt);
+		natt++;
+	}
+
 	lrel->natts = natt;
 
 	walrcv_clear_result(res);
@@ -863,8 +879,22 @@ copy_table(Relation rel)
 	/* Start copy on the publisher. */
 	initStringInfo(&cmd);
 	if (lrel.relkind == RELKIND_RELATION)
-		appendStringInfo(&cmd, "COPY %s TO STDOUT",
+	{
+		appendStringInfo(&cmd, "COPY %s",
 						 quote_qualified_identifier(lrel.nspname, lrel.relname));
+		if (lrel.natts)
+		{
+			appendStringInfoString(&cmd, " (");
+			for (int i = 0; i < lrel.natts; i++)
+			{
+				if (i > 0)
+					appendStringInfoString(&cmd, ", ");
+				appendStringInfoString(&cmd, quote_identifier(lrel.attnames[i]));
+			}
+			appendStringInfoChar(&cmd, ')');
+		}
+		appendStringInfoString(&cmd, " TO STDOUT");
+	}
 	else
 	{
 		/*
