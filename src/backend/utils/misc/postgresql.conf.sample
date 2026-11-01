@@ -401,6 +401,7 @@
 					# (change requires restart)
 #max_sync_workers_per_subscription = 2	# taken from max_logical_replication_workers
 #max_parallel_apply_workers_per_subscription = 2	# taken from max_logical_replication_workers
+#logical_replication_index_only_rowid = off	# allow index_only_rowid tables
 
 
 #------------------------------------------------------------------------------

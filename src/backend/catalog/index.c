@@ -3012,6 +3012,28 @@ index_update_stats(Relation rel,
 
 
 /*
+ * Does the index use the ".rowid" column of the table?
+ */
+static bool
+index_references_rowid(Relation heapRelation, IndexInfo *indexInfo)
+{
+	AttrNumber	rowid = get_attnum(RelationGetRelid(heapRelation),
+								   REPLICA_IDENTITY_ROWID_ATTNAME);
+	Bitmapset  *attrs = NULL;
+
+	if (rowid == InvalidAttrNumber)
+		return false;
+
+	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+		if (indexInfo->ii_IndexAttrNumbers[i] == rowid)
+			return true;
+
+	pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &attrs);
+	pull_varattnos((Node *) indexInfo->ii_Predicate, 1, &attrs);
+	return bms_is_member(rowid - FirstLowInvalidHeapAttributeNumber, attrs);
+}
+
+/*
  * index_build - invoke access-method-specific index build procedure
  *
  * On entry, the index's catalog entries are valid, and its physical disk
@@ -3046,6 +3068,21 @@ index_build(Relation heapRelation,
 	Assert(PointerIsValid(indexRelation->rd_indam));
 	Assert(PointerIsValid(indexRelation->rd_indam->ambuild));
 	Assert(PointerIsValid(indexRelation->rd_indam->ambuildempty));
+
+	/*
+	 * If the table stores ".rowid" only in its index, an index on it cannot
+	 * be built from existing rows.
+	 */
+	if (RelationHasIndexOnlyRowid(heapRelation) &&
+		RelationGetNumberOfBlocks(heapRelation) > 0 &&
+		index_references_rowid(heapRelation, indexInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot build index \"%s\" on table \"%s\"",
+						RelationGetRelationName(indexRelation),
+						RelationGetRelationName(heapRelation)),
+				 errdetail("The table has the storage parameter \"%s\", so the values of column \"%s\" are not stored in the table itself.",
+						   "index_only_rowid", REPLICA_IDENTITY_ROWID_ATTNAME)));
 
 	/*
 	 * Determine worker process details for parallel CREATE INDEX.  Currently,

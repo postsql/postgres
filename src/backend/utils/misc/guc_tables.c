@@ -1115,6 +1115,15 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"logical_replication_index_only_rowid", PGC_SUSET, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Allows tables with storage parameter index_only_rowid to store the column \".rowid\" only in its index."),
+			NULL
+		},
+		&logical_replication_index_only_rowid,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"ssl", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Enables SSL connections."),
 			NULL
