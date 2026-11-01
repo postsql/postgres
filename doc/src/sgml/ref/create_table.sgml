@@ -2010,6 +2010,22 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
+   <varlistentry id="reloption-logical-decoding-prune-records" xreflabel="logical_decoding_prune_records">
+    <term><literal>logical_decoding_prune_records</literal> (<type>boolean</type>)
+    <indexterm>
+     <primary><varname>logical_decoding_prune_records</varname> storage parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Keep the line pointers changed by pruning pages of this table in the
+      write-ahead log for logical decoding, if
+      <xref linkend="guc-logical-decoding-prune-records"/> is enabled.
+      The default is <literal>false</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
    <varlistentry id="reloption-user-catalog-table" xreflabel="user_catalog_table">
     <term><literal>user_catalog_table</literal> (<type>boolean</type>)
     <indexterm>

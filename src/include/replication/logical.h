@@ -112,6 +112,13 @@ typedef struct LogicalDecodingContext
 
 	/* Do we need to process any change in fast_forward mode? */
 	bool		processing_required;
+
+	/*
+	 * Optional callback for pruned heap pages, set by the output plugin's
+	 * startup callback.  It is not part of OutputPluginCallbacks, and placed
+	 * last, so that the offsets of all other members do not change.
+	 */
+	LogicalDecodePruneCB prune_cb;
 } LogicalDecodingContext;
 
 

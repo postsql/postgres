@@ -43,6 +43,7 @@ tests += {
       'twophase_stream',
       'tids',
       'rowid',
+      'prune',
     ],
     'regress_args': [
       '--temp-config', files('logical.conf'),

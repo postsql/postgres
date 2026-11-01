@@ -95,6 +95,15 @@ static relopt_bool boolRelOpts[] =
 {
 	{
 		{
+			"logical_decoding_prune_records",
+			"Keeps the line pointers changed by pruning in the WAL for logical decoding",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		false
+	},
+	{
+		{
 			"index_only_rowid",
 			"Stores the \".rowid\" column of a REPLICA IDENTITY ROWID replication target only in its index",
 			RELOPT_KIND_HEAP,
@@ -1926,7 +1935,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
 		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
 		{"index_only_rowid", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, index_only_rowid)}
+		offsetof(StdRdOptions, index_only_rowid)},
+		{"logical_decoding_prune_records", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, logical_decoding_prune_records)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

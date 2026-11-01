@@ -364,6 +364,7 @@ typedef struct StdRdOptions
 	double		vacuum_max_eager_freeze_failure_rate;
 
 	bool		index_only_rowid;	/* store ".rowid" only in its index */
+	bool		logical_decoding_prune_records; /* see pruneheap.c */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
