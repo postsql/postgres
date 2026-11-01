@@ -1642,6 +1642,30 @@ getBackendKeyData(PGconn *conn, int msgLength)
 }
 
 
+static const char *const CommitsVisibleChannelNames[PQ_COMMITS_VISIBLE_LSN_CHANNELS] =
+{
+	"Commits visible at LSN 10 ms",
+	"Commits visible at LSN 20 ms",
+	"Commits visible at LSN 50 ms",
+	"Commits visible at LSN 100 ms",
+	"Commits visible at LSN 200 ms",
+	"Commits visible at LSN 500 ms",
+	"Commits visible at LSN 1 s",
+};
+
+static int
+pqCommitsVisibleChannelIndex(const char *channel)
+{
+	if (strncmp(channel, "Commits visible at LSN ", 23) != 0)
+		return -1;
+	for (int i = 0; i < PQ_COMMITS_VISIBLE_LSN_CHANNELS; i++)
+	{
+		if (strcmp(channel + 23, CommitsVisibleChannelNames[i] + 23) == 0)
+			return i;
+	}
+	return -1;
+}
+
 /*
  * Attempt to read a Notify response message.
  * This is possible in several places, so we break it out as a subroutine.
@@ -1654,33 +1678,95 @@ static int
 getNotify(PGconn *conn)
 {
 	int			be_pid;
-	char	   *svname;
+	int			chan_idx;
+	char	   *svname = NULL;
+	const char *relname_src;
 	int			nmlen;
 	int			extralen;
+	size_t		extra_cap;
 	PGnotify   *newNotify;
 
 	if (pqGetInt(&be_pid, 4, conn))
 		return EOF;
 	if (pqGets(&conn->workBuffer, conn))
 		return EOF;
-	/* must save name while getting extra string */
-	svname = strdup(conn->workBuffer.data);
-	if (!svname)
+
+	chan_idx = pqCommitsVisibleChannelIndex(conn->workBuffer.data);
+	if (chan_idx >= 0)
 	{
-		/*
-		 * Notify messages can arrive at any state, so we cannot associate the
-		 * error with any particular query.  There's no way to return back an
-		 * "async error", so the best we can do is drop the connection.  That
-		 * seems better than silently ignoring the notification.
-		 */
-		libpq_append_conn_error(conn, "out of memory");
-		handleFatalError(conn);
-		return 0;
+		relname_src = CommitsVisibleChannelNames[chan_idx];
 	}
+	else
+	{
+		/* must save name while getting extra string */
+		svname = strdup(conn->workBuffer.data);
+		if (!svname)
+		{
+			/*
+			 * Notify messages can arrive at any state, so we cannot associate
+			 * the error with any particular query.  There's no way to return
+			 * back an "async error", so the best we can do is drop the
+			 * connection.  That seems better than silently ignoring the
+			 * notification.
+			 */
+			libpq_append_conn_error(conn, "out of memory");
+			handleFatalError(conn);
+			return 0;
+		}
+		relname_src = svname;
+	}
+
 	if (pqGets(&conn->workBuffer, conn))
 	{
 		free(svname);
 		return EOF;
+	}
+
+	extralen = strlen(conn->workBuffer.data);
+
+	if (chan_idx >= 0)
+	{
+		int64_t		ts_usec;
+		uint64_t	parsed_lsn;
+		PGnotify   *existing = conn->lsn_progress_unread[chan_idx];
+
+		if (PQparseCommitsVisibleLSN(conn->workBuffer.data,
+									 &ts_usec, &parsed_lsn))
+		{
+			conn->rfq_last_progress_ts = ts_usec;
+			if (conn->in_hot_standby == PG_BOOL_YES &&
+				parsed_lsn > conn->rfq_last_replay_lsn)
+				conn->rfq_last_replay_lsn = parsed_lsn;
+		}
+
+		/*
+		 * Coalesce unread "Commits visible at LSN ..." notifications in place
+		 * so slow clients always receive only the latest payload without
+		 * queuing stale frames or allocating memory.
+		 */
+		if (existing != NULL && extralen <= 63)
+		{
+			strcpy(existing->extra, conn->workBuffer.data);
+			existing->be_pid = be_pid;
+			if (existing != conn->notifyTail)
+			{
+				if (conn->notifyHead == existing)
+					conn->notifyHead = existing->next;
+				else
+				{
+					PGnotify   *prev = conn->notifyHead;
+
+					while (prev && prev->next != existing)
+						prev = prev->next;
+					if (prev)
+						prev->next = existing->next;
+				}
+				existing->next = NULL;
+				conn->notifyTail->next = existing;
+				conn->notifyTail = existing;
+			}
+			return 0;
+		}
 	}
 
 	/*
@@ -1688,9 +1774,9 @@ getNotify(PGconn *conn)
 	 * freed at once.  We don't use NAMEDATALEN because we don't want to tie
 	 * this interface to a specific server name length.
 	 */
-	nmlen = strlen(svname);
-	extralen = strlen(conn->workBuffer.data);
-	newNotify = (PGnotify *) malloc(sizeof(PGnotify) + nmlen + extralen + 2);
+	nmlen = strlen(relname_src);
+	extra_cap = (chan_idx >= 0 && extralen < 63) ? 64 : (size_t) extralen + 1;
+	newNotify = (PGnotify *) malloc(sizeof(PGnotify) + nmlen + 1 + extra_cap);
 	if (!newNotify)
 	{
 		free(svname);
@@ -1700,7 +1786,7 @@ getNotify(PGconn *conn)
 	}
 
 	newNotify->relname = (char *) newNotify + sizeof(PGnotify);
-	strcpy(newNotify->relname, svname);
+	strcpy(newNotify->relname, relname_src);
 	newNotify->extra = newNotify->relname + nmlen + 1;
 	strcpy(newNotify->extra, conn->workBuffer.data);
 	newNotify->be_pid = be_pid;
@@ -1710,6 +1796,8 @@ getNotify(PGconn *conn)
 	else
 		conn->notifyHead = newNotify;
 	conn->notifyTail = newNotify;
+	if (chan_idx >= 0)
+		conn->lsn_progress_unread[chan_idx] = newNotify;
 
 	free(svname);
 	return 0;

@@ -427,6 +427,10 @@ extern int	PQsessionHasPreparedStatements(const PGconn *conn);
 extern int	PQsessionHasListenChannels(const PGconn *conn);
 extern uint64_t PQlastCommitLSN(const PGconn *conn);
 extern uint64_t PQlastReplayLSN(const PGconn *conn);
+extern int64_t PQlastVisibleLSNTimestamp(const PGconn *conn);
+extern int	PQparseCommitsVisibleLSN(const char *extra,
+									 int64_t *utc_unix_usec,
+									 uint64_t *lsn);
 extern const char *PQreadyForQueryValue(const PGconn *conn,
 										const char *key,
 										int *val_len);

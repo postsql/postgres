@@ -2905,7 +2905,20 @@ int PQsessionHasListenChannels(const PGconn *conn);
 <synopsis>
 uint64_t PQlastCommitLSN(const PGconn *conn);
 uint64_t PQlastReplayLSN(const PGconn *conn);
+int64_t PQlastVisibleLSNTimestamp(const PGconn *conn);
+int PQparseCommitsVisibleLSN(const char *extra, int64_t *utc_unix_usec, uint64_t *lsn);
 </synopsis>
+       <function>PQlastVisibleLSNTimestamp</function> returns the UTC Unix
+       epoch timestamp in microseconds from the most recent
+       <literal>"Commits visible at LSN ..."</literal> notification received
+       on the connection (or <literal>0</literal> if none), and
+       <function>PQparseCommitsVisibleLSN</function> parses a notification
+       <structfield>extra</structfield> payload into its UTC timestamp and
+       64-bit <acronym>LSN</acronym> components, returning <literal>1</literal>
+       on success or <literal>0</literal> on malformed input. Unread
+       notifications on each <literal>"Commits visible at LSN ..."</literal>
+       channel are coalesced in place so <function>PQnotifies</function>
+       always delivers only the newest notification per subscribed cadence.
       </para>
      </listitem>
     </varlistentry>

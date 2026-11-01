@@ -674,6 +674,7 @@ pqDropServerData(PGconn *conn)
 		free(prev);
 	}
 	conn->notifyHead = conn->notifyTail = NULL;
+	memset(conn->lsn_progress_unread, 0, sizeof(conn->lsn_progress_unread));
 
 	/* Reset ParameterStatus data, as well as variables deduced from it */
 	pstatus = conn->pstatus;
@@ -695,6 +696,7 @@ pqDropServerData(PGconn *conn)
 	conn->rfq_has_listen_channels = PG_BOOL_UNKNOWN;
 	conn->rfq_last_commit_lsn = 0;
 	conn->rfq_last_replay_lsn = 0;
+	conn->rfq_last_progress_ts = 0;
 	conn->rfq_nfields = 0;
 	conn->scram_sha_256_iterations = SCRAM_SHA_256_DEFAULT_ITERATIONS;
 	conn->sversion = 0;
@@ -5030,6 +5032,7 @@ pqMakeEmptyPGconn(void)
 	conn->rfq_has_listen_channels = PG_BOOL_UNKNOWN;
 	conn->rfq_last_commit_lsn = 0;
 	conn->rfq_last_replay_lsn = 0;
+	conn->rfq_last_progress_ts = 0;
 	conn->rfq_nfields = 0;
 	conn->scram_sha_256_iterations = SCRAM_SHA_256_DEFAULT_ITERATIONS;
 	conn->verbosity = PQERRORS_DEFAULT;
@@ -7747,6 +7750,12 @@ uint64_t
 PQlastReplayLSN(const PGconn *conn)
 {
 	return conn ? conn->rfq_last_replay_lsn : 0;
+}
+
+int64_t
+PQlastVisibleLSNTimestamp(const PGconn *conn)
+{
+	return conn ? conn->rfq_last_progress_ts : 0;
 }
 
 const char *

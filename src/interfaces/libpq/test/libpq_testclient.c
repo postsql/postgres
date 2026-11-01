@@ -266,6 +266,63 @@ run_ready_for_query_tests(const char *primary_conninfo,
 		return 1;
 	}
 
+	/* PQparseCommitsVisibleLSN unit & boundary tests */
+	{
+		int64_t		ts = -1;
+		uint64_t	plsn = 0;
+
+		if (!PQparseCommitsVisibleLSN("1970-01-01T00:00:00.000000Z 0/00000001",
+									  &ts, &plsn) ||
+			ts != 0 || plsn != 1)
+		{
+			fprintf(stderr, "epoch PQparseCommitsVisibleLSN failed\n");
+			return 1;
+		}
+		if (!PQparseCommitsVisibleLSN("2026-11-01T00:00:00.123456Z 1/0306EE20",
+									  &ts, &plsn) ||
+			ts != INT64CONST(1793491200123456) ||
+			plsn != ((UINT64CONST(1) << 32) | UINT64CONST(0x0306EE20)))
+		{
+			fprintf(stderr, "2026 PQparseCommitsVisibleLSN failed (ts=%lld)\n",
+					(long long) ts);
+			return 1;
+		}
+		if (!PQparseCommitsVisibleLSN("2024-02-29T23:59:59.999999Z 0/1", &ts, &plsn) ||
+			PQparseCommitsVisibleLSN("2025-02-29T23:59:59.999999Z 0/1", &ts, &plsn) ||
+			PQparseCommitsVisibleLSN(NULL, &ts, &plsn) ||
+			PQparseCommitsVisibleLSN("", &ts, &plsn) ||
+			PQparseCommitsVisibleLSN("2026-11-01T00:00:00.123456 0/1", &ts, &plsn) ||
+			PQparseCommitsVisibleLSN("2026-11-01T00:00:00.123456Z bad", &ts, &plsn))
+		{
+			fprintf(stderr, "boundary PQparseCommitsVisibleLSN check failed\n");
+			return 1;
+		}
+	}
+
+	/* Live standby LISTEN "Commits visible at LSN 10 ms" test */
+	{
+		PGnotify   *n;
+		int64_t		ts = 0;
+		uint64_t	plsn = 0;
+
+		exec_expect_ok(sconn, "LISTEN \"Commits visible at LSN 10 ms\"");
+		n = PQnotifies(sconn);
+		if (!n ||
+			strcmp(n->relname, "Commits visible at LSN 10 ms") != 0 ||
+			!PQparseCommitsVisibleLSN(n->extra, &ts, &plsn) ||
+			ts <= 0 || plsn < lsn2 ||
+			PQlastVisibleLSNTimestamp(sconn) != ts ||
+			PQnotifies(sconn) != NULL)
+		{
+			fprintf(stderr, "live standby Commits visible at LSN notify failed\n");
+			if (n)
+				PQfreemem(n);
+			return 1;
+		}
+		PQfreemem(n);
+		exec_expect_ok(sconn, "UNLISTEN *");
+	}
+
 	if (trace_fp)
 	{
 		PQuntrace(pconn);
@@ -298,6 +355,50 @@ main(int argc, char *argv[])
 					(int) PQstatus(conn), PQerrorMessage(conn));
 		PQfinish(conn);
 		return ok ? 0 : 1;
+	}
+	if ((argc == 3) && !strcmp(argv[1], "--coalesce-burst"))
+	{
+		PGconn	   *conn = PQconnectdb(argv[2]);
+		PGnotify   *n1,
+				   *n2,
+				   *n3;
+		int64_t		ts = 0;
+		uint64_t	lsn = 0;
+
+		if (PQstatus(conn) != CONNECTION_OK)
+		{
+			fprintf(stderr, "burst connect failed: %s\n", PQerrorMessage(conn));
+			PQfinish(conn);
+			return 1;
+		}
+		n1 = PQnotifies(conn);
+		n2 = PQnotifies(conn);
+		n3 = PQnotifies(conn);
+		if (!n1 || strcmp(n1->relname, "user_chan") != 0 ||
+			strcmp(n1->extra, "mid") != 0 ||
+			!n2 || strcmp(n2->relname, "Commits visible at LSN 10 ms") != 0 ||
+			!PQparseCommitsVisibleLSN(n2->extra, &ts, &lsn) ||
+			lsn != 200 || n3 != NULL)
+		{
+			fprintf(stderr, "burst coalescing failed: n1=%s n2=%s lsn=%llu n3=%p\n",
+					n1 ? n1->relname : "NULL",
+					n2 ? n2->extra : "NULL",
+					(unsigned long long) lsn,
+					(void *) n3);
+			if (n1)
+				PQfreemem(n1);
+			if (n2)
+				PQfreemem(n2);
+			if (n3)
+				PQfreemem(n3);
+			PQfinish(conn);
+			return 1;
+		}
+		PQfreemem(n1);
+		PQfreemem(n2);
+		PQfinish(conn);
+		printf("coalesce_burst_ok\n");
+		return 0;
 	}
 
 	printf("unsupported arguments\n");

@@ -25,6 +25,7 @@
 #endif
 
 #include "common/int.h"
+#include "common/pg_parse_lsn.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "mb/pg_wchar.h"
@@ -2694,12 +2695,112 @@ PQnotifies(PGconn *conn)
 	event = conn->notifyHead;
 	if (event)
 	{
+		for (int i = 0; i < PQ_COMMITS_VISIBLE_LSN_CHANNELS; i++)
+		{
+			if (conn->lsn_progress_unread[i] == event)
+			{
+				conn->lsn_progress_unread[i] = NULL;
+				break;
+			}
+		}
 		conn->notifyHead = event->next;
 		if (!conn->notifyHead)
 			conn->notifyTail = NULL;
 		event->next = NULL;		/* don't let app see the internal state */
 	}
 	return event;
+}
+
+static bool
+pqParseFixedDigits(const char *p, int n, int *out)
+{
+	int			val = 0;
+
+	for (int i = 0; i < n; i++)
+	{
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		val = val * 10 + (p[i] - '0');
+	}
+	*out = val;
+	return true;
+}
+
+/*
+ * Parse "<ISO-8601 UTC timestamp> <LSN>" payload emitted on
+ * "Commits visible at LSN ..." channels (e.g.,
+ * "2026-11-01T10:47:59.123456Z 0/0306EE20").
+ * Returns 1 on success, 0 on syntax error.
+ */
+int
+PQparseCommitsVisibleLSN(const char *extra, int64_t *utc_unix_usec,
+						 uint64_t *lsn)
+{
+	static const int mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+	const char *p = extra;
+	int			year = 0,
+				ylen = 0,
+				mon,
+				day,
+				hour,
+				min,
+				sec,
+				usec,
+				max_day;
+	bool		leap;
+	int			y_adj;
+	int64		era,
+				days,
+				total_sec;
+	unsigned	yoe,
+				doy,
+				doe;
+	XLogRecPtr	parsed_lsn;
+
+	if (!extra)
+		return 0;
+
+	while (p[ylen] >= '0' && p[ylen] <= '9' && ylen <= 6)
+	{
+		year = year * 10 + (p[ylen] - '0');
+		ylen++;
+	}
+	if (ylen < 4 || ylen > 6 || year < 1 || p[ylen] != '-')
+		return 0;
+	p += ylen + 1;
+
+	if (!pqParseFixedDigits(p, 2, &mon) || p[2] != '-' ||
+		!pqParseFixedDigits(p + 3, 2, &day) || p[5] != 'T' ||
+		!pqParseFixedDigits(p + 6, 2, &hour) || p[8] != ':' ||
+		!pqParseFixedDigits(p + 9, 2, &min) || p[11] != ':' ||
+		!pqParseFixedDigits(p + 12, 2, &sec) || p[14] != '.' ||
+		!pqParseFixedDigits(p + 15, 6, &usec) || p[21] != 'Z' ||
+		p[22] != ' ')
+		return 0;
+
+	if (mon < 1 || mon > 12 || hour > 23 || min > 59 || sec > 60)
+		return 0;
+	leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+	max_day = mdays[mon - 1] + ((mon == 2 && leap) ? 1 : 0);
+	if (day < 1 || day > max_day)
+		return 0;
+
+	if (!pg_parse_lsn(p + 23, &parsed_lsn))
+		return 0;
+
+	y_adj = year - (mon <= 2 ? 1 : 0);
+	era = (y_adj >= 0 ? y_adj : y_adj - 399) / 400;
+	yoe = (unsigned) (y_adj - era * 400);
+	doy = (unsigned) ((153 * (mon + (mon > 2 ? -3 : 9)) + 2) / 5 + day - 1);
+	doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	days = era * 146097 + (int64) doe - 719468;
+	total_sec = days * 86400 + (int64) hour * 3600 + (int64) min * 60 + sec;
+
+	if (utc_unix_usec)
+		*utc_unix_usec = total_sec * INT64CONST(1000000) + usec;
+	if (lsn)
+		*lsn = (uint64_t) parsed_lsn;
+	return 1;
 }
 
 /*

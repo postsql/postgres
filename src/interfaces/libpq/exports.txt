@@ -221,3 +221,5 @@ PQreadyForQueryValue      218
 PQreadyForQueryFieldCount 219
 PQreadyForQueryField      220
 PQsetReadyForQueryHook    221
+PQlastVisibleLSNTimestamp 222
+PQparseCommitsVisibleLSN  223

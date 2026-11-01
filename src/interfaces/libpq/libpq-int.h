@@ -275,6 +275,9 @@ typedef struct pgParameterStatus
 	/* Note: name and value are stored in same malloc block as struct is */
 } pgParameterStatus;
 
+/* Number of built-in "Commits visible at LSN ..." coalescing channels */
+#define PQ_COMMITS_VISIBLE_LSN_CHANNELS 7
+
 /* Entry in PGconn's decoded ReadyForQuery ('Z') key-value array */
 typedef struct pgRfqField
 {
@@ -487,6 +490,7 @@ struct pg_conn
 	int			copy_already_done;	/* # bytes already returned in COPY OUT */
 	PGnotify   *notifyHead;		/* oldest unreported Notify msg */
 	PGnotify   *notifyTail;		/* newest unreported Notify msg */
+	PGnotify   *lsn_progress_unread[PQ_COMMITS_VISIBLE_LSN_CHANNELS];
 
 	/* Support for multiple hosts in connection string */
 	int			nconnhost;		/* # of hosts named in conn string */
@@ -575,6 +579,7 @@ struct pg_conn
 	PGTernaryBool rfq_has_listen_channels;
 	uint64		rfq_last_commit_lsn;
 	uint64		rfq_last_replay_lsn;
+	int64		rfq_last_progress_ts;
 	pgRfqField *rfq_fields;
 	int			rfq_nfields;
 	int			rfq_fields_cap;
