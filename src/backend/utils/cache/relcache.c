@@ -4920,6 +4920,54 @@ RelationGetReplicaIndex(Relation relation)
 }
 
 /*
+ * RelationIsRowidTarget -- is this table a target of logical replication by
+ * tuple identifier?
+ *
+ * A subscriber identifies the rows of a table published with REPLICA
+ * IDENTITY ROWID by a column named ".rowid" of type tid.  We consider a table
+ * to be such a target if its replica identity index (by default, its
+ * primary key) consists of exactly that column.
+ *
+ * The result is cached; any change of the table's indexes or columns
+ * invalidates the relcache entry.
+ */
+bool
+RelationIsRowidTarget(Relation relation)
+{
+	if (relation->rd_rowidtarget == 0)
+	{
+		bool		result = false;
+		Oid			replidindex;
+
+		if (relation->rd_rel->relkind == RELKIND_RELATION &&
+			OidIsValid(replidindex = RelationGetReplicaIndex(relation)))
+		{
+			Relation	indexrel = RelationIdGetRelation(replidindex);
+
+			if (RelationIsValid(indexrel))
+			{
+				Form_pg_index index = indexrel->rd_index;
+
+				if (index->indnatts == 1 && index->indkey.values[0] > 0)
+				{
+					Form_pg_attribute attr =
+						TupleDescAttr(RelationGetDescr(relation),
+									  index->indkey.values[0] - 1);
+
+					result = (attr->atttypid == TIDOID &&
+							  strcmp(NameStr(attr->attname),
+									 REPLICA_IDENTITY_ROWID_ATTNAME) == 0);
+				}
+				RelationClose(indexrel);
+			}
+		}
+		relation->rd_rowidtarget = result ? 'y' : 'n';
+	}
+
+	return relation->rd_rowidtarget == 'y';
+}
+
+/*
  * RelationGetIndexExpressions -- get the index expressions for an index
  *
  * We cache the result of transforming pg_index.indexprs into a node tree.

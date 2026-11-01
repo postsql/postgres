@@ -95,7 +95,9 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
@@ -827,10 +829,63 @@ fetch_remote_table_info(char *nspname, char *relname,
 	}
 	ExecDropSingleTupleTableSlot(slot);
 
+	/*
+	 * With REPLICA IDENTITY ROWID, the publisher sends the tuple identifier
+	 * as an additional key column; see logicalrep_write_attrs().  copy_table()
+	 * fetches it as ctid.
+	 */
+	if (lrel->replident == REPLICA_IDENTITY_ROWID)
+	{
+		if (natt >= MaxTupleAttributeNumber)
+			elog(ERROR, "too many columns in remote table \"%s.%s\"",
+				 nspname, relname);
+		lrel->attnames[natt] = pstrdup(REPLICA_IDENTITY_ROWID_ATTNAME);
+		lrel->atttyps[natt] = TIDOID;
+		lrel->attkeys = bms_add_member(lrel->attkeys, natt);
+		natt++;
+	}
+
 	lrel->natts = natt;
 
 	walrcv_clear_result(res);
 	pfree(cmd.data);
+}
+
+/*
+ * Does the table, or any of its partitions, contain any rows?
+ */
+static bool
+table_has_rows(Relation rel)
+{
+	List	   *relids;
+	ListCell   *lc;
+	bool		found = false;
+
+	relids = find_all_inheritors(RelationGetRelid(rel), AccessShareLock, NULL);
+	foreach(lc, relids)
+	{
+		Relation	r = table_open(lfirst_oid(lc), NoLock);
+
+		if (r->rd_rel->relkind == RELKIND_RELATION)
+		{
+			Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
+			TableScanDesc scan = table_beginscan(r, snapshot, 0, NULL);
+			TupleTableSlot *slot = table_slot_create(r, NULL);
+
+			found = table_scan_getnextslot(scan, ForwardScanDirection, slot);
+
+			ExecDropSingleTupleTableSlot(slot);
+			table_endscan(scan);
+			UnregisterSnapshot(snapshot);
+		}
+		table_close(r, NoLock);
+
+		if (found)
+			break;
+	}
+	list_free(relids);
+
+	return found;
 }
 
 /*
@@ -860,9 +915,27 @@ copy_table(Relation rel)
 	relmapentry = logicalrep_rel_open(lrel.remoteid, NoLock);
 	Assert(rel == relmapentry->localrel);
 
-	/* Start copy on the publisher. */
+	/*
+	 * With REPLICA IDENTITY ROWID, the rows copied are identified by their
+	 * tuple identifiers on the publisher.  Rows that already exist locally
+	 * could not be matched by later changes, and could collide with them.
+	 */
+	if (lrel.replident == REPLICA_IDENTITY_ROWID && table_has_rows(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot synchronize table \"%s.%s\" because it is not empty",
+						get_namespace_name(RelationGetNamespace(rel)),
+						RelationGetRelationName(rel)),
+				 errdetail("The published table uses REPLICA IDENTITY ROWID."),
+				 errhint("Empty the table, or use copy_data = false.")));
+
+	/*
+	 * Start copy on the publisher.  The tuple identifier of REPLICA IDENTITY
+	 * ROWID tables can only be fetched with COPY (SELECT ...).
+	 */
 	initStringInfo(&cmd);
-	if (lrel.relkind == RELKIND_RELATION)
+	if (lrel.relkind == RELKIND_RELATION &&
+		lrel.replident != REPLICA_IDENTITY_ROWID)
 		appendStringInfo(&cmd, "COPY %s TO STDOUT",
 						 quote_qualified_identifier(lrel.nspname, lrel.relname));
 	else
@@ -874,11 +947,21 @@ copy_table(Relation rel)
 		appendStringInfoString(&cmd, "COPY (SELECT ");
 		for (int i = 0; i < lrel.natts; i++)
 		{
-			appendStringInfoString(&cmd, quote_identifier(lrel.attnames[i]));
+			/* the virtual ".rowid" column is the last one; see above */
+			if (lrel.replident == REPLICA_IDENTITY_ROWID && i == lrel.natts - 1)
+				appendStringInfoString(&cmd, "ctid");
+			else
+				appendStringInfoString(&cmd, quote_identifier(lrel.attnames[i]));
 			if (i < lrel.natts - 1)
 				appendStringInfoString(&cmd, ", ");
 		}
-		appendStringInfo(&cmd, " FROM %s) TO STDOUT",
+
+		/*
+		 * For regular tables, make sure we don't copy data from a child that
+		 * inherits the named table, like COPY of the table does not.
+		 */
+		appendStringInfo(&cmd, " FROM %s%s) TO STDOUT",
+						 lrel.relkind == RELKIND_RELATION ? "ONLY " : "",
 						 quote_qualified_identifier(lrel.nspname, lrel.relname));
 	}
 	res = walrcv_exec(LogRepWorkerWalRcvConn, cmd.data, 0, NULL);

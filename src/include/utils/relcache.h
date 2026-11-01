@@ -55,6 +55,7 @@ extern List *RelationGetIndexList(Relation relation);
 extern List *RelationGetStatExtList(Relation relation);
 extern Oid	RelationGetPrimaryKeyIndex(Relation relation);
 extern Oid	RelationGetReplicaIndex(Relation relation);
+extern bool RelationIsRowidTarget(Relation relation);
 extern List *RelationGetIndexExpressions(Relation relation);
 extern List *RelationGetDummyIndexExpressions(Relation relation);
 extern List *RelationGetIndexPredicate(Relation relation);

@@ -201,6 +201,29 @@ CREATE TABLE t (a int, b text, ".rowid" tid PRIMARY KEY);
     (see the <literal>publish_via_partition_root</literal> parameter of
     <xref linkend="sql-createpublication"/>).
    </para>
+
+   <para>
+    During the initial data synchronization, the rows are copied together
+    with their tuple identifiers.  The subscriber's table must be empty at
+    that time, because rows that already exist could not be matched by later
+    changes; otherwise the synchronization fails.  (Subscribers of releases
+    that do not support replica identity <literal>ROWID</literal> do not
+    fetch the tuple identifiers, so they must be created with
+    <literal>copy_data = false</literal>.)
+   </para>
+
+   <para>
+    On the subscriber, a table whose replica identity index (by default, its
+    primary key) consists of a single column <literal>".rowid" tid</literal>
+    is the target of replication by tuple identifier.  To prevent its rows
+    from diverging from the publisher's rows they are identified with,
+    <command>UPDATE</command>, <command>DELETE</command> and
+    <command>INSERT ... ON CONFLICT DO UPDATE</command> on it are refused,
+    except by logical replication or
+    when <xref linkend="guc-session-replication-role"/> is set to
+    <literal>replica</literal>.  Once the migration is complete, drop the
+    primary key and the <literal>.rowid</literal> column.
+   </para>
   </sect2>
  </sect1>
 
