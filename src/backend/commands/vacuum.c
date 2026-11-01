@@ -41,6 +41,7 @@
 #include "commands/cluster.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
+#include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -2307,11 +2308,19 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 			if ((params->options & VACOPT_VERBOSE) != 0)
 				cluster_params.options |= CLUOPT_VERBOSE;
 
-			/* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
-			cluster_rel(rel, InvalidOid, &cluster_params);
-			/* cluster_rel closes the relation, but keeps lock */
+			/*
+			 * VACUUM FULL is now a variant of CLUSTER; see cluster.c.  It
+			 * refuses to rewrite tables that must keep their tuple
+			 * identifiers; skip those if they were not named explicitly.
+			 */
+			if (relation != NULL ||
+				CheckRelationRewriteAllowed(rel, "VACUUM FULL", true))
+			{
+				cluster_rel(rel, InvalidOid, &cluster_params);
+				/* cluster_rel closes the relation, but keeps lock */
 
-			rel = NULL;
+				rel = NULL;
+			}
 		}
 		else
 			table_relation_vacuum(rel, params, bstrategy);

@@ -5930,6 +5930,9 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot rewrite temporary tables of other sessions")));
 
+			/* rewriting assigns new tuple identifiers */
+			(void) CheckRelationRewriteAllowed(OldHeap, "ALTER TABLE", false);
+
 			/*
 			 * Select destination tablespace (same as original unless user
 			 * requested a change)
@@ -7650,6 +7653,41 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 }
 
 /*
+ * CheckRelationRewriteAllowed
+ *		Can the heap of this relation be rewritten?
+ *
+ * Rewriting a table (VACUUM FULL, CLUSTER, or ALTER TABLE commands
+ * that rewrite) assigns new tuple identifiers to all rows, without any
+ * logically decoded change.  Logical replication with REPLICA IDENTITY ROWID
+ * identifies rows by their tuple identifier, so subscribers would silently
+ * apply later changes to the wrong rows.  Therefore rewriting such tables is
+ * refused while logical decoding is possible.
+ *
+ * Returns true if the rewrite is allowed.  Otherwise an ERROR is raised, or,
+ * if skip_ok is true (the table was not named explicitly), a WARNING is
+ * emitted and false is returned.
+ */
+bool
+CheckRelationRewriteAllowed(Relation rel, const char *cmdname, bool skip_ok)
+{
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID &&
+		XLogLogicalInfoActive())
+	{
+		ereport(skip_ok ? WARNING : ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 skip_ok ?
+				 errmsg("skipping \"%s\" --- cannot execute %s on a table using REPLICA IDENTITY ROWID",
+						RelationGetRelationName(rel), cmdname) :
+				 errmsg("cannot execute %s on table \"%s\"",
+						cmdname, RelationGetRelationName(rel)),
+				 errdetail("The table uses REPLICA IDENTITY ROWID, and rewriting it would change the tuple identifiers that logical replication uses to identify its rows.")));
+		return false;
+	}
+
+	return true;
+}
+
+/*
  * If a new or renamed column will collide with the name of an existing
  * column and if_not_exists is false then error out, else do nothing.
  */
@@ -7659,6 +7697,15 @@ check_for_column_name_collision(Relation rel, const char *colname,
 {
 	HeapTuple	attTuple;
 	int			attnum;
+
+	/* logical replication adds a virtual column of this name */
+	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_ROWID &&
+		strcmp(colname, REPLICA_IDENTITY_ROWID_ATTNAME) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_COLUMN),
+				 errmsg("column name \"%s\" is reserved in table \"%s\"",
+						colname, RelationGetRelationName(rel)),
+				 errdetail("The table uses REPLICA IDENTITY ROWID.")));
 
 	/*
 	 * this test is deliberately not attisdropped-aware, since if one tries to
@@ -18554,6 +18601,31 @@ ATExecReplicaIdentity(Relation rel, ReplicaIdentityStmt *stmt, LOCKMODE lockmode
 	}
 	else if (stmt->identity_type == REPLICA_IDENTITY_NOTHING)
 	{
+		relation_mark_replica_identity(rel, stmt->identity_type, InvalidOid, true);
+		return;
+	}
+	else if (stmt->identity_type == REPLICA_IDENTITY_ROWID)
+	{
+		/*
+		 * The tuple identifiers of a partitioned table are not unique; that
+		 * would need a key that includes the partition.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("REPLICA IDENTITY ROWID is not supported for partitioned tables"),
+					 errhint("Set REPLICA IDENTITY ROWID on the partitions instead.")));
+
+		/* logical replication adds a virtual column of this name */
+		if (get_attnum(RelationGetRelid(rel),
+					   REPLICA_IDENTITY_ROWID_ATTNAME) != InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_COLUMN),
+					 errmsg("cannot use REPLICA IDENTITY ROWID for table \"%s\"",
+							RelationGetRelationName(rel)),
+					 errdetail("The table has a column named \"%s\".",
+							   REPLICA_IDENTITY_ROWID_ATTNAME)));
+
 		relation_mark_replica_identity(rel, stmt->identity_type, InvalidOid, true);
 		return;
 	}

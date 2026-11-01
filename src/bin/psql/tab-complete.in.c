@@ -2978,7 +2978,7 @@ match_previous_words(int pattern_id,
 	else if (Matches("ALTER", "TABLE", MatchAny, "REPLICA", "IDENTITY", "USING"))
 		COMPLETE_WITH("INDEX");
 	else if (Matches("ALTER", "TABLE", MatchAny, "REPLICA", "IDENTITY"))
-		COMPLETE_WITH("FULL", "NOTHING", "DEFAULT", "USING");
+		COMPLETE_WITH("FULL", "NOTHING", "DEFAULT", "ROWID", "USING");
 	else if (Matches("ALTER", "TABLE", MatchAny, "REPLICA"))
 		COMPLETE_WITH("IDENTITY");
 

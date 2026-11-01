@@ -323,6 +323,19 @@ cluster_rel(Relation OldHeap, Oid indexOid, ClusterParams *params)
 	/* Check for user-requested abort. */
 	CHECK_FOR_INTERRUPTS();
 
+	/*
+	 * Rewriting assigns new tuple identifiers.  When processing many tables,
+	 * skip those that must keep them.
+	 */
+	if (!CheckRelationRewriteAllowed(OldHeap,
+									 OidIsValid(indexOid) ?
+									 "CLUSTER" : "VACUUM FULL",
+									 recheck))
+	{
+		relation_close(OldHeap, AccessExclusiveLock);
+		return;
+	}
+
 	pgstat_progress_start_command(PROGRESS_COMMAND_CLUSTER, tableOid);
 	if (OidIsValid(indexOid))
 		pgstat_progress_update_param(PROGRESS_CLUSTER_COMMAND,
