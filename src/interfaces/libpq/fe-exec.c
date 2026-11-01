@@ -1300,9 +1300,11 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 
 	/*
 	 * Success.  In partial-result mode, if we have enough rows then make the
-	 * result available to the client immediately.
+	 * result available to the client immediately (except for internal WAIT
+	 * FOR LSN results, whose partialResMode belongs to the user's query).
 	 */
-	if (conn->partialResMode && res->ntups >= conn->maxChunkSize)
+	if (conn->partialResMode && res->ntups >= conn->maxChunkSize &&
+		!(conn->cmd_queue_head && conn->cmd_queue_head->internal_wait_lsn))
 		conn->asyncStatus = PGASYNC_READY_MORE;
 
 	return 1;
@@ -1341,6 +1343,9 @@ pqAllocCmdQueueEntry(PGconn *conn)
 	}
 	entry->next = NULL;
 	entry->query = NULL;
+	entry->internal_wait_lsn = false;
+	entry->waited_lsn = 0;
+	entry->deferred_simple_query = NULL;
 
 	return entry;
 }
@@ -1414,6 +1419,13 @@ pqRecycleCmdQueueEntry(PGconn *conn, PGcmdQueueEntry *entry)
 		free(entry->query);
 		entry->query = NULL;
 	}
+	if (entry->deferred_simple_query)
+	{
+		free(entry->deferred_simple_query);
+		entry->deferred_simple_query = NULL;
+	}
+	entry->internal_wait_lsn = false;
+	entry->waited_lsn = 0;
 
 	entry->next = conn->cmd_queue_recycle;
 	conn->cmd_queue_recycle = entry;
@@ -1442,10 +1454,108 @@ PQsendQueryContinue(PGconn *conn, const char *query)
 	return PQsendQueryInternal(conn, query, false);
 }
 
+static void
+pqFormatWaitForLSN(const PGconn *conn, uint64 target_lsn,
+				   char *buf, size_t bufsz)
+{
+	const char *mode_str;
+
+	switch (conn->wait_lsn_opts.mode)
+	{
+		case PQWAIT_LSN_STANDBY_FLUSH:
+			mode_str = "standby_flush";
+			break;
+		case PQWAIT_LSN_STANDBY_WRITE:
+			mode_str = "standby_write";
+			break;
+		case PQWAIT_LSN_STANDBY_REPLAY:
+		default:
+			mode_str = "standby_replay";
+			break;
+	}
+
+	if (conn->wait_lsn_opts.timeout_ms > 0)
+		snprintf(buf, bufsz,
+				 "WAIT FOR LSN '%X/%08X' WITH (MODE '%s', TIMEOUT '%lldms'%s)",
+				 (uint32) (target_lsn >> 32), (uint32) target_lsn,
+				 mode_str,
+				 (long long) conn->wait_lsn_opts.timeout_ms,
+				 conn->wait_lsn_opts.no_throw ? ", NO_THROW" : "");
+	else
+		snprintf(buf, bufsz,
+				 "WAIT FOR LSN '%X/%08X' WITH (MODE '%s'%s)",
+				 (uint32) (target_lsn >> 32), (uint32) target_lsn,
+				 mode_str,
+				 conn->wait_lsn_opts.no_throw ? ", NO_THROW" : "");
+}
+
+static bool
+pqShouldInjectWaitLSN(PGconn *conn, uint64 *target_lsn_out,
+					  bool *in_trans_err_out)
+{
+	uint64		target;
+	uint64		effective_satisfied;
+
+	*target_lsn_out = 0;
+	*in_trans_err_out = false;
+
+	if (!conn || !conn->wait_for_commit_lsn || conn->is_lsn_primary ||
+		conn->pipelineStatus == PQ_PIPELINE_ABORTED)
+		return false;
+
+	target = pqLsnGroupGetCommitLSN(conn);
+	if (conn->min_target_lsn > target)
+		target = conn->min_target_lsn;
+	if (target == 0)
+		return false;
+
+	effective_satisfied = (conn->wait_lsn_opts.pooled_replica &&
+						   conn->xactStatus == PQTRANS_IDLE) ?
+		0 : conn->satisfied_lsn;
+	if (conn->cmd_queue_head != NULL &&
+		conn->pending_wait_lsn > effective_satisfied)
+		effective_satisfied = conn->pending_wait_lsn;
+
+	if (target <= effective_satisfied)
+		return false;
+
+	if (conn->xactStatus == PQTRANS_INERROR)
+		return false;
+
+	if (conn->xactStatus == PQTRANS_INTRANS)
+	{
+		switch (conn->wait_lsn_opts.intrans_policy)
+		{
+			case PQWAIT_INTRANS_ERROR:
+				libpq_append_conn_error(conn,
+										"cannot execute WAIT FOR LSN %X/%08X while connection is in an open transaction block",
+										(uint32) (target >> 32), (uint32) target);
+				*in_trans_err_out = true;
+				return false;
+			case PQWAIT_INTRANS_SKIP_WARN:
+				pqInternalNotice(&conn->noticeHooks,
+								 "skipping WAIT FOR LSN %X/%08X because connection is already in a transaction block",
+								 (uint32) (target >> 32), (uint32) target);
+				return false;
+			case PQWAIT_INTRANS_SILENT_SKIP:
+			default:
+				return false;
+		}
+	}
+
+	*target_lsn_out = target;
+	return true;
+}
+
 static int
 PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 {
 	PGcmdQueueEntry *entry = NULL;
+	PGcmdQueueEntry *wait_entry = NULL;
+	uint64		target_lsn = 0;
+	bool		in_trans_err = false;
+	bool		inject_wait;
+	int			saved_outCount;
 
 	if (!PQsendQueryStart(conn, newQuery))
 		return 0;
@@ -1464,9 +1574,82 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 		return 0;
 	}
 
+	inject_wait = pqShouldInjectWaitLSN(conn, &target_lsn, &in_trans_err);
+	if (in_trans_err)
+		return 0;
+
+	saved_outCount = conn->outCount;
+
+	if (inject_wait)
+	{
+		char		wait_sql[160];
+
+		pqFormatWaitForLSN(conn, target_lsn, wait_sql, sizeof(wait_sql));
+		wait_entry = pqAllocCmdQueueEntry(conn);
+		if (wait_entry == NULL)
+			return 0;
+		wait_entry->queryclass = PGQUERY_SIMPLE;
+		wait_entry->internal_wait_lsn = true;
+		wait_entry->waited_lsn = target_lsn;
+		wait_entry->query = strdup(wait_sql);
+
+		if (conn->wait_lsn_opts.no_throw == 0)
+		{
+			/*
+			 * 1-RTT error-isolating gate: hold the user's Simple Query until
+			 * WAIT FOR LSN succeeds so a timeout or promotion error never
+			 * executes the user query against stale standby state.
+			 */
+			wait_entry->deferred_simple_query = strdup(query);
+			if (!wait_entry->deferred_simple_query)
+			{
+				pqRecycleCmdQueueEntry(conn, wait_entry);
+				libpq_append_conn_error(conn, "out of memory");
+				return 0;
+			}
+
+			if (pqPutMsgStart(PqMsg_Query, conn) < 0 ||
+				pqPuts(wait_sql, conn) < 0 ||
+				pqPutMsgEnd(conn) < 0)
+			{
+				conn->outCount = saved_outCount;
+				pqRecycleCmdQueueEntry(conn, wait_entry);
+				return 0;
+			}
+
+			if (pqFlush(conn) < 0)
+			{
+				pqRecycleCmdQueueEntry(conn, wait_entry);
+				return 0;
+			}
+
+			if (target_lsn > conn->pending_wait_lsn)
+				conn->pending_wait_lsn = target_lsn;
+			pqAppendCmdQueueEntry(conn, wait_entry);
+			return 1;
+		}
+
+		/*
+		 * NO_THROW enabled: coalesce both 'Q' messages in a single flush for
+		 * 0 extra network round-trips.
+		 */
+		if (pqPutMsgStart(PqMsg_Query, conn) < 0 ||
+			pqPuts(wait_sql, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0)
+		{
+			conn->outCount = saved_outCount;
+			pqRecycleCmdQueueEntry(conn, wait_entry);
+			return 0;
+		}
+	}
+
 	entry = pqAllocCmdQueueEntry(conn);
 	if (entry == NULL)
+	{
+		conn->outCount = saved_outCount;
+		pqRecycleCmdQueueEntry(conn, wait_entry);
 		return 0;				/* error msg already set */
+	}
 
 	/* Send the query message(s) */
 	/* construct the outgoing Query message */
@@ -1475,6 +1658,8 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 		pqPutMsgEnd(conn) < 0)
 	{
 		/* error message should be set up already */
+		conn->outCount = saved_outCount;
+		pqRecycleCmdQueueEntry(conn, wait_entry);
 		pqRecycleCmdQueueEntry(conn, entry);
 		return 0;
 	}
@@ -1492,11 +1677,18 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 		goto sendFailed;
 
 	/* OK, it's launched! */
+	if (wait_entry)
+	{
+		if (target_lsn > conn->pending_wait_lsn)
+			conn->pending_wait_lsn = target_lsn;
+		pqAppendCmdQueueEntry(conn, wait_entry);
+	}
 	pqAppendCmdQueueEntry(conn, entry);
 
 	return 1;
 
 sendFailed:
+	pqRecycleCmdQueueEntry(conn, wait_entry);
 	pqRecycleCmdQueueEntry(conn, entry);
 	/* error message should be set up already */
 	return 0;
@@ -1783,11 +1975,75 @@ PQsendQueryGuts(PGconn *conn,
 				int resultFormat)
 {
 	int			i;
-	PGcmdQueueEntry *entry;
+	PGcmdQueueEntry *entry = NULL;
+	PGcmdQueueEntry *wait_entry = NULL;
+	uint64		target_lsn = 0;
+	bool		in_trans_err = false;
+	bool		inject_wait;
+	int			saved_outCount;
+
+	inject_wait = pqShouldInjectWaitLSN(conn, &target_lsn, &in_trans_err);
+	if (in_trans_err)
+		return 0;
+
+	saved_outCount = conn->outCount;
 
 	entry = pqAllocCmdQueueEntry(conn);
 	if (entry == NULL)
 		return 0;				/* error msg already set */
+
+	if (inject_wait)
+	{
+		char		wait_sql[160];
+		const char *wait_stmt = command ? "" : "_pq_wait_lsn";
+
+		pqFormatWaitForLSN(conn, target_lsn, wait_sql, sizeof(wait_sql));
+		wait_entry = pqAllocCmdQueueEntry(conn);
+		if (wait_entry == NULL)
+			goto sendFailed;
+		wait_entry->queryclass = PGQUERY_EXTENDED;
+		wait_entry->internal_wait_lsn = true;
+		wait_entry->waited_lsn = target_lsn;
+		wait_entry->query = strdup(wait_sql);
+
+		/*
+		 * Coalesce Parse + Bind + Describe Portal + Execute (and Close when
+		 * preserving an existing prepared statement) ahead of the user query
+		 * without an intermediate Sync, achieving 0 extra round-trips while
+		 * relying on PostgreSQL's ignore_till_sync on WAIT errors.
+		 */
+		if (pqPutMsgStart(PqMsg_Parse, conn) < 0 ||
+			pqPuts(wait_stmt, conn) < 0 ||
+			pqPuts(wait_sql, conn) < 0 ||
+			pqPutInt(0, 2, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0 ||
+			pqPutMsgStart(PqMsg_Bind, conn) < 0 ||
+			pqPuts("", conn) < 0 ||
+			pqPuts(wait_stmt, conn) < 0 ||
+			pqPutInt(0, 2, conn) < 0 ||
+			pqPutInt(0, 2, conn) < 0 ||
+			pqPutInt(1, 2, conn) < 0 ||
+			pqPutInt(0, 2, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0 ||
+			pqPutMsgStart(PqMsg_Describe, conn) < 0 ||
+			pqPutc('P', conn) < 0 ||
+			pqPuts("", conn) < 0 ||
+			pqPutMsgEnd(conn) < 0 ||
+			pqPutMsgStart(PqMsg_Execute, conn) < 0 ||
+			pqPuts("", conn) < 0 ||
+			pqPutInt(0, 4, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0)
+			goto sendFailed;
+
+		if (wait_stmt[0] != '\0')
+		{
+			if (pqPutMsgStart(PqMsg_Close, conn) < 0 ||
+				pqPutc('S', conn) < 0 ||
+				pqPuts(wait_stmt, conn) < 0 ||
+				pqPutMsgEnd(conn) < 0)
+				goto sendFailed;
+		}
+	}
 
 	/*
 	 * We will send Parse (if needed), Bind, Describe Portal, Execute, Sync
@@ -1923,14 +2179,26 @@ PQsendQueryGuts(PGconn *conn,
 	 * it all; PQgetResult() will do any additional flushing needed.
 	 */
 	if (pqPipelineFlush(conn) < 0)
+	{
+		saved_outCount = -1;
 		goto sendFailed;
+	}
 
 	/* OK, it's launched! */
+	if (wait_entry)
+	{
+		if (target_lsn > conn->pending_wait_lsn)
+			conn->pending_wait_lsn = target_lsn;
+		pqAppendCmdQueueEntry(conn, wait_entry);
+	}
 	pqAppendCmdQueueEntry(conn, entry);
 
 	return 1;
 
 sendFailed:
+	if (saved_outCount >= 0)
+		conn->outCount = saved_outCount;
+	pqRecycleCmdQueueEntry(conn, wait_entry);
 	pqRecycleCmdQueueEntry(conn, entry);
 	/* error message should be set up already */
 	return 0;
@@ -2037,7 +2305,82 @@ PQconsumeInput(PGconn *conn)
 static void
 parseInput(PGconn *conn)
 {
-	pqParseInput3(conn);
+	for (;;)
+	{
+		PGcmdQueueEntry *head;
+
+		pqParseInput3(conn);
+
+		head = conn->cmd_queue_head;
+		if (!head || !head->internal_wait_lsn ||
+			conn->asyncStatus != PGASYNC_READY)
+			break;
+
+		/*
+		 * Consume successful internal WAIT FOR LSN results transparently.
+		 */
+		if (!conn->error_result &&
+			conn->result != NULL &&
+			(conn->result->resultStatus == PGRES_TUPLES_OK ||
+			 conn->result->resultStatus == PGRES_COMMAND_OK))
+		{
+			const char *status_val = NULL;
+
+			if (conn->result->resultStatus == PGRES_TUPLES_OK &&
+				PQntuples(conn->result) > 0 &&
+				PQnfields(conn->result) > 0)
+				status_val = PQgetvalue(conn->result, 0, 0);
+
+			if (!status_val || strcmp(status_val, "success") == 0)
+			{
+				if (head->waited_lsn > conn->satisfied_lsn)
+					conn->satisfied_lsn = head->waited_lsn;
+			}
+			else
+			{
+				pqInternalNotice(&conn->noticeHooks,
+								 "WAIT FOR LSN %X/%08X finished with status \"%s\"",
+								 (uint32) (head->waited_lsn >> 32),
+								 (uint32) head->waited_lsn,
+								 status_val);
+			}
+
+			pqClearAsyncResult(conn);
+			if (head->queryclass == PGQUERY_EXTENDED)
+				pqCommandQueueAdvance(conn, false, false);
+			conn->asyncStatus = PGASYNC_BUSY;
+			continue;
+		}
+
+		/*
+		 * In Simple Query mode with NO_THROW enabled (where the user's 'Q'
+		 * message was already sent behind WAIT FOR LSN), surface an
+		 * unexpected WAIT error as a client notice so the user's result stays
+		 * aligned.
+		 */
+		if (head->queryclass == PGQUERY_SIMPLE &&
+			head->deferred_simple_query == NULL)
+		{
+			if (conn->result && conn->result->errMsg && conn->result->errMsg[0])
+				pqInternalNotice(&conn->noticeHooks, "%s", conn->result->errMsg);
+			pqClearAsyncResult(conn);
+			pqClearConnErrorState(conn);
+			conn->asyncStatus = PGASYNC_BUSY;
+			continue;
+		}
+
+		/*
+		 * Otherwise (no_throw == 0 gated Simple Query, or Extended/Pipeline
+		 * Query where the backend skips the user query until Sync), discard
+		 * any deferred Simple Query and let PQgetResult() return the error.
+		 */
+		if (head->deferred_simple_query)
+		{
+			free(head->deferred_simple_query);
+			head->deferred_simple_query = NULL;
+		}
+		break;
+	}
 }
 
 /*
@@ -2174,8 +2517,27 @@ PQgetResult(PGconn *conn)
 			}
 
 			/* Advance the queue as appropriate */
-			pqCommandQueueAdvance(conn, false,
-								  res->resultStatus == PGRES_PIPELINE_SYNC);
+			{
+				bool		failed_ext_wait =
+					(conn->cmd_queue_head != NULL &&
+					 conn->cmd_queue_head->internal_wait_lsn &&
+					 conn->cmd_queue_head->queryclass == PGQUERY_EXTENDED);
+
+				pqCommandQueueAdvance(conn, false,
+									  res->resultStatus == PGRES_PIPELINE_SYNC);
+
+				/*
+				 * If a coalesced Extended/Pipeline WAIT FOR LSN threw an
+				 * error, the server enters ignore_till_sync and skips the
+				 * paired user query without sending a second ErrorResponse, so
+				 * pop that paired entry too.
+				 */
+				if (failed_ext_wait &&
+					conn->cmd_queue_head != NULL &&
+					conn->cmd_queue_head->queryclass == PGQUERY_EXTENDED &&
+					!conn->cmd_queue_head->internal_wait_lsn)
+					pqCommandQueueAdvance(conn, false, false);
+			}
 
 			if (conn->pipelineStatus != PQ_PIPELINE_OFF)
 			{
@@ -3336,6 +3698,45 @@ pqCommandQueueAdvance(PGconn *conn, bool isReadyForQuery, bool gotSync)
 	if (conn->cmd_queue_head == NULL)
 		conn->cmd_queue_tail = NULL;
 
+	/*
+	 * If a gated Simple Query WAIT FOR LSN just completed cleanly at
+	 * ReadyForQuery, dispatch the deferred user Simple Query now.
+	 */
+	if (isReadyForQuery && prevquery->internal_wait_lsn &&
+		prevquery->deferred_simple_query != NULL)
+	{
+		char	   *deferred = prevquery->deferred_simple_query;
+		PGcmdQueueEntry *uentry;
+		int			saved_outCount = conn->outCount;
+
+		prevquery->deferred_simple_query = NULL;
+		prevquery->next = NULL;
+		pqRecycleCmdQueueEntry(conn, prevquery);
+
+		uentry = pqAllocCmdQueueEntry(conn);
+		if (!uentry ||
+			pqPutMsgStart(PqMsg_Query, conn) < 0 ||
+			pqPuts(deferred, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0)
+		{
+			conn->outCount = saved_outCount;
+			free(deferred);
+			pqRecycleCmdQueueEntry(conn, uentry);
+			pqSaveErrorResult(conn);
+			return;
+		}
+		uentry->queryclass = PGQUERY_SIMPLE;
+		uentry->query = deferred;
+		if (pqFlush(conn) < 0)
+		{
+			pqRecycleCmdQueueEntry(conn, uentry);
+			pqSaveErrorResult(conn);
+			return;
+		}
+		pqAppendCmdQueueEntry(conn, uentry);
+		return;
+	}
+
 	/* and make the queue element recyclable */
 	prevquery->next = NULL;
 	pqRecycleCmdQueueEntry(conn, prevquery);
@@ -3386,6 +3787,13 @@ pqPipelineProcessQueue(PGconn *conn)
 	conn->partialResMode = false;
 	conn->singleRowMode = false;
 	conn->maxChunkSize = 0;
+
+	while (conn->pipelineStatus == PQ_PIPELINE_ABORTED &&
+		   conn->cmd_queue_head != NULL &&
+		   conn->cmd_queue_head->internal_wait_lsn)
+	{
+		pqCommandQueueAdvance(conn, false, false);
+	}
 
 	/*
 	 * If there are no further commands to process in the queue, get us in

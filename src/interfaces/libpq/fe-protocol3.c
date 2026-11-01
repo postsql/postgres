@@ -247,9 +247,17 @@ pqParseInput3(PGconn *conn)
 					}
 					else
 					{
-						/* Advance the command queue and set us idle */
+						/*
+						 * Advance the command queue; set us idle unless
+						 * another queued command (e.g., coalesced/deferred
+						 * WAIT FOR LSN follow-on query) remains in flight.
+						 */
 						pqCommandQueueAdvance(conn, true, false);
-						conn->asyncStatus = PGASYNC_IDLE;
+						if (conn->error_result)
+							conn->asyncStatus = PGASYNC_READY;
+						else
+							conn->asyncStatus = (conn->cmd_queue_head != NULL) ?
+								PGASYNC_BUSY : PGASYNC_IDLE;
 					}
 					break;
 				case PqMsg_EmptyQueryResponse:
@@ -911,6 +919,8 @@ pqGetErrorNotice3(PGconn *conn, bool isError)
 	/* If in pipeline mode, set error indicator for it */
 	if (isError && conn->pipelineStatus != PQ_PIPELINE_OFF)
 		conn->pipelineStatus = PQ_PIPELINE_ABORTED;
+	if (isError)
+		conn->pending_wait_lsn = 0;
 
 	/*
 	 * If this is an error message, pre-emptively clear any incomplete query
@@ -1734,9 +1744,15 @@ getNotify(PGconn *conn)
 									 &ts_usec, &parsed_lsn))
 		{
 			conn->rfq_last_progress_ts = ts_usec;
-			if (conn->in_hot_standby == PG_BOOL_YES &&
-				parsed_lsn > conn->rfq_last_replay_lsn)
-				conn->rfq_last_replay_lsn = parsed_lsn;
+			if (conn->in_hot_standby == PG_BOOL_YES)
+			{
+				if (parsed_lsn > conn->rfq_last_replay_lsn)
+					conn->rfq_last_replay_lsn = parsed_lsn;
+				if (!conn->is_lsn_primary &&
+					!conn->wait_lsn_opts.pooled_replica &&
+					parsed_lsn > conn->satisfied_lsn)
+					conn->satisfied_lsn = parsed_lsn;
+			}
 		}
 
 		/*
@@ -2040,16 +2056,28 @@ getReadyForQuery(PGconn *conn, int msgLength)
 					{
 						if (lsn > conn->rfq_last_commit_lsn)
 							conn->rfq_last_commit_lsn = lsn;
+						if (conn->is_lsn_primary && conn->lsn_group)
+							pqLsnGroupPublishCommitLSN(conn, lsn);
 					}
 					else
 					{
 						if (lsn > conn->rfq_last_replay_lsn)
 							conn->rfq_last_replay_lsn = lsn;
+						if (!conn->is_lsn_primary)
+						{
+							if (conn->wait_lsn_opts.pooled_replica)
+								conn->satisfied_lsn = lsn;
+							else if (lsn > conn->satisfied_lsn)
+								conn->satisfied_lsn = lsn;
+						}
 					}
 				}
 			}
 		}
 	}
+
+	if (conn->cmd_queue_head == NULL || conn->cmd_queue_head->next == NULL)
+		conn->pending_wait_lsn = 0;
 
 	conn->inCursor += ext_len;
 	return 0;

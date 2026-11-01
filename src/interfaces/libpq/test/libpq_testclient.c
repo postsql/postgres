@@ -22,6 +22,10 @@
 #error "LIBPQ_HAS_EXTENDED_READY_FOR_QUERY not defined"
 #endif
 
+#ifndef LIBPQ_HAS_WAIT_FOR_COMMIT_LSN
+#error "LIBPQ_HAS_WAIT_FOR_COMMIT_LSN not defined"
+#endif
+
 static void
 print_ssl_library(void)
 {
@@ -334,6 +338,488 @@ run_ready_for_query_tests(const char *primary_conninfo,
 	return 0;
 }
 
+typedef struct notice_counter
+{
+	int			count;
+	char		last_msg[256];
+} notice_counter;
+
+static void
+count_notices(void *arg, const char *message)
+{
+	notice_counter *nc = (notice_counter *) arg;
+
+	nc->count++;
+	strlcpy(nc->last_msg, message ? message : "", sizeof(nc->last_msg));
+}
+
+static int
+query_single_int(PGconn *conn, const char *sql)
+{
+	PGresult   *res = PQexec(conn, sql);
+	int			val;
+
+	if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+	{
+		fprintf(stderr, "query_single_int failed (%s): %s\n",
+				sql, PQerrorMessage(conn));
+		PQclear(res);
+		exit(1);
+	}
+	val = atoi(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	return val;
+}
+
+static void
+drain_async_conn(PGconn *conn)
+{
+	PGresult   *res;
+
+	while ((res = PQgetResult(conn)) != NULL)
+	{
+		if (PQresultStatus(res) != PGRES_TUPLES_OK &&
+			PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			fprintf(stderr, "async helper failed: %s\n", PQerrorMessage(conn));
+			PQclear(res);
+			exit(1);
+		}
+		PQclear(res);
+	}
+}
+
+static int
+run_wait_for_commit_lsn_tests(const char *primary_conninfo,
+							  const char *standby1_conninfo,
+							  const char *standby2_conninfo)
+{
+	PGconn	   *pconn;
+	PGconn	   *ro1;
+	PGconn	   *ro2;
+	PGconn	   *ctrl1;
+	PGconn	   *ctrl2;
+	PGconn	   *ro_list[2];
+	notice_counter nc = {0};
+	PQwaitCommitLSNOpts opts;
+	uint64_t	lsn;
+
+	pconn = PQconnectdb(primary_conninfo);
+	ro1 = PQconnectdb(standby1_conninfo);
+	ro2 = PQconnectdb(standby2_conninfo);
+	ctrl1 = PQconnectdb(standby1_conninfo);
+	ctrl2 = PQconnectdb(standby2_conninfo);
+
+	if (PQstatus(pconn) != CONNECTION_OK ||
+		PQstatus(ro1) != CONNECTION_OK ||
+		PQstatus(ro2) != CONNECTION_OK ||
+		PQstatus(ctrl1) != CONNECTION_OK ||
+		PQstatus(ctrl2) != CONNECTION_OK)
+	{
+		fprintf(stderr, "connection setup failed\n");
+		return 1;
+	}
+
+	PQsetNoticeProcessor(ro1, count_notices, &nc);
+
+	/* 1. Boundary & negative input checks */
+	if (PQassociateReadOnlyConn(NULL, ro1) != 0 ||
+		PQassociateReadOnlyConn(pconn, NULL) != 0 ||
+		PQassociateReadOnlyConn(pconn, pconn) != 0 ||
+		PQassociateReadOnlyConns(pconn, NULL, 1) != 0 ||
+		PQassociateReadOnlyConns(pconn, NULL, -1) != 0 ||
+		PQsetWaitForCommitLSN(NULL, 1) != 0 ||
+		PQgetWaitForCommitLSN(NULL) != 0 ||
+		PQgetSatisfiedCommitLSN(NULL) != 0 ||
+		PQgetAssociatedPrimaryConn(NULL) != NULL)
+	{
+		fprintf(stderr, "boundary checks failed\n");
+		return 1;
+	}
+
+	memset(&opts, 0, sizeof(opts));
+	opts.timeout_ms = -5;
+	if (PQsetWaitForCommitLSNOpts(ro1, 1, &opts) != 0)
+	{
+		fprintf(stderr, "negative timeout_ms should be rejected\n");
+		return 1;
+	}
+	opts.timeout_ms = 0;
+	opts.mode = (PQWaitLSNMode) 99;
+	if (PQsetWaitForCommitLSNOpts(ro1, 1, &opts) != 0)
+	{
+		fprintf(stderr, "invalid mode should be rejected\n");
+		return 1;
+	}
+
+	/* 2. Associate two open RO connections with primary */
+	ro_list[0] = ro1;
+	ro_list[1] = ro2;
+	if (!PQassociateReadOnlyConns(pconn, ro_list, 2) ||
+		PQgetAssociatedPrimaryConn(ro1) != pconn ||
+		PQgetAssociatedPrimaryConn(ro2) != pconn ||
+		PQsessionHasTempTables(pconn) != 0)
+	{
+		fprintf(stderr, "PQassociateReadOnlyConns failed\n");
+		return 1;
+	}
+
+	/* Role-mismatch guards */
+	if (PQassociateReadOnlyConn(ro1, ro2) != 0 ||
+		PQassociateReadOnlyConn(pconn, pconn) != 0 ||
+		PQsetWaitForCommitLSN(pconn, 1) != 0 ||
+		PQdissociateReadOnlyConn(pconn) != 0 ||
+		PQsetMinTargetCommitLSN(pconn, 100) != 0)
+	{
+		fprintf(stderr, "role-mismatch guards failed\n");
+		return 1;
+	}
+	/* Clear expected error messages on pconn/ro1 */
+	exec_expect_ok(pconn, "SELECT 1");
+
+	/* Enable WAIT on ro1, leave ro2 disabled */
+	if (!PQsetWaitForCommitLSN(ro1, 1) ||
+		PQgetWaitForCommitLSN(ro1) != 1 ||
+		PQgetWaitForCommitLSN(ro2) != 0)
+	{
+		fprintf(stderr, "PQsetWaitForCommitLSN state mismatch\n");
+		return 1;
+	}
+
+	/* 3a. Simple Query causal read-your-writes with delayed standby replay */
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(ctrl2, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (101)");
+	lsn = PQlastCommitLSN(pconn);
+
+	/* ro2 has WAIT disabled -> immediately sees 0 while paused */
+	if (query_single_int(ro2, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 101") != 0)
+	{
+		fprintf(stderr, "expected ro2 (WAIT disabled) to see 0 while paused\n");
+		return 1;
+	}
+	exec_expect_ok(ctrl2, "SELECT pg_wal_replay_resume()");
+
+	/* Schedule resume on standby1 in 100ms; ro1 must wait and see 1 */
+	if (!PQsendQuery(ctrl1, "SELECT pg_sleep(0.10), pg_wal_replay_resume()"))
+		return 1;
+	if (query_single_int(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 101") != 1 ||
+		PQgetSatisfiedCommitLSN(ro1) < lsn)
+	{
+		fprintf(stderr, "ro1 Simple Query did not wait for commit LSN\n");
+		return 1;
+	}
+	drain_async_conn(ctrl1);
+
+	/* 3b. Extended Query (PQexecParams) 0-RTT coalescing */
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (102)");
+	lsn = PQlastCommitLSN(pconn);
+	if (!PQsendQuery(ctrl1, "SELECT pg_sleep(0.10), pg_wal_replay_resume()"))
+		return 1;
+	{
+		const char *paramValues[1] = {"102"};
+		PGresult   *res = PQexecParams(ro1,
+									   "SELECT count(*) FROM wait_lsn_tbl WHERE id = $1::int",
+									   1, NULL, paramValues, NULL, NULL, 0);
+
+		if (!res || PQresultStatus(res) != PGRES_TUPLES_OK ||
+			atoi(PQgetvalue(res, 0, 0)) != 1 ||
+			PQgetSatisfiedCommitLSN(ro1) < lsn ||
+			PQsessionHasPreparedStatements(ro1) != 0)
+		{
+			fprintf(stderr, "ro1 PQexecParams wait failed\n");
+			PQclear(res);
+			return 1;
+		}
+		PQclear(res);
+	}
+	drain_async_conn(ctrl1);
+
+	/* 3c. Unnamed prepared statement ("") preserved across internal WAIT */
+	{
+		const char *paramValues[1] = {"103"};
+		PGresult   *res;
+		PGresult   *pres = PQprepare(ro1, "",
+									 "SELECT count(*) FROM wait_lsn_tbl WHERE id = $1::int",
+									 0, NULL);
+
+		if (!pres || PQresultStatus(pres) != PGRES_COMMAND_OK)
+		{
+			fprintf(stderr, "PQprepare unnamed failed: %s\n", PQerrorMessage(ro1));
+			PQclear(pres);
+			return 1;
+		}
+		PQclear(pres);
+
+		exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+		exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (103)");
+		lsn = PQlastCommitLSN(pconn);
+		if (!PQsendQuery(ctrl1, "SELECT pg_sleep(0.10), pg_wal_replay_resume()"))
+			return 1;
+
+		res = PQexecPrepared(ro1, "", 1, paramValues, NULL, NULL, 0);
+
+		if (!res || PQresultStatus(res) != PGRES_TUPLES_OK ||
+			atoi(PQgetvalue(res, 0, 0)) != 1 ||
+			PQgetSatisfiedCommitLSN(ro1) < lsn ||
+			PQsessionHasPreparedStatements(ro1) != 0)
+		{
+			fprintf(stderr, "ro1 PQexecPrepared(\"\") wait failed (P=%d)\n",
+					PQsessionHasPreparedStatements(ro1));
+			PQclear(res);
+			return 1;
+		}
+		PQclear(res);
+		drain_async_conn(ctrl1);
+	}
+
+	/* 3d. Pipeline mode coalescing */
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (104)");
+	lsn = PQlastCommitLSN(pconn);
+	if (!PQsendQuery(ctrl1, "SELECT pg_sleep(0.10), pg_wal_replay_resume()"))
+		return 1;
+	{
+		const char *p1[1] = {"104"};
+		const char *p2[1] = {"101"};
+		PGresult   *r1,
+				   *r2,
+				   *sync_res;
+
+		if (!PQenterPipelineMode(ro1) ||
+			!PQsendQueryParams(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = $1::int",
+							   1, NULL, p1, NULL, NULL, 0) ||
+			!PQsendQueryParams(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = $1::int",
+							   1, NULL, p2, NULL, NULL, 0) ||
+			!PQpipelineSync(ro1))
+		{
+			fprintf(stderr, "pipeline dispatch failed: %s\n", PQerrorMessage(ro1));
+			return 1;
+		}
+
+		r1 = PQgetResult(ro1);
+		if (!r1 || PQresultStatus(r1) != PGRES_TUPLES_OK ||
+			atoi(PQgetvalue(r1, 0, 0)) != 1 || PQgetResult(ro1) != NULL)
+		{
+			fprintf(stderr, "pipeline r1 failed\n");
+			return 1;
+		}
+		PQclear(r1);
+
+		r2 = PQgetResult(ro1);
+		if (!r2 || PQresultStatus(r2) != PGRES_TUPLES_OK ||
+			atoi(PQgetvalue(r2, 0, 0)) != 1 || PQgetResult(ro1) != NULL)
+		{
+			fprintf(stderr, "pipeline r2 failed\n");
+			return 1;
+		}
+		PQclear(r2);
+
+		sync_res = PQgetResult(ro1);
+		if (!sync_res || PQresultStatus(sync_res) != PGRES_PIPELINE_SYNC ||
+			!PQexitPipelineMode(ro1))
+		{
+			fprintf(stderr, "pipeline sync/exit failed\n");
+			return 1;
+		}
+		PQclear(sync_res);
+	}
+	drain_async_conn(ctrl1);
+
+	/* 4. Unset WAIT on ro1 and enable on ro2 */
+	if (!PQsetWaitForCommitLSN(ro1, 0) || !PQsetWaitForCommitLSN(ro2, 1))
+		return 1;
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(ctrl2, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (105)");
+	if (query_single_int(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 105") != 0)
+	{
+		fprintf(stderr, "expected ro1 (now unset) to return 0 immediately\n");
+		return 1;
+	}
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_resume()");
+	if (!PQsendQuery(ctrl2, "SELECT pg_sleep(0.10), pg_wal_replay_resume()"))
+		return 1;
+	if (query_single_int(ro2, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 105") != 1)
+	{
+		fprintf(stderr, "expected ro2 (now enabled) to wait and return 1\n");
+		return 1;
+	}
+	drain_async_conn(ctrl2);
+
+	/* 5. Timeout error isolation (no_throw=0) vs 0-RTT coalescing (no_throw=1) */
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (106)");
+	lsn = PQlastCommitLSN(pconn);
+
+	memset(&opts, 0, sizeof(opts));
+	opts.mode = PQWAIT_LSN_STANDBY_REPLAY;
+	opts.timeout_ms = 50;
+	opts.no_throw = 0;
+	if (!PQsetWaitForCommitLSNOpts(ro1, 1, &opts))
+		return 1;
+
+	/* Simple Query with no_throw=0: "SELECT 1/0" must NEVER reach standby1! */
+	{
+		PGresult   *res = PQexec(ro1, "SELECT 1 / 0");
+
+		if (!res || PQresultStatus(res) != PGRES_FATAL_ERROR ||
+			strstr(PQerrorMessage(ro1), "timed out while waiting for target LSN") == NULL ||
+			strstr(PQerrorMessage(ro1), "division by zero") != NULL)
+		{
+			fprintf(stderr, "Simple Query no_throw=0 error isolation failed: %s\n",
+					PQerrorMessage(ro1));
+			PQclear(res);
+			return 1;
+		}
+		PQclear(res);
+	}
+
+	/* Extended Query with no_throw=0: ignore_till_sync skips "SELECT 1/0"! */
+	{
+		PGresult   *res = PQexecParams(ro1, "SELECT 1 / 0",
+									   0, NULL, NULL, NULL, NULL, 0);
+
+		if (!res || PQresultStatus(res) != PGRES_FATAL_ERROR ||
+			strstr(PQerrorMessage(ro1), "timed out while waiting for target LSN") == NULL ||
+			strstr(PQerrorMessage(ro1), "division by zero") != NULL)
+		{
+			fprintf(stderr, "Extended Query no_throw=0 error isolation failed: %s\n",
+					PQerrorMessage(ro1));
+			PQclear(res);
+			return 1;
+		}
+		PQclear(res);
+	}
+
+	/* Simple Query with no_throw=1: coalesces in 0 extra RTT + emits warning */
+	opts.no_throw = 1;
+	if (!PQsetWaitForCommitLSNOpts(ro1, 1, &opts))
+		return 1;
+	nc.count = 0;
+	if (query_single_int(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 106") != 0 ||
+		nc.count != 1 ||
+		strstr(nc.last_msg, "timeout") == NULL ||
+		PQgetSatisfiedCommitLSN(ro1) >= lsn)
+	{
+		fprintf(stderr, "Simple Query no_throw=1 behavior mismatch (notices=%d msg=%s)\n",
+				nc.count, nc.last_msg);
+		return 1;
+	}
+
+	/* Resume standby1 and verify ro1 now catches up and updates satisfied_lsn */
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_resume()");
+	opts.timeout_ms = 5000;
+	opts.no_throw = 0;
+	PQsetWaitForCommitLSNOpts(ro1, 1, &opts);
+	if (query_single_int(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 106") != 1 ||
+		PQgetSatisfiedCommitLSN(ro1) < lsn)
+	{
+		fprintf(stderr, "ro1 failed to catch up after resume\n");
+		return 1;
+	}
+
+	/* 6. In-transaction policies (SKIP_WARN vs ERROR) */
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_pause()");
+	exec_expect_ok(ro1, "BEGIN");
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (107)");
+	nc.count = 0;
+	if (query_single_int(ro1, "SELECT 1") != 1 || nc.count != 1 ||
+		strstr(nc.last_msg, "skipping WAIT FOR LSN") == NULL)
+	{
+		fprintf(stderr, "PQWAIT_INTRANS_SKIP_WARN failed\n");
+		return 1;
+	}
+	opts.intrans_policy = PQWAIT_INTRANS_ERROR;
+	PQsetWaitForCommitLSNOpts(ro1, 1, &opts);
+	if (PQexec(ro1, "SELECT 1") != NULL ||
+		strstr(PQerrorMessage(ro1), "open transaction block") == NULL)
+	{
+		fprintf(stderr, "PQWAIT_INTRANS_ERROR failed\n");
+		return 1;
+	}
+	PQsetWaitForCommitLSN(ro1, 0);
+	exec_expect_ok(ro1, "ROLLBACK");
+	exec_expect_ok(ctrl1, "SELECT pg_wal_replay_resume()");
+	PQsetWaitForCommitLSNOpts(ro1, 1, NULL);
+
+	/* 7. Zero-wait fast path via LISTEN "Commits visible at LSN 10 ms" */
+	exec_expect_ok(ro1, "LISTEN \"Commits visible at LSN 10 ms\"");
+	{
+		PGnotify   *n;
+
+		while ((n = PQnotifies(ro1)) != NULL)
+			PQfreemem(n);
+	}
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (108)");
+	lsn = PQlastCommitLSN(pconn);
+	for (int attempt = 0; attempt < 200; attempt++)
+	{
+		PGnotify   *n;
+
+		if (!PQconsumeInput(ro1))
+			return 1;
+		while ((n = PQnotifies(ro1)) != NULL)
+			PQfreemem(n);
+		if (PQgetSatisfiedCommitLSN(ro1) >= lsn)
+			break;
+		pg_usleep(10000);
+	}
+	if (PQgetSatisfiedCommitLSN(ro1) < lsn)
+	{
+		fprintf(stderr, "NOTIFY did not advance PQgetSatisfiedCommitLSN\n");
+		return 1;
+	}
+	/* Now satisfied_lsn >= lsn BEFORE query -> executes on 0-wait fast path! */
+	exec_expect_ok(ctrl1, "SELECT /* fastpath_begin_108 */ 1");
+	if (query_single_int(ro1, "SELECT /* fastpath_no_wait_108 */ count(*) FROM wait_lsn_tbl WHERE id = 108") != 1)
+		return 1;
+	exec_expect_ok(ro1, "UNLISTEN *");
+
+	/* 8. Unprivileged role check + out-of-order PQfinish(pconn) */
+	exec_expect_ok(pconn, "INSERT INTO wait_lsn_tbl VALUES (109)");
+	lsn = PQlastCommitLSN(pconn);
+
+	/* Close primary FIRST while ro1 & ro2 remain open */
+	PQfinish(pconn);
+	pconn = NULL;
+
+	if (PQgetAssociatedPrimaryConn(ro1) != NULL ||
+		PQgetAssociatedPrimaryConn(ro2) != NULL)
+	{
+		fprintf(stderr, "expected NULL associated primary after PQfinish(pconn)\n");
+		return 1;
+	}
+
+	/* ro1 still honours the last published commit_lsn under unprivileged role */
+	exec_expect_ok(ro1, "SET ROLE regress_wait_lsn_unpriv");
+	if (query_single_int(ro1, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 109") != 1 ||
+		PQgetSatisfiedCommitLSN(ro1) < lsn)
+	{
+		fprintf(stderr, "ro1 query after PQfinish(pconn) under unprivileged role failed\n");
+		return 1;
+	}
+	exec_expect_ok(ro1, "RESET ROLE");
+
+	/* Explicit PQdissociateReadOnlyConn + standalone PQsetMinTargetCommitLSN */
+	if (!PQdissociateReadOnlyConn(ro2) ||
+		!PQsetMinTargetCommitLSN(ro2, lsn) ||
+		!PQsetWaitForCommitLSN(ro2, 1) ||
+		query_single_int(ro2, "SELECT count(*) FROM wait_lsn_tbl WHERE id = 109") != 1)
+	{
+		fprintf(stderr, "standalone PQsetMinTargetCommitLSN failed\n");
+		return 1;
+	}
+
+	PQfinish(ctrl1);
+	PQfinish(ctrl2);
+	PQfinish(ro1);
+	PQfinish(ro2);
+	printf("wait_for_commit_lsn_ok\n");
+	return 0;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -344,6 +830,8 @@ main(int argc, char *argv[])
 	}
 	if ((argc == 4) && !strcmp(argv[1], "--ready-for-query"))
 		return run_ready_for_query_tests(argv[2], argv[3]);
+	if ((argc == 5) && !strcmp(argv[1], "--wait-for-commit-lsn"))
+		return run_wait_for_commit_lsn_tests(argv[2], argv[3], argv[4]);
 	if ((argc == 3) && !strcmp(argv[1], "--expect-bad-rfq"))
 	{
 		PGconn	   *conn = PQconnectdb(argv[2]);

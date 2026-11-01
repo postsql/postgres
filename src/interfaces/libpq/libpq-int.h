@@ -358,8 +358,13 @@ typedef struct PGcmdQueueEntry
 {
 	PGQueryClass queryclass;	/* Query type */
 	char	   *query;			/* SQL command, or NULL if none/unknown/OOM */
+	bool		internal_wait_lsn;	/* libpq-injected WAIT FOR LSN command */
+	uint64		waited_lsn;		/* target LSN awaited by internal command */
+	char	   *deferred_simple_query;	/* gated simple query when no_throw=0 */
 	struct PGcmdQueueEntry *next;	/* list link */
 } PGcmdQueueEntry;
+
+struct PGlsnGroup;
 
 /*
  * pg_conn_host stores all information about each of possibly several hosts
@@ -587,6 +592,15 @@ struct pg_conn
 	size_t		rfq_raw_buf_cap;
 	PQreadyForQueryHook rfq_hook;
 	void	   *rfq_hook_passthrough;
+
+	/* Primary <-> Read-Only WAIT FOR COMMIT LSN association state */
+	struct PGlsnGroup *lsn_group;
+	bool		is_lsn_primary;
+	bool		wait_for_commit_lsn;
+	PQwaitCommitLSNOpts wait_lsn_opts;
+	uint64		satisfied_lsn;
+	uint64		min_target_lsn;
+	uint64		pending_wait_lsn;
 	PGVerbosity verbosity;		/* error/notice message verbosity */
 	PGContextVisibility show_context;	/* whether to show CONTEXT field */
 	PGlobjfuncs *lobjfuncs;		/* private state for large-object access fns */
@@ -994,6 +1008,8 @@ extern char *libpq_ngettext(const char *msgid, const char *msgid_plural, unsigne
 
 extern void libpq_append_error(PQExpBuffer errorMessage, const char *fmt, ...) pg_attribute_printf(2, 3);
 extern void libpq_append_conn_error(PGconn *conn, const char *fmt, ...) pg_attribute_printf(2, 3);
+extern void pqLsnGroupPublishCommitLSN(PGconn *conn, uint64 lsn);
+extern uint64 pqLsnGroupGetCommitLSN(const PGconn *conn);
 
 /*
  * These macros are needed to let error-handling code be portable between

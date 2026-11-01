@@ -628,6 +628,77 @@ pqDropConnection(PGconn *conn, bool flushInput)
 	}
 }
 
+struct PGlsnGroup
+{
+	pthread_mutex_t lock;
+	int			refcount;
+	PGconn	   *primary_conn;
+	uint64		commit_lsn;
+};
+
+static void
+pqLsnGroupDetach(PGconn *conn)
+{
+	struct PGlsnGroup *group;
+	int			remaining;
+
+	if (!conn || !conn->lsn_group)
+		return;
+
+	group = conn->lsn_group;
+	pthread_mutex_lock(&group->lock);
+	if (conn->is_lsn_primary && group->primary_conn == conn)
+		group->primary_conn = NULL;
+	remaining = --group->refcount;
+	pthread_mutex_unlock(&group->lock);
+
+	conn->lsn_group = NULL;
+	conn->is_lsn_primary = false;
+	conn->wait_for_commit_lsn = false;
+
+	if (remaining == 0)
+	{
+#ifdef WIN32
+		if (group->lock.initstate == 1)
+			DeleteCriticalSection(&group->lock.csection);
+#else
+		pthread_mutex_destroy(&group->lock);
+#endif
+		free(group);
+	}
+}
+
+void
+pqLsnGroupPublishCommitLSN(PGconn *conn, uint64 lsn)
+{
+	struct PGlsnGroup *group;
+
+	if (!conn || !conn->is_lsn_primary || !conn->lsn_group || lsn == 0)
+		return;
+
+	group = conn->lsn_group;
+	pthread_mutex_lock(&group->lock);
+	if (lsn > group->commit_lsn)
+		group->commit_lsn = lsn;
+	pthread_mutex_unlock(&group->lock);
+}
+
+uint64
+pqLsnGroupGetCommitLSN(const PGconn *conn)
+{
+	struct PGlsnGroup *group;
+	uint64		lsn;
+
+	if (!conn || !conn->lsn_group)
+		return 0;
+
+	group = conn->lsn_group;
+	pthread_mutex_lock(&group->lock);
+	lsn = group->commit_lsn;
+	pthread_mutex_unlock(&group->lock);
+	return lsn;
+}
+
 /*
  * pqFreeCommandQueue
  * Free all the entries of PGcmdQueueEntry queue passed.
@@ -641,6 +712,7 @@ pqFreeCommandQueue(PGcmdQueueEntry *queue)
 
 		queue = cur->next;
 		free(cur->query);
+		free(cur->deferred_simple_query);
 		free(cur);
 	}
 }
@@ -698,6 +770,8 @@ pqDropServerData(PGconn *conn)
 	conn->rfq_last_replay_lsn = 0;
 	conn->rfq_last_progress_ts = 0;
 	conn->rfq_nfields = 0;
+	conn->satisfied_lsn = 0;
+	conn->pending_wait_lsn = 0;
 	conn->scram_sha_256_iterations = SCRAM_SHA_256_DEFAULT_ITERATIONS;
 	conn->sversion = 0;
 
@@ -5034,6 +5108,8 @@ pqMakeEmptyPGconn(void)
 	conn->rfq_last_replay_lsn = 0;
 	conn->rfq_last_progress_ts = 0;
 	conn->rfq_nfields = 0;
+	conn->satisfied_lsn = 0;
+	conn->pending_wait_lsn = 0;
 	conn->scram_sha_256_iterations = SCRAM_SHA_256_DEFAULT_ITERATIONS;
 	conn->verbosity = PQERRORS_DEFAULT;
 	conn->show_context = PQSHOW_CONTEXT_ERRORS;
@@ -5173,6 +5249,7 @@ freePGconn(PGconn *conn)
 	free(conn->inBuffer);
 	free(conn->outBuffer);
 	free(conn->rowBuf);
+	pqLsnGroupDetach(conn);
 	free(conn->rfq_fields);
 	free(conn->rfq_raw_buf);
 	termPQExpBuffer(&conn->errorMessage);
@@ -7824,6 +7901,253 @@ PQsetReadyForQueryHook(PGconn *conn, PQreadyForQueryHook hook, void *passthrough
 	conn->rfq_hook = hook;
 	conn->rfq_hook_passthrough = passthrough;
 	return prev;
+}
+
+static void
+pqTryEnableRichReadyForQuery(PGconn *conn)
+{
+	PGresult   *res;
+
+	if (!conn ||
+		conn->status != CONNECTION_OK ||
+		conn->asyncStatus != PGASYNC_IDLE ||
+		conn->xactStatus != PQTRANS_IDLE ||
+		conn->pipelineStatus != PQ_PIPELINE_OFF ||
+		conn->cmd_queue_head != NULL ||
+		conn->rfq_has_temp_tables != PG_BOOL_UNKNOWN)
+		return;
+
+	res = PQexec(conn, "SET ready_for_query_message = 'rich'");
+	PQclear(res);
+	pqClearConnErrorState(conn);
+}
+
+int
+PQassociateReadOnlyConn(PGconn *primary_conn, PGconn *ro_conn)
+{
+	struct PGlsnGroup *group;
+
+	if (!primary_conn || !ro_conn)
+		return 0;
+
+	if (primary_conn == ro_conn)
+	{
+		libpq_append_conn_error(ro_conn, "cannot associate a connection with itself");
+		return 0;
+	}
+	if (primary_conn->lsn_group != NULL && !primary_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(primary_conn, "connection is already associated as a read-only connection");
+		return 0;
+	}
+	if (ro_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(ro_conn, "connection is already acting as an LSN primary");
+		return 0;
+	}
+
+	pqTryEnableRichReadyForQuery(primary_conn);
+	pqTryEnableRichReadyForQuery(ro_conn);
+
+	if (primary_conn->lsn_group == NULL)
+	{
+		group = (struct PGlsnGroup *) calloc(1, sizeof(struct PGlsnGroup));
+		if (!group)
+		{
+			libpq_append_conn_error(primary_conn, "out of memory");
+			return 0;
+		}
+		if (pthread_mutex_init(&group->lock, NULL) != 0)
+		{
+			free(group);
+			libpq_append_conn_error(primary_conn, "could not initialize LSN group mutex");
+			return 0;
+		}
+		group->refcount = 1;
+		group->primary_conn = primary_conn;
+		group->commit_lsn = primary_conn->rfq_last_commit_lsn;
+		primary_conn->lsn_group = group;
+		primary_conn->is_lsn_primary = true;
+	}
+	else
+	{
+		group = primary_conn->lsn_group;
+		pqLsnGroupPublishCommitLSN(primary_conn, primary_conn->rfq_last_commit_lsn);
+	}
+
+	if (ro_conn->lsn_group == group)
+		return 1;
+
+	if (ro_conn->lsn_group != NULL)
+	{
+		bool		keep_wait = ro_conn->wait_for_commit_lsn;
+
+		pqLsnGroupDetach(ro_conn);
+		ro_conn->wait_for_commit_lsn = keep_wait;
+	}
+
+	pthread_mutex_lock(&group->lock);
+	group->refcount++;
+	pthread_mutex_unlock(&group->lock);
+
+	ro_conn->lsn_group = group;
+	ro_conn->is_lsn_primary = false;
+	if (!ro_conn->wait_lsn_opts.pooled_replica &&
+		ro_conn->rfq_last_replay_lsn > ro_conn->satisfied_lsn)
+		ro_conn->satisfied_lsn = ro_conn->rfq_last_replay_lsn;
+
+	return 1;
+}
+
+int
+PQassociateReadOnlyConns(PGconn *primary_conn,
+						 PGconn *const *ro_conns,
+						 int n_ro_conns)
+{
+	if (!primary_conn || n_ro_conns < 0 || (n_ro_conns > 0 && !ro_conns))
+	{
+		if (primary_conn)
+			libpq_append_conn_error(primary_conn, "invalid read-only connection array");
+		return 0;
+	}
+	if (primary_conn->lsn_group != NULL && !primary_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(primary_conn, "connection is already associated as a read-only connection");
+		return 0;
+	}
+
+	for (int i = 0; i < n_ro_conns; i++)
+	{
+		PGconn	   *ro = ro_conns[i];
+
+		if (!ro || ro == primary_conn || ro->is_lsn_primary)
+		{
+			libpq_append_conn_error(primary_conn, "invalid read-only connection at index %d", i);
+			return 0;
+		}
+	}
+
+	for (int i = 0; i < n_ro_conns; i++)
+	{
+		if (!PQassociateReadOnlyConn(primary_conn, ro_conns[i]))
+			return 0;
+	}
+	return 1;
+}
+
+int
+PQdissociateReadOnlyConn(PGconn *ro_conn)
+{
+	if (!ro_conn)
+		return 0;
+	if (ro_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(ro_conn, "cannot dissociate a primary connection via PQdissociateReadOnlyConn");
+		return 0;
+	}
+	pqLsnGroupDetach(ro_conn);
+	return 1;
+}
+
+PGconn *
+PQgetAssociatedPrimaryConn(const PGconn *ro_conn)
+{
+	PGconn	   *primary;
+
+	if (!ro_conn || !ro_conn->lsn_group || ro_conn->is_lsn_primary)
+		return NULL;
+
+	pthread_mutex_lock(&ro_conn->lsn_group->lock);
+	primary = ro_conn->lsn_group->primary_conn;
+	pthread_mutex_unlock(&ro_conn->lsn_group->lock);
+	return primary;
+}
+
+int
+PQsetWaitForCommitLSN(PGconn *ro_conn, int enable)
+{
+	if (!ro_conn)
+		return 0;
+	if (ro_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(ro_conn, "cannot enable WAIT FOR COMMIT LSN on an associated primary connection");
+		return 0;
+	}
+	ro_conn->wait_for_commit_lsn = (enable != 0);
+	return 1;
+}
+
+int
+PQsetWaitForCommitLSNOpts(PGconn *ro_conn,
+						  int enable,
+						  const PQwaitCommitLSNOpts *opts)
+{
+	if (!ro_conn)
+		return 0;
+	if (ro_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(ro_conn, "cannot enable WAIT FOR COMMIT LSN on an associated primary connection");
+		return 0;
+	}
+
+	if (opts != NULL)
+	{
+		if ((int) opts->mode < PQWAIT_LSN_STANDBY_REPLAY ||
+			(int) opts->mode > PQWAIT_LSN_STANDBY_WRITE)
+		{
+			libpq_append_conn_error(ro_conn, "invalid PQWaitLSNMode value: %d", (int) opts->mode);
+			return 0;
+		}
+		if (opts->timeout_ms < 0 || opts->timeout_ms > INT_MAX)
+		{
+			libpq_append_conn_error(ro_conn, "invalid WAIT FOR LSN timeout_ms: %lld",
+									(long long) opts->timeout_ms);
+			return 0;
+		}
+		if ((int) opts->intrans_policy < PQWAIT_INTRANS_SKIP_WARN ||
+			(int) opts->intrans_policy > PQWAIT_INTRANS_SILENT_SKIP)
+		{
+			libpq_append_conn_error(ro_conn, "invalid PQWaitInTransPolicy value: %d",
+									(int) opts->intrans_policy);
+			return 0;
+		}
+		ro_conn->wait_lsn_opts = *opts;
+	}
+	else
+	{
+		memset(&ro_conn->wait_lsn_opts, 0, sizeof(ro_conn->wait_lsn_opts));
+	}
+
+	ro_conn->wait_for_commit_lsn = (enable != 0);
+	return 1;
+}
+
+int
+PQgetWaitForCommitLSN(const PGconn *ro_conn)
+{
+	if (!ro_conn)
+		return 0;
+	return ro_conn->wait_for_commit_lsn ? 1 : 0;
+}
+
+uint64_t
+PQgetSatisfiedCommitLSN(const PGconn *ro_conn)
+{
+	return ro_conn ? ro_conn->satisfied_lsn : 0;
+}
+
+int
+PQsetMinTargetCommitLSN(PGconn *ro_conn, uint64_t target_lsn)
+{
+	if (!ro_conn)
+		return 0;
+	if (ro_conn->is_lsn_primary)
+	{
+		libpq_append_conn_error(ro_conn, "cannot set target commit LSN on an associated primary connection");
+		return 0;
+	}
+	ro_conn->min_target_lsn = target_lsn;
+	return 1;
 }
 
 const char *

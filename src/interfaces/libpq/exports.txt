@@ -223,3 +223,12 @@ PQreadyForQueryField      220
 PQsetReadyForQueryHook    221
 PQlastVisibleLSNTimestamp 222
 PQparseCommitsVisibleLSN  223
+PQassociateReadOnlyConn   224
+PQassociateReadOnlyConns  225
+PQdissociateReadOnlyConn  226
+PQgetAssociatedPrimaryConn 227
+PQsetWaitForCommitLSN     228
+PQsetWaitForCommitLSNOpts 229
+PQgetWaitForCommitLSN     230
+PQgetSatisfiedCommitLSN   231
+PQsetMinTargetCommitLSN   232

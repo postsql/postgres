@@ -70,6 +70,8 @@ extern "C"
 #define LIBPQ_HAS_OAUTH_BEARER_TOKEN_V2 1
 /* Indicates presence of extended ReadyForQuery inspection functions */
 #define LIBPQ_HAS_EXTENDED_READY_FOR_QUERY 1
+/* Indicates presence of Primary/RO association and WAIT FOR COMMIT LSN APIs */
+#define LIBPQ_HAS_WAIT_FOR_COMMIT_LSN 1
 
 /*
  * Option flags for PQcopyResult
@@ -443,6 +445,46 @@ typedef void (*PQreadyForQueryHook) (PGconn *conn, void *passthrough);
 extern PQreadyForQueryHook PQsetReadyForQueryHook(PGconn *conn,
 												  PQreadyForQueryHook hook,
 												  void *passthrough);
+
+/* Primary <-> Read-Only connection association & WAIT FOR COMMIT LSN */
+typedef enum
+{
+	PQWAIT_LSN_STANDBY_REPLAY = 0,	/* default: MODE 'standby_replay' */
+	PQWAIT_LSN_STANDBY_FLUSH,	/* MODE 'standby_flush' */
+	PQWAIT_LSN_STANDBY_WRITE	/* MODE 'standby_write' */
+} PQWaitLSNMode;
+
+typedef enum
+{
+	PQWAIT_INTRANS_SKIP_WARN = 0,	/* emit client notice & skip if in-tx */
+	PQWAIT_INTRANS_ERROR,		/* fail query if new LSN arrives while in-tx */
+	PQWAIT_INTRANS_SILENT_SKIP	/* skip silently (snapshot already fixed) */
+} PQWaitInTransPolicy;
+
+typedef struct PQwaitCommitLSNOpts
+{
+	PQWaitLSNMode mode;			/* standby_replay (default) / flush / write */
+	int64_t		timeout_ms;		/* 0 = no timeout; >0 = TIMEOUT '<n>ms' */
+	int			no_throw;		/* 0 = throw ERROR on timeout/promote; 1 =
+								 * NO_THROW */
+	int			pooled_replica; /* if 1, do not assume monotonic standby
+								 * across txns */
+	PQWaitInTransPolicy intrans_policy; /* behavior when PQTRANS_INTRANS */
+} PQwaitCommitLSNOpts;
+
+extern int	PQassociateReadOnlyConn(PGconn *primary_conn, PGconn *ro_conn);
+extern int	PQassociateReadOnlyConns(PGconn *primary_conn,
+									 PGconn *const *ro_conns,
+									 int n_ro_conns);
+extern int	PQdissociateReadOnlyConn(PGconn *ro_conn);
+extern PGconn *PQgetAssociatedPrimaryConn(const PGconn *ro_conn);
+extern int	PQsetWaitForCommitLSN(PGconn *ro_conn, int enable);
+extern int	PQsetWaitForCommitLSNOpts(PGconn *ro_conn,
+									  int enable,
+									  const PQwaitCommitLSNOpts *opts);
+extern int	PQgetWaitForCommitLSN(const PGconn *ro_conn);
+extern uint64_t PQgetSatisfiedCommitLSN(const PGconn *ro_conn);
+extern int	PQsetMinTargetCommitLSN(PGconn *ro_conn, uint64_t target_lsn);
 extern const char *PQparameterStatus(const PGconn *conn,
 									 const char *paramName);
 extern int	PQprotocolVersion(const PGconn *conn);

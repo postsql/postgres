@@ -162,6 +162,7 @@ tests += {
       't/005_negotiate_encryption.pl',
       't/006_service.pl',
       't/007_ready_for_query.pl',
+      't/008_wait_for_commit_lsn.pl',
     ],
     'env': {
       'with_ssl': ssl_library,

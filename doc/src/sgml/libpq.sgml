@@ -2951,6 +2951,51 @@ PQreadyForQueryHook PQsetReadyForQueryHook(PGconn *conn,
      </listitem>
     </varlistentry>
 
+    <varlistentry id="libpq-PQassociateReadOnlyConn">
+     <term><function>PQassociateReadOnlyConn</function><indexterm><primary>PQassociateReadOnlyConn</primary></indexterm></term>
+     <term><function>PQassociateReadOnlyConns</function><indexterm><primary>PQassociateReadOnlyConns</primary></indexterm></term>
+     <term><function>PQdissociateReadOnlyConn</function><indexterm><primary>PQdissociateReadOnlyConn</primary></indexterm></term>
+     <term><function>PQgetAssociatedPrimaryConn</function><indexterm><primary>PQgetAssociatedPrimaryConn</primary></indexterm></term>
+     <term><function>PQsetWaitForCommitLSN</function><indexterm><primary>PQsetWaitForCommitLSN</primary></indexterm></term>
+     <term><function>PQsetWaitForCommitLSNOpts</function><indexterm><primary>PQsetWaitForCommitLSNOpts</primary></indexterm></term>
+     <term><function>PQgetWaitForCommitLSN</function><indexterm><primary>PQgetWaitForCommitLSN</primary></indexterm></term>
+     <term><function>PQgetSatisfiedCommitLSN</function><indexterm><primary>PQgetSatisfiedCommitLSN</primary></indexterm></term>
+     <term><function>PQsetMinTargetCommitLSN</function><indexterm><primary>PQsetMinTargetCommitLSN</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Associate one or more read-only standby connections with a primary
+       connection and configure automatic <command>WAIT FOR LSN</command>
+       causal read-your-writes synchronization.
+
+<synopsis>
+int PQassociateReadOnlyConn(PGconn *primary_conn, PGconn *ro_conn);
+int PQassociateReadOnlyConns(PGconn *primary_conn,
+                             PGconn *const *ro_conns,
+                             int n_ro_conns);
+int PQdissociateReadOnlyConn(PGconn *ro_conn);
+PGconn *PQgetAssociatedPrimaryConn(const PGconn *ro_conn);
+int PQsetWaitForCommitLSN(PGconn *ro_conn, int enable);
+int PQsetWaitForCommitLSNOpts(PGconn *ro_conn,
+                              int enable,
+                              const PQwaitCommitLSNOpts *opts);
+int PQgetWaitForCommitLSN(const PGconn *ro_conn);
+uint64_t PQgetSatisfiedCommitLSN(const PGconn *ro_conn);
+int PQsetMinTargetCommitLSN(PGconn *ro_conn, uint64_t target_lsn);
+</synopsis>
+       Commits observed on <parameter>primary_conn</parameter> via extended
+       <literal>ReadyForQuery</literal> (<literal>l</literal>) automatically
+       update the group's target commit <acronym>LSN</acronym>; when waiting is
+       enabled on <parameter>ro_conn</parameter> (or an explicit minimum floor
+       is supplied via <function>PQsetMinTargetCommitLSN</function>) and the
+       target exceeds <function>PQgetSatisfiedCommitLSN</function>,
+       <application>libpq</application> transparently injects
+       <command>WAIT FOR LSN</command> ahead of queries on
+       <parameter>ro_conn</parameter>.
+      </para>
+     </listitem>
+    </varlistentry>
+
     <varlistentry id="libpq-PQparameterStatus">
      <term><function>PQparameterStatus</function><indexterm><primary>PQparameterStatus</primary></indexterm></term>
 
