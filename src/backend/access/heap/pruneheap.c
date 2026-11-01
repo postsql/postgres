@@ -28,6 +28,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* GUC variable */
+bool		logical_decoding_prune_records = false;
+
 /* Working data for heap_page_prune and subroutines */
 typedef struct
 {
@@ -424,15 +427,28 @@ heap_page_prune(Relation relation, Buffer buffer,
 		{
 			xl_heap_prune xlrec;
 			XLogRecPtr	recptr;
+			uint8		regbuf_flags = REGBUF_STANDARD;
 
 			xlrec.latestRemovedXid = prstate.latestRemovedXid;
 			xlrec.nredirected = prstate.nredirected;
 			xlrec.ndead = prstate.ndead;
 
+			/*
+			 * If a full-page image is taken, the arrays of changed line
+			 * pointers are normally left out, as redo restores the page from
+			 * the image.  Keep them for logical decoding (see DecodePrune())
+			 * if both the server and the table ask for it.
+			 */
+			if (logical_decoding_prune_records &&
+				relation->rd_options != NULL &&
+				((StdRdOptions *) relation->rd_options)->logical_decoding_prune_records &&
+				RelationIsLogicallyLogged(relation))
+				regbuf_flags |= REGBUF_KEEP_DATA;
+
 			XLogBeginInsert();
 			XLogRegisterData((char *) &xlrec, SizeOfHeapPrune);
 
-			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+			XLogRegisterBuffer(0, buffer, regbuf_flags);
 
 			/*
 			 * The OffsetNumber arrays are not actually in the buffer, but we

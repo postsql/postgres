@@ -115,6 +115,15 @@ typedef struct LogicalDecodingContext
 	 * of a logical replication slot.
 	 */
 	bool		in_create;
+
+	/*
+	 * Optional prune callback (see LogicalDecodePruneCB), set by the output
+	 * plugin in its startup callback.  It is not a member of
+	 * OutputPluginCallbacks, which is embedded in this struct; it is placed
+	 * last, so that the offsets of all other members are the same as in
+	 * older releases.
+	 */
+	LogicalDecodePruneCB prune_cb;
 } LogicalDecodingContext;
 
 

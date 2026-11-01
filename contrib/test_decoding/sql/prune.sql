@@ -1,0 +1,67 @@
+-- Decoding of pruning (XLOG_HEAP2_PRUNE and XLOG_HEAP2_VACUUM records).
+--
+-- Pruning is triggered explicitly with VACUUM on tables with autovacuum
+-- disabled.  The output is the same whether or not a full-page image is
+-- taken, as logical_decoding_prune_records is enabled (see logical.conf
+-- for the server setting).  The slot's catalog_xmin does not hold back
+-- pruning of user tables.  VACUUM does not flush the WAL, and decoding only
+-- reads flushed WAL, so each VACUUM is followed by a CHECKPOINT.
+SET synchronous_commit = on;
+SHOW logical_decoding_prune_records;
+
+CREATE TABLE prune_t (id int PRIMARY KEY, val text)
+	WITH (autovacuum_enabled = off, logical_decoding_prune_records = on);
+INSERT INTO prune_t SELECT g, 'val' || g FROM generate_series(1, 10) g;
+SELECT 'init' FROM pg_create_logical_replication_slot('prune_slot', 'test_decoding');
+
+-- dead rows are first marked dead, then unused when the indexes are cleaned
+DELETE FROM prune_t WHERE id IN (2, 3, 4);
+CHECKPOINT;
+VACUUM prune_t;
+CHECKPOINT;
+-- a HOT chain: the root line pointer is redirected to the surviving version
+UPDATE prune_t SET val = 'upd' WHERE id = 5;
+UPDATE prune_t SET val = 'upd2' WHERE id = 5;
+VACUUM prune_t;
+CHECKPOINT;
+SELECT data FROM pg_logical_slot_get_changes('prune_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-prunes', '1');
+
+-- without include-prunes, nothing is output
+DELETE FROM prune_t WHERE id = 6;
+VACUUM prune_t;
+CHECKPOINT;
+SELECT data FROM pg_logical_slot_get_changes('prune_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1') WHERE data LIKE '%PRUNE%';
+
+-- Without the storage parameter, pruning is still reported, but a record
+-- with a full-page image does not keep the line pointers.  Whether the
+-- record needs a full-page image depends on whether one was already taken
+-- for hint bits (with data checksums), so only report whether pruning was
+-- decoded.  A table without indexes has its dead line pointers marked
+-- unused right after pruning, by a separate record.
+CREATE TABLE prune_nokeep (id int) WITH (autovacuum_enabled = off);
+INSERT INTO prune_nokeep SELECT g FROM generate_series(1, 5) g;
+DELETE FROM prune_nokeep WHERE id IN (1, 2);
+SELECT count(*) > 0 FROM pg_logical_slot_get_changes('prune_slot', NULL, NULL);
+CHECKPOINT;
+VACUUM prune_nokeep;
+CHECKPOINT;
+SELECT regexp_replace(data, ':( \(no-row-info\)| (dead|unused): \(0,1\) \(0,2\))$', ': ...') AS data
+FROM pg_logical_slot_get_changes('prune_slot', NULL, NULL,
+	'include-xids', '0', 'skip-empty-xacts', '1', 'include-prunes', '1');
+
+-- the storage parameter can be changed by the owner, the server setting not
+CREATE ROLE regress_prune_user;
+ALTER TABLE prune_nokeep OWNER TO regress_prune_user;
+SET ROLE regress_prune_user;
+ALTER TABLE prune_nokeep SET (logical_decoding_prune_records = on);
+SET logical_decoding_prune_records = on;                -- error
+RESET ROLE;
+
+-- invalid option value
+SELECT data FROM pg_logical_slot_get_changes('prune_slot', NULL, NULL, 'include-prunes', 'maybe');
+
+SELECT pg_drop_replication_slot('prune_slot');
+DROP TABLE prune_t, prune_nokeep;
+DROP ROLE regress_prune_user;

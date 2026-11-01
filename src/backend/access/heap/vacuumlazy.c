@@ -45,6 +45,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
@@ -2532,13 +2533,24 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 	{
 		xl_heap_vacuum xlrec;
 		XLogRecPtr	recptr;
+		uint8		regbuf_flags = REGBUF_STANDARD;
 
 		xlrec.nunused = uncnt;
+
+		/*
+		 * Keep the line pointers marked unused for logical decoding even if a
+		 * full-page image is taken, like heap_page_prune() does.
+		 */
+		if (logical_decoding_prune_records &&
+			vacrel->rel->rd_options != NULL &&
+			((StdRdOptions *) vacrel->rel->rd_options)->logical_decoding_prune_records &&
+			RelationIsLogicallyLogged(vacrel->rel))
+			regbuf_flags |= REGBUF_KEEP_DATA;
 
 		XLogBeginInsert();
 		XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
 
-		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+		XLogRegisterBuffer(0, buffer, regbuf_flags);
 		XLogRegisterBufData(0, (char *) unused, uncnt * sizeof(OffsetNumber));
 
 		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);

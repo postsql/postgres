@@ -34,6 +34,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "access/xlogutils.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_control.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
@@ -42,6 +43,9 @@
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
 #include "storage/standby.h"
+#include "utils/inval.h"
+#include "utils/relfilenodemap.h"
+#include "utils/snapmgr.h"
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -50,6 +54,7 @@ static void DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeSpecConfirm(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
+static void DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 
 static void DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 						 xl_xact_parsed_commit *parsed, TransactionId xid,
@@ -424,9 +429,12 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 * Everything else here is just low level physical stuff we're not
 			 * interested in.
 			 */
-		case XLOG_HEAP2_FREEZE_PAGE:
 		case XLOG_HEAP2_PRUNE:
 		case XLOG_HEAP2_VACUUM:
+			if (!ctx->fast_forward)
+				DecodePrune(ctx, buf);
+			break;
+		case XLOG_HEAP2_FREEZE_PAGE:
 		case XLOG_HEAP2_VISIBLE:
 		case XLOG_HEAP2_LOCK_UPDATED:
 			break;
@@ -1203,6 +1211,137 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		data += datalen;
 	}
 	Assert(data == tupledata + tuplelen);
+}
+
+/*
+ * Parse XLOG_HEAP2_PRUNE and XLOG_HEAP2_VACUUM records, and pass the line
+ * pointers changed by pruning to the output plugin's prune callback.
+ *
+ * Pruning is not part of any transaction; it is reported when it is
+ * decoded.  The record keeps the changed line pointers unless it has a
+ * full-page image; see logical_decoding_prune_records.
+ */
+static void
+DecodePrune(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	XLogReaderState *r = buf->record;
+	uint8		info = XLogRecGetInfo(r) & XLOG_HEAP_OPMASK;
+	RelFileNode rnode;
+	LogicalDecodePruneData prune = {0};
+	char	   *data;
+	Size		datalen;
+	MemoryContext ccxt = CurrentMemoryContext;
+	ResourceOwner cowner = CurrentResourceOwner;
+	bool		using_subtxn;
+
+	/* cheap checks first */
+	if (ctx->prune_cb == NULL)
+		return;
+
+	XLogRecGetBlockTag(r, 0, &rnode, NULL, &prune.blkno);
+	if (rnode.dbNode != ctx->slot->data.database)
+		return;
+
+	if (SnapBuildCurrentState(ctx->snapshot_builder) != SNAPBUILD_CONSISTENT ||
+		SnapBuildXactNeedsSkip(ctx->snapshot_builder, buf->origptr))
+		return;
+
+	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
+		return;
+
+	/* the record type tells what kind of pruning this was */
+	prune.reason = info;
+	data = XLogRecGetBlockData(r, 0, &datalen);
+	if (data != NULL && datalen > 0)
+	{
+		/* the layout is the one heap_xlog_prune() and heap_xlog_vacuum() read */
+		OffsetNumber *offsets = (OffsetNumber *) data;
+		int			noffsets = datalen / sizeof(OffsetNumber);
+
+		if (info == XLOG_HEAP2_PRUNE)
+		{
+			xl_heap_prune *xlrec = (xl_heap_prune *) XLogRecGetData(r);
+
+			prune.nredirected = xlrec->nredirected;
+			prune.ndead = xlrec->ndead;
+			prune.nunused = noffsets - 2 * prune.nredirected - prune.ndead;
+			prune.redirected = offsets;
+			prune.nowdead = offsets + 2 * prune.nredirected;
+			prune.nowunused = prune.nowdead + prune.ndead;
+		}
+		else
+		{
+			xl_heap_vacuum *xlrec = (xl_heap_vacuum *) XLogRecGetData(r);
+
+			prune.nunused = xlrec->nunused;
+			prune.nowunused = offsets;
+		}
+		if (prune.nunused < 0 ||
+			(info == XLOG_HEAP2_VACUUM && prune.nunused > noffsets))
+			elog(ERROR, "invalid heap pruning record at %X/%X",
+				 LSN_FORMAT_ARGS(buf->origptr));
+		if (prune.nredirected == 0 && prune.ndead == 0 && prune.nunused == 0)
+			return;
+		prune.has_row_info = true;
+	}
+	else if (!XLogRecHasBlockImage(r, 0))
+		return;
+
+	/*
+	 * Map the relfilenode to the relation, under the historic snapshot, in a
+	 * transaction of its own (or a subtransaction, when called through the
+	 * SQL functions); see ReorderBufferProcessTXN().
+	 */
+	using_subtxn = IsTransactionOrTransactionBlock();
+	PG_TRY();
+	{
+		Oid			reloid;
+
+		if (using_subtxn)
+			BeginInternalSubTransaction("prune");
+		else
+			StartTransactionCommand();
+		SetupHistoricSnapshot(SnapBuildGetOrBuildSnapshot(ctx->snapshot_builder,
+														  InvalidTransactionId),
+							  NULL);
+
+		reloid = RelidByRelfilenode(rnode.spcNode, rnode.relNode);
+		if (OidIsValid(reloid))
+		{
+			Relation	relation = RelationIdGetRelation(reloid);
+
+			if (RelationIsValid(relation))
+			{
+				if (RelationIsLogicallyLogged(relation) &&
+					!IsToastRelation(relation) &&
+					relation->rd_rel->relkind != RELKIND_SEQUENCE &&
+					(!relation->rd_rel->relrewrite || ctx->reorder->output_rewrites))
+					ctx->reorder->prune(ctx->reorder, relation, buf->origptr,
+										&prune);
+				RelationClose(relation);
+			}
+		}
+
+		TeardownHistoricSnapshot(false);
+		if (using_subtxn)
+			RollbackAndReleaseCurrentSubTransaction();
+		else
+			AbortCurrentTransaction();
+		MemoryContextSwitchTo(ccxt);
+		CurrentResourceOwner = cowner;
+	}
+	PG_CATCH();
+	{
+		TeardownHistoricSnapshot(true);
+		if (using_subtxn)
+		{
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(ccxt);
+			CurrentResourceOwner = cowner;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
