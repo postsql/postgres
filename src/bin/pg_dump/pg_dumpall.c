@@ -27,9 +27,11 @@
 #include "common/string.h"
 #include "connectdb.h"
 #include "dumputils.h"
+#include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
 #include "filter.h"
 #include "getopt_long.h"
+#include "storage/block.h"
 
 /* version string we expect back from pg_dump */
 #define PGDUMP_VERSIONSTR "pg_dump (PostgreSQL) " PG_VERSION "\n"
@@ -76,6 +78,10 @@ static void executeCommand(PGconn *conn, const char *query);
 static void expand_dbname_patterns(PGconn *conn, SimpleStringList *patterns,
 								   SimpleStringList *names);
 static void read_dumpall_filters(const char *filename, SimpleStringList *pattern);
+static void validate_max_table_segment_pages(const char *arg, const char *optname);
+static void validate_chunk_size_opt(const char *arg, const char *optname);
+static void validate_table_chunk_sizes(const char *raw_list, const char *optname);
+static void validate_settings_from_database(const char *arg, const char *optname);
 
 static char pg_dump_bin[MAXPGPATH];
 static PQExpBuffer pgdumpopts;
@@ -187,6 +193,16 @@ main(int argc, char *argv[])
 		{"filter", required_argument, NULL, 8},
 		{"sequence-data", no_argument, &sequence_data, 1},
 		{"restrict-key", required_argument, NULL, 9},
+		{"max-table-segment-pages", required_argument, NULL, 10},
+		{"max_table_segment_pages", required_argument, NULL, 10},
+		{"chunk-above-size", required_argument, NULL, 11},
+		{"chunk_above_size", required_argument, NULL, 11},
+		{"chunk-size", required_argument, NULL, 12},
+		{"chunk_size", required_argument, NULL, 12},
+		{"table-chunk-sizes", required_argument, NULL, 13},
+		{"table_chunk_sizes", required_argument, NULL, 13},
+		{"settings-from-database", required_argument, NULL, 14},
+		{"settings_from_database", required_argument, NULL, 14},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -202,6 +218,11 @@ main(int argc, char *argv[])
 	bool		globals_only = false;
 	bool		roles_only = false;
 	bool		tablespaces_only = false;
+	bool		max_table_segment_pages_set = false;
+	bool		chunk_above_size_set = false;
+	bool		chunk_size_set = false;
+	bool		table_chunk_sizes_set = false;
+	bool		settings_from_database_set = false;
 	PGconn	   *conn;
 	int			encoding;
 	int			c,
@@ -379,12 +400,106 @@ main(int argc, char *argv[])
 				appendShellString(pgdumpopts, optarg);
 				break;
 
+			case 10:
+				validate_max_table_segment_pages(optarg, "--max-table-segment-pages");
+				appendPQExpBufferStr(pgdumpopts, " --max-table-segment-pages ");
+				appendShellString(pgdumpopts, optarg);
+				max_table_segment_pages_set = true;
+				break;
+
+			case 11:
+				validate_chunk_size_opt(optarg, "--chunk-above-size");
+				appendPQExpBufferStr(pgdumpopts, " --chunk-above-size ");
+				appendShellString(pgdumpopts, optarg);
+				chunk_above_size_set = true;
+				break;
+
+			case 12:
+				validate_chunk_size_opt(optarg, "--chunk-size");
+				appendPQExpBufferStr(pgdumpopts, " --chunk-size ");
+				appendShellString(pgdumpopts, optarg);
+				chunk_size_set = true;
+				break;
+
+			case 13:
+				validate_table_chunk_sizes(optarg, "--table-chunk-sizes");
+				appendPQExpBufferStr(pgdumpopts, " --table-chunk-sizes ");
+				appendShellString(pgdumpopts, optarg);
+				table_chunk_sizes_set = true;
+				break;
+
+			case 14:
+				validate_settings_from_database(optarg, "--settings-from-database");
+				appendPQExpBufferStr(pgdumpopts, " --settings-from-database ");
+				appendShellString(pgdumpopts, optarg);
+				settings_from_database_set = true;
+				break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit_nicely(1);
 		}
 	}
+
+	if (!settings_from_database_set)
+	{
+		const char *env_sfd = getenv("PGDUMP_SETTINGS_FROM_DATABASE");
+
+		if (env_sfd != NULL && env_sfd[0] != '\0')
+			validate_settings_from_database(env_sfd,
+											"PGDUMP_SETTINGS_FROM_DATABASE");
+	}
+
+	if (!max_table_segment_pages_set)
+	{
+		const char *env_seg_pages = getenv("PGDUMP_MAX_TABLE_SEGMENT_PAGES");
+
+		if (env_seg_pages != NULL && env_seg_pages[0] != '\0')
+		{
+			validate_max_table_segment_pages(env_seg_pages,
+											 "PGDUMP_MAX_TABLE_SEGMENT_PAGES");
+			max_table_segment_pages_set = true;
+		}
+	}
+
+	if (!chunk_above_size_set)
+	{
+		const char *env_above = getenv("PGDUMP_CHUNK_ABOVE_SIZE");
+
+		if (env_above != NULL && env_above[0] != '\0')
+		{
+			validate_chunk_size_opt(env_above, "PGDUMP_CHUNK_ABOVE_SIZE");
+			chunk_above_size_set = true;
+		}
+	}
+
+	if (!chunk_size_set)
+	{
+		const char *env_size = getenv("PGDUMP_CHUNK_SIZE");
+
+		if (env_size != NULL && env_size[0] != '\0')
+		{
+			validate_chunk_size_opt(env_size, "PGDUMP_CHUNK_SIZE");
+			chunk_size_set = true;
+		}
+	}
+
+	{
+		const char *env_tbl_sizes = getenv("PGDUMP_TABLE_CHUNK_SIZES");
+
+		if (env_tbl_sizes != NULL && env_tbl_sizes[0] != '\0')
+		{
+			validate_table_chunk_sizes(env_tbl_sizes,
+									   "PGDUMP_TABLE_CHUNK_SIZES");
+			table_chunk_sizes_set = true;
+		}
+	}
+
+	if (binary_upgrade &&
+		(max_table_segment_pages_set || chunk_above_size_set ||
+		 chunk_size_set || table_chunk_sizes_set))
+		pg_fatal("table chunking options and --binary-upgrade cannot be used together");
 
 	/* Complain if any arguments remain */
 	if (optind < argc)
@@ -723,6 +838,8 @@ help(void)
 	printf(_("  -t, --tablespaces-only       dump only tablespaces, no databases or roles\n"));
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
+	printf(_("  --chunk-above-size=SIZE      chunk tables whose total size exceeds SIZE\n"));
+	printf(_("  --chunk-size=SIZE            target byte size per table data chunk\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
@@ -732,6 +849,8 @@ help(void)
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
+	printf(_("  --max-table-segment-pages=NPAGES\n"
+			 "                               number of pages per data segment\n"));
 	printf(_("  --no-comments                do not dump comment commands\n"));
 	printf(_("  --no-data                    do not dump data\n"));
 	printf(_("  --no-policies                do not dump row security policies\n"));
@@ -751,8 +870,12 @@ help(void)
 	printf(_("  --restrict-key=RESTRICT_KEY  use provided string as psql \\restrict key\n"));
 	printf(_("  --rows-per-insert=NROWS      number of rows per INSERT; implies --inserts\n"));
 	printf(_("  --sequence-data              include sequence data in dump\n"));
+	printf(_("  --settings-from-database=BOOL\n"
+			 "                               read pgdump.* chunking settings from database\n"
+			 "                               (default: on)\n"));
 	printf(_("  --statistics                 dump the statistics\n"));
 	printf(_("  --statistics-only            dump only the statistics, not schema or data\n"));
+	printf(_("  --table-chunk-sizes=LIST     comma-separated [schema.]table:size overrides\n"));
 	printf(_("  --use-set-session-authorization\n"
 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
 			 "                               ALTER OWNER commands to set ownership\n"));
@@ -1861,4 +1984,129 @@ read_dumpall_filters(const char *filename, SimpleStringList *pattern)
 	}
 
 	filter_free(&fstate);
+}
+
+static void
+validate_max_table_segment_pages(const char *arg, const char *optname)
+{
+	uint32		val;
+
+	if (!option_parse_uint32(arg, optname, 1, MaxBlockNumber, &val))
+		exit_nicely(1);
+}
+
+static void
+validate_chunk_size_opt(const char *arg, const char *optname)
+{
+	uint64		val;
+
+	if (!option_parse_size_bytes(arg, optname, &val))
+		exit_nicely(1);
+}
+
+static void
+validate_table_chunk_sizes(const char *raw_list, const char *optname)
+{
+	const char *p = raw_list;
+
+	for (;;)
+	{
+		const char *comma;
+		const char *entry_start;
+		const char *entry_end;
+		const char *colon;
+		const char *t_start;
+		const char *t_end;
+		const char *s_start;
+		const char *s_end;
+		const char *dot;
+		const char *scan;
+		char	   *size_str;
+		uint64		chunk_size = 0;
+
+		comma = strchr(p, ',');
+		entry_start = p;
+		entry_end = comma ? comma : (p + strlen(p));
+
+		while (entry_start < entry_end && isspace((unsigned char) *entry_start))
+			entry_start++;
+		while (entry_end > entry_start && isspace((unsigned char) *(entry_end - 1)))
+			entry_end--;
+
+		if (entry_start == entry_end)
+		{
+			pg_log_error("invalid value for %s: \"%s\"", optname, raw_list);
+			exit_nicely(1);
+		}
+
+		colon = memchr(entry_start, ':', (size_t) (entry_end - entry_start));
+		if (colon == NULL)
+		{
+			pg_log_error("invalid value for %s: \"%s\"", optname, raw_list);
+			exit_nicely(1);
+		}
+
+		t_start = entry_start;
+		t_end = colon;
+		while (t_start < t_end && isspace((unsigned char) *t_start))
+			t_start++;
+		while (t_end > t_start && isspace((unsigned char) *(t_end - 1)))
+			t_end--;
+
+		s_start = colon + 1;
+		s_end = entry_end;
+		while (s_start < s_end && isspace((unsigned char) *s_start))
+			s_start++;
+		while (s_end > s_start && isspace((unsigned char) *(s_end - 1)))
+			s_end--;
+
+		if (t_start == t_end || s_start == s_end)
+		{
+			pg_log_error("invalid value for %s: \"%s\"", optname, raw_list);
+			exit_nicely(1);
+		}
+
+		for (scan = t_start; scan < t_end; scan++)
+		{
+			if (isspace((unsigned char) *scan))
+			{
+				pg_log_error("invalid value for %s: \"%s\"", optname, raw_list);
+				exit_nicely(1);
+			}
+		}
+
+		dot = memchr(t_start, '.', (size_t) (t_end - t_start));
+		if (dot != NULL)
+		{
+			const char *rel_start = dot + 1;
+
+			if (dot == t_start || rel_start == t_end ||
+				memchr(rel_start, '.', (size_t) (t_end - rel_start)) != NULL)
+			{
+				pg_log_error("invalid value for %s: \"%s\"", optname, raw_list);
+				exit_nicely(1);
+			}
+		}
+
+		size_str = pnstrdup(s_start, (size_t) (s_end - s_start));
+		if (!option_parse_size_bytes(size_str, optname, &chunk_size))
+		{
+			pg_free(size_str);
+			exit_nicely(1);
+		}
+		pg_free(size_str);
+
+		if (comma == NULL)
+			break;
+		p = comma + 1;
+	}
+}
+
+static void
+validate_settings_from_database(const char *arg, const char *optname)
+{
+	bool		val;
+
+	if (!option_parse_bool(arg, optname, &val))
+		exit_nicely(1);
 }

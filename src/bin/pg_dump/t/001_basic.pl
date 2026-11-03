@@ -250,7 +250,7 @@ command_fails_like(
 	'pg_dumpall: option --exclude-database cannot be used together with -g/--globals-only'
 );
 
-# Table chunking --max-table-segment-pages CLI option validation
+# Table chunking CLI options and PGDUMP_* environment variable validation
 command_fails_like(
 	[ 'pg_dump', '--max-table-segment-pages=0' ],
 	qr/\Qpg_dump: error: --max-table-segment-pages not in range 1..4294967294\E/,
@@ -270,5 +270,198 @@ command_fails_like(
 	[ 'pg_dump', '--max-table-segment-pages=invalid' ],
 	qr/\Qpg_dump: error: invalid value "invalid" for option --max-table-segment-pages\E/,
 	'pg_dump: --max-table-segment-pages=invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--max_table_segment_pages=invalid' ],
+	qr/\Qpg_dump: error: invalid value "invalid" for option --max-table-segment-pages\E/,
+	'pg_dump: --max_table_segment_pages=invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--chunk-above-size=0' ],
+	qr/\Qpg_dump: error: invalid value for --chunk-above-size: "0"\E/,
+	'pg_dump: --chunk-above-size=0 invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--chunk_above_size=10XB' ],
+	qr/\Qpg_dump: error: invalid value for --chunk-above-size: "10XB"\E/,
+	'pg_dump: --chunk_above_size=10XB invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--chunk-size=0MB' ],
+	qr/\Qpg_dump: error: invalid value for --chunk-size: "0MB"\E/,
+	'pg_dump: --chunk-size=0MB invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--chunk_size=-5M' ],
+	qr/\Qpg_dump: error: invalid value for --chunk-size: "-5M"\E/,
+	'pg_dump: --chunk_size=-5M invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--table-chunk-sizes=missing_colon' ],
+	qr/\Qpg_dump: error: invalid value for --table-chunk-sizes: "missing_colon"\E/,
+	'pg_dump: --table-chunk-sizes=missing_colon invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--table_chunk_sizes=a.b.c:10M' ],
+	qr/\Qpg_dump: error: invalid value for --table-chunk-sizes: "a.b.c:10M"\E/,
+	'pg_dump: --table_chunk_sizes=a.b.c:10M invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--table-chunk-sizes=' ],
+	qr/\Qpg_dump: error: invalid value for --table-chunk-sizes: ""\E/,
+	'pg_dump: --table-chunk-sizes= empty invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--table-chunk-sizes=   ' ],
+	qr/\Qpg_dump: error: invalid value for --table-chunk-sizes: "   "\E/,
+	'pg_dump: --table-chunk-sizes= whitespace invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--settings-from-database=maybe' ],
+	qr/\Qpg_dump: error: invalid value "maybe" for option --settings-from-database\E/,
+	'pg_dump: --settings-from-database=maybe invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--settings_from_database=2' ],
+	qr/\Qpg_dump: error: invalid value "2" for option --settings-from-database\E/,
+	'pg_dump: --settings_from_database=2 invalid');
+
+command_fails_like(
+	[ 'pg_dump', '--binary-upgrade', '--max-table-segment-pages=10' ],
+	qr/\Qpg_dump: error: table chunking options and --binary-upgrade cannot be used together\E/,
+	'pg_dump: --binary-upgrade with --max-table-segment-pages fails');
+
+command_fails_like(
+	[ 'pg_dump', '--binary-upgrade', '--chunk-size=16MB' ],
+	qr/\Qpg_dump: error: table chunking options and --binary-upgrade cannot be used together\E/,
+	'pg_dump: --binary-upgrade with --chunk-size fails');
+
+command_fails_like(
+	[ 'pg_dumpall', '--max-table-segment-pages=0' ],
+	qr/\Qpg_dumpall: error: --max-table-segment-pages not in range 1..4294967294\E/,
+	'pg_dumpall: --max-table-segment-pages=0 out of range');
+
+command_fails_like(
+	[ 'pg_dumpall', '--max-table-segment-pages=invalid' ],
+	qr/\Qpg_dumpall: error: invalid value "invalid" for option --max-table-segment-pages\E/,
+	'pg_dumpall: --max-table-segment-pages=invalid');
+
+command_fails_like(
+	[ 'pg_dumpall', '--chunk-above-size=invalid' ],
+	qr/\Qpg_dumpall: error: invalid value for --chunk-above-size: "invalid"\E/,
+	'pg_dumpall: --chunk-above-size=invalid');
+
+command_fails_like(
+	[ 'pg_dumpall', '--chunk-size=invalid' ],
+	qr/\Qpg_dumpall: error: invalid value for --chunk-size: "invalid"\E/,
+	'pg_dumpall: --chunk-size=invalid');
+
+command_fails_like(
+	[ 'pg_dumpall', '--table-chunk-sizes=invalid' ],
+	qr/\Qpg_dumpall: error: invalid value for --table-chunk-sizes: "invalid"\E/,
+	'pg_dumpall: --table-chunk-sizes=invalid');
+
+command_fails_like(
+	[ 'pg_dumpall', '--table-chunk-sizes=' ],
+	qr/\Qpg_dumpall: error: invalid value for --table-chunk-sizes: ""\E/,
+	'pg_dumpall: --table-chunk-sizes= empty invalid');
+
+command_fails_like(
+	[ 'pg_dumpall', '--table-chunk-sizes=   ' ],
+	qr/\Qpg_dumpall: error: invalid value for --table-chunk-sizes: "   "\E/,
+	'pg_dumpall: --table-chunk-sizes= whitespace invalid');
+
+command_fails_like(
+	[ 'pg_dumpall', '--settings-from-database=invalid' ],
+	qr/\Qpg_dumpall: error: invalid value "invalid" for option --settings-from-database\E/,
+	'pg_dumpall: --settings-from-database=invalid');
+
+{
+	local $ENV{PGDUMP_MAX_TABLE_SEGMENT_PAGES} = 'bad_env_val';
+	command_fails_like(
+		[ 'pg_dump' ],
+		qr/\Qpg_dump: error: invalid value "bad_env_val" for option PGDUMP_MAX_TABLE_SEGMENT_PAGES\E/,
+		'pg_dump: invalid PGDUMP_MAX_TABLE_SEGMENT_PAGES environment variable');
+
+	command_fails_like(
+		[ 'pg_dumpall' ],
+		qr/\Qpg_dumpall: error: invalid value "bad_env_val" for option PGDUMP_MAX_TABLE_SEGMENT_PAGES\E/,
+		'pg_dumpall: invalid PGDUMP_MAX_TABLE_SEGMENT_PAGES environment variable');
+
+	command_fails_like(
+		[ 'pg_dump', '--max-table-segment-pages=10', '-s', '-a' ],
+		qr/\Qpg_dump: error: options -a\/--data-only and -s\/--schema-only cannot be used together\E/,
+		'pg_dump: CLI --max-table-segment-pages=10 overrides PGDUMP_MAX_TABLE_SEGMENT_PAGES');
+}
+
+{
+	local $ENV{PGDUMP_CHUNK_ABOVE_SIZE} = 'bad_above';
+	command_fails_like(
+		[ 'pg_dump' ],
+		qr/\Qpg_dump: error: invalid value for PGDUMP_CHUNK_ABOVE_SIZE: "bad_above"\E/,
+		'pg_dump: invalid PGDUMP_CHUNK_ABOVE_SIZE environment variable');
+
+	command_fails_like(
+		[ 'pg_dumpall' ],
+		qr/\Qpg_dumpall: error: invalid value for PGDUMP_CHUNK_ABOVE_SIZE: "bad_above"\E/,
+		'pg_dumpall: invalid PGDUMP_CHUNK_ABOVE_SIZE environment variable');
+}
+
+{
+	local $ENV{PGDUMP_CHUNK_SIZE} = 'bad_size';
+	command_fails_like(
+		[ 'pg_dump' ],
+		qr/\Qpg_dump: error: invalid value for PGDUMP_CHUNK_SIZE: "bad_size"\E/,
+		'pg_dump: invalid PGDUMP_CHUNK_SIZE environment variable');
+
+	command_fails_like(
+		[ 'pg_dumpall' ],
+		qr/\Qpg_dumpall: error: invalid value for PGDUMP_CHUNK_SIZE: "bad_size"\E/,
+		'pg_dumpall: invalid PGDUMP_CHUNK_SIZE environment variable');
+}
+
+{
+	local $ENV{PGDUMP_TABLE_CHUNK_SIZES} = 'bad_table_spec';
+	command_fails_like(
+		[ 'pg_dump' ],
+		qr/\Qpg_dump: error: invalid value for PGDUMP_TABLE_CHUNK_SIZES: "bad_table_spec"\E/,
+		'pg_dump: invalid PGDUMP_TABLE_CHUNK_SIZES environment variable');
+
+	command_fails_like(
+		[ 'pg_dumpall' ],
+		qr/\Qpg_dumpall: error: invalid value for PGDUMP_TABLE_CHUNK_SIZES: "bad_table_spec"\E/,
+		'pg_dumpall: invalid PGDUMP_TABLE_CHUNK_SIZES environment variable');
+}
+
+{
+	local $ENV{PGDUMP_TABLE_CHUNK_SIZES} = '   ';
+	command_fails_like(
+		[ 'pg_dump' ],
+		qr/\Qpg_dump: error: invalid value for PGDUMP_TABLE_CHUNK_SIZES: "   "\E/,
+		'pg_dump: whitespace-only PGDUMP_TABLE_CHUNK_SIZES environment variable');
+
+	command_fails_like(
+		[ 'pg_dumpall' ],
+		qr/\Qpg_dumpall: error: invalid value for PGDUMP_TABLE_CHUNK_SIZES: "   "\E/,
+		'pg_dumpall: whitespace-only PGDUMP_TABLE_CHUNK_SIZES environment variable');
+}
+
+{
+	local $ENV{PGDUMP_SETTINGS_FROM_DATABASE} = 'bad_bool';
+	command_fails_like(
+		[ 'pg_dump' ],
+		qr/\Qpg_dump: error: invalid value "bad_bool" for option PGDUMP_SETTINGS_FROM_DATABASE\E/,
+		'pg_dump: invalid PGDUMP_SETTINGS_FROM_DATABASE environment variable');
+
+	command_fails_like(
+		[ 'pg_dumpall' ],
+		qr/\Qpg_dumpall: error: invalid value "bad_bool" for option PGDUMP_SETTINGS_FROM_DATABASE\E/,
+		'pg_dumpall: invalid PGDUMP_SETTINGS_FROM_DATABASE environment variable');
+
+	command_fails_like(
+		[ 'pg_dump', '--settings-from-database=off', '-s', '-a' ],
+		qr/\Qpg_dump: error: options -a\/--data-only and -s\/--schema-only cannot be used together\E/,
+		'pg_dump: CLI --settings-from-database=off overrides PGDUMP_SETTINGS_FROM_DATABASE');
+}
 
 done_testing();

@@ -257,6 +257,21 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--chunk-above-size=<replaceable class="parameter">size</replaceable></option></term>
+      <term><option>--chunk_above_size=<replaceable class="parameter">size</replaceable></option></term>
+      <term><option>--chunk-size=<replaceable class="parameter">size</replaceable></option></term>
+      <term><option>--chunk_size=<replaceable class="parameter">size</replaceable></option></term>
+      <listitem>
+       <para>
+        Pass <option>--chunk-above-size</option> or
+        <option>--chunk-size</option> to each
+        <application>pg_dump</application> invocation. See
+        <xref linkend="app-pgdump"/> for details.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--column-inserts</option></term>
       <term><option>--attribute-inserts</option></term>
       <listitem>
@@ -419,6 +434,18 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
         <replaceable class="parameter">timeout</replaceable>. The timeout may be
         specified in any of the formats accepted by <command>SET
         statement_timeout</command>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--max-table-segment-pages=<replaceable class="parameter">npages</replaceable></option></term>
+      <term><option>--max_table_segment_pages=<replaceable class="parameter">npages</replaceable></option></term>
+      <listitem>
+       <para>
+        Pass <option>--max-table-segment-pages</option> to each
+        <application>pg_dump</application> invocation. See
+        <xref linkend="app-pgdump"/> for details.
        </para>
       </listitem>
      </varlistentry>
@@ -636,6 +663,18 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
      </varlistentry>
 
      <varlistentry>
+      <term><option>--settings-from-database=<replaceable class="parameter">boolean</replaceable></option></term>
+      <term><option>--settings_from_database=<replaceable class="parameter">boolean</replaceable></option></term>
+      <listitem>
+       <para>
+        Pass <option>--settings-from-database</option> to each
+        <application>pg_dump</application> invocation. See
+        <xref linkend="app-pgdump"/> for details.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--statistics</option></term>
       <listitem>
        <para>
@@ -662,6 +701,18 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
         Include sequence data in the dump.  This is the default behavior except
         when <option>--no-data</option>, <option>--schema-only</option>, or
         <option>--statistics-only</option> is specified.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--table-chunk-sizes=<replaceable class="parameter">list</replaceable></option></term>
+      <term><option>--table_chunk_sizes=<replaceable class="parameter">list</replaceable></option></term>
+      <listitem>
+       <para>
+        Pass <option>--table-chunk-sizes</option> to each
+        <application>pg_dump</application> invocation. See
+        <xref linkend="app-pgdump"/> for details.
        </para>
       </listitem>
      </varlistentry>
@@ -855,6 +906,24 @@ exclude database <replaceable class="parameter">PATTERN</replaceable>
       Specifies whether to use color in diagnostic messages. Possible values
       are <literal>always</literal>, <literal>auto</literal> and
       <literal>never</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><envar>PGDUMP_CHUNK_ABOVE_SIZE</envar></term>
+    <term><envar>PGDUMP_CHUNK_SIZE</envar></term>
+    <term><envar>PGDUMP_MAX_TABLE_SEGMENT_PAGES</envar></term>
+    <term><envar>PGDUMP_SETTINGS_FROM_DATABASE</envar></term>
+    <term><envar>PGDUMP_TABLE_CHUNK_SIZES</envar></term>
+    <listitem>
+     <para>
+      Specify default values for the corresponding table chunking command-line
+      options (<option>--chunk-above-size</option>,
+      <option>--chunk-size</option>,
+      <option>--max-table-segment-pages</option>,
+      <option>--settings-from-database</option>, and
+      <option>--table-chunk-sizes</option>).
      </para>
     </listitem>
    </varlistentry>

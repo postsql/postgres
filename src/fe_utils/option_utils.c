@@ -139,6 +139,186 @@ option_parse_uint32(const char *optarg, const char *optname,
 }
 
 /*
+ * option_parse_size_bytes
+ *
+ * Parse a positive integer size value with an optional unit suffix
+ * (k/kB, M/MB, G/GB, T/TB, case-insensitive; default unit is M) into bytes.
+ * Returns true and stores the byte count in *result on success; logs an error
+ * and returns false on failure.
+ */
+bool
+option_parse_size_bytes(const char *optarg, const char *optname,
+						uint64 *result)
+{
+	const char *p = optarg;
+	const char *unit_start;
+	size_t		unit_len;
+	uint64		val = 0;
+	uint64		multiplier = 0;
+
+	if (optarg == NULL)
+	{
+		pg_log_error("invalid value for %s: \"\"", optname);
+		return false;
+	}
+
+	while (*p != '\0' && isspace((unsigned char) *p))
+		p++;
+
+	if (!isdigit((unsigned char) *p))
+	{
+		pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+		return false;
+	}
+
+	while (isdigit((unsigned char) *p))
+	{
+		uint64		digit = (uint64) (*p - '0');
+
+		if (val > (PG_UINT64_MAX - digit) / 10)
+		{
+			pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+			return false;
+		}
+		val = val * 10 + digit;
+		p++;
+	}
+
+	if (val == 0)
+	{
+		pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+		return false;
+	}
+
+	while (*p != '\0' && isspace((unsigned char) *p))
+		p++;
+
+	unit_start = p;
+	while (*p != '\0' && !isspace((unsigned char) *p))
+		p++;
+	unit_len = (size_t) (p - unit_start);
+
+	while (*p != '\0' && isspace((unsigned char) *p))
+		p++;
+
+	if (*p != '\0')
+	{
+		pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+		return false;
+	}
+
+	if (unit_len == 0)
+	{
+		multiplier = (uint64) 1024 * 1024;
+	}
+	else if (unit_len == 1 ||
+			 (unit_len == 2 &&
+			  (unit_start[1] == 'b' || unit_start[1] == 'B')))
+	{
+		switch (unit_start[0])
+		{
+			case 'k':
+			case 'K':
+				multiplier = (uint64) 1024;
+				break;
+			case 'm':
+			case 'M':
+				multiplier = (uint64) 1024 * 1024;
+				break;
+			case 'g':
+			case 'G':
+				multiplier = (uint64) 1024 * 1024 * 1024;
+				break;
+			case 't':
+			case 'T':
+				multiplier = (uint64) 1024 * 1024 * 1024 * 1024;
+				break;
+			default:
+				pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+				return false;
+		}
+	}
+	else
+	{
+		pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+		return false;
+	}
+
+	if (val > PG_UINT64_MAX / multiplier)
+	{
+		pg_log_error("invalid value for %s: \"%s\"", optname, optarg);
+		return false;
+	}
+
+	if (result)
+		*result = val * multiplier;
+	return true;
+}
+
+/*
+ * option_parse_bool
+ *
+ * Parse a boolean value for an option (on/off, true/false, yes/no, 1/0,
+ * case-insensitive, ignoring leading/trailing whitespace).
+ * Returns true and stores the parsed value in *result on success; logs an
+ * error and returns false on failure.
+ */
+bool
+option_parse_bool(const char *optarg, const char *optname,
+				  bool *result)
+{
+	const char *p = optarg;
+	const char *start;
+	size_t		len;
+
+	if (optarg == NULL)
+	{
+		pg_log_error("invalid value \"%s\" for option %s", "", optname);
+		return false;
+	}
+
+	while (*p != '\0' && isspace((unsigned char) *p))
+		p++;
+
+	start = p;
+	while (*p != '\0' && !isspace((unsigned char) *p))
+		p++;
+	len = (size_t) (p - start);
+
+	while (*p != '\0' && isspace((unsigned char) *p))
+		p++;
+
+	if (len == 0 || *p != '\0')
+	{
+		pg_log_error("invalid value \"%s\" for option %s", optarg, optname);
+		return false;
+	}
+
+	if ((len == 2 && pg_strncasecmp(start, "on", 2) == 0) ||
+		(len == 4 && pg_strncasecmp(start, "true", 4) == 0) ||
+		(len == 3 && pg_strncasecmp(start, "yes", 3) == 0) ||
+		(len == 1 && start[0] == '1'))
+	{
+		if (result)
+			*result = true;
+		return true;
+	}
+
+	if ((len == 3 && pg_strncasecmp(start, "off", 3) == 0) ||
+		(len == 5 && pg_strncasecmp(start, "false", 5) == 0) ||
+		(len == 2 && pg_strncasecmp(start, "no", 2) == 0) ||
+		(len == 1 && start[0] == '0'))
+	{
+		if (result)
+			*result = false;
+		return true;
+	}
+
+	pg_log_error("invalid value \"%s\" for option %s", optarg, optname);
+	return false;
+}
+
+/*
  * Provide strictly harmonized handling of the --sync-method option.
  */
 bool

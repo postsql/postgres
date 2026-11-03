@@ -169,6 +169,18 @@ typedef struct _restoreOptions
 	char	   *restrict_key;
 } RestoreOptions;
 
+#define CHUNK_SRC_ENV	1
+#define CHUNK_SRC_CLI	2
+#define CHUNK_SRC_DB	3
+
+typedef struct TableChunkSizeOverride
+{
+	char	   *schemaname;		/* NULL if unqualified */
+	char	   *relname;		/* table name */
+	uint64		chunk_size;		/* target chunk size in bytes */
+	int			source;			/* CHUNK_SRC_ENV, CHUNK_SRC_CLI, or CHUNK_SRC_DB */
+} TableChunkSizeOverride;
+
 typedef struct _dumpOptions
 {
 	ConnParams	cparams;
@@ -181,6 +193,11 @@ typedef struct _dumpOptions
 	const char *lockWaitTimeout;
 	int			dump_inserts;	/* 0 = COPY, otherwise rows per INSERT */
 	BlockNumber	max_table_segment_pages; /* chunk when relpages is above this */
+	bool		settings_from_database;	/* read chunking config from DB GUCs */
+	uint64		chunk_above_size;	/* chunk when pg_table_size() > this */
+	uint64		chunk_size;			/* target chunk size in bytes */
+	TableChunkSizeOverride *table_chunk_overrides;
+	int			num_table_chunk_overrides;
 
 	/* flags for various command-line long options */
 	int			disable_dollar_quoting;

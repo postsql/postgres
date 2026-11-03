@@ -413,6 +413,14 @@ static void setupDumpWorker(Archive *AH);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
 static bool forcePartitionRootLoad(const TableInfo *tbinfo);
 static void read_dump_filters(const char *filename, DumpOptions *dopt);
+static void parse_table_chunk_sizes(const char *raw_list, const char *optname,
+									int source, DumpOptions *dopt);
+static void readDbChunkingConfig(Archive *fout, DumpOptions *dopt);
+static bool isChunkingActive(const DumpOptions *dopt);
+static BlockNumber computeSegmentPagesFromBytes(const TableInfo *tbinfo,
+												uint64 chunk_size);
+static BlockNumber getTableSegmentPages(const DumpOptions *dopt,
+										const TableInfo *tbinfo);
 
 
 int
@@ -451,6 +459,10 @@ main(int argc, char **argv)
 	bool		no_data = false;
 	bool		no_schema = false;
 	bool		no_statistics = false;
+	bool		max_table_segment_pages_set = false;
+	bool		chunk_above_size_set = false;
+	bool		chunk_size_set = false;
+	bool		settings_from_database_set = false;
 
 	static DumpOptions dopt;
 
@@ -537,6 +549,15 @@ main(int argc, char **argv)
 		{"sequence-data", no_argument, &dopt.sequence_data, 1},
 		{"restrict-key", required_argument, NULL, 25},
 		{"max-table-segment-pages", required_argument, NULL, 26},
+		{"max_table_segment_pages", required_argument, NULL, 26},
+		{"chunk-above-size", required_argument, NULL, 27},
+		{"chunk_above_size", required_argument, NULL, 27},
+		{"chunk-size", required_argument, NULL, 28},
+		{"chunk_size", required_argument, NULL, 28},
+		{"table-chunk-sizes", required_argument, NULL, 29},
+		{"table_chunk_sizes", required_argument, NULL, 29},
+		{"settings-from-database", required_argument, NULL, 30},
+		{"settings_from_database", required_argument, NULL, 30},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -568,6 +589,7 @@ main(int argc, char **argv)
 	}
 
 	InitDumpOptions(&dopt);
+	dopt.settings_from_database = true;
 
 	while ((c = getopt_long(argc, argv, "abBcCd:e:E:f:F:h:j:n:N:Op:RsS:t:T:U:vwWxXZ:",
 							long_options, &optindex)) != -1)
@@ -802,8 +824,35 @@ main(int argc, char **argv)
 				break;
 
 			case 26:
+				max_table_segment_pages_set = true;
 				if (!option_parse_uint32(optarg, "--max-table-segment-pages", 1, MaxBlockNumber,
 									  &dopt.max_table_segment_pages))
+					exit_nicely(1);
+				break;
+
+			case 27:
+				chunk_above_size_set = true;
+				if (!option_parse_size_bytes(optarg, "--chunk-above-size",
+											 &dopt.chunk_above_size))
+					exit_nicely(1);
+				break;
+
+			case 28:
+				chunk_size_set = true;
+				if (!option_parse_size_bytes(optarg, "--chunk-size",
+											 &dopt.chunk_size))
+					exit_nicely(1);
+				break;
+
+			case 29:
+				parse_table_chunk_sizes(optarg, "--table-chunk-sizes",
+										CHUNK_SRC_CLI, &dopt);
+				break;
+
+			case 30:
+				settings_from_database_set = true;
+				if (!option_parse_bool(optarg, "--settings-from-database",
+									   &dopt.settings_from_database))
 					exit_nicely(1);
 				break;
 
@@ -813,6 +862,75 @@ main(int argc, char **argv)
 				exit_nicely(1);
 		}
 	}
+
+	if (!settings_from_database_set)
+	{
+		const char *env_sfd = getenv("PGDUMP_SETTINGS_FROM_DATABASE");
+
+		if (env_sfd != NULL && env_sfd[0] != '\0')
+		{
+			if (!option_parse_bool(env_sfd,
+								   "PGDUMP_SETTINGS_FROM_DATABASE",
+								   &dopt.settings_from_database))
+				exit_nicely(1);
+		}
+	}
+
+	if (!max_table_segment_pages_set)
+	{
+		const char *env_seg_pages = getenv("PGDUMP_MAX_TABLE_SEGMENT_PAGES");
+
+		if (env_seg_pages != NULL && env_seg_pages[0] != '\0')
+		{
+			if (!option_parse_uint32(env_seg_pages,
+									 "PGDUMP_MAX_TABLE_SEGMENT_PAGES",
+									 1, MaxBlockNumber,
+									 &dopt.max_table_segment_pages))
+				exit_nicely(1);
+		}
+	}
+
+	if (!chunk_above_size_set)
+	{
+		const char *env_above = getenv("PGDUMP_CHUNK_ABOVE_SIZE");
+
+		if (env_above != NULL && env_above[0] != '\0')
+		{
+			if (!option_parse_size_bytes(env_above,
+										 "PGDUMP_CHUNK_ABOVE_SIZE",
+										 &dopt.chunk_above_size))
+				exit_nicely(1);
+		}
+	}
+
+	if (!chunk_size_set)
+	{
+		const char *env_size = getenv("PGDUMP_CHUNK_SIZE");
+
+		if (env_size != NULL && env_size[0] != '\0')
+		{
+			if (!option_parse_size_bytes(env_size,
+										 "PGDUMP_CHUNK_SIZE",
+										 &dopt.chunk_size))
+				exit_nicely(1);
+		}
+	}
+
+	{
+		const char *env_tbl_sizes = getenv("PGDUMP_TABLE_CHUNK_SIZES");
+
+		if (env_tbl_sizes != NULL && env_tbl_sizes[0] != '\0')
+			parse_table_chunk_sizes(env_tbl_sizes,
+									"PGDUMP_TABLE_CHUNK_SIZES",
+									CHUNK_SRC_ENV, &dopt);
+	}
+
+	if (dopt.binary_upgrade &&
+		(dopt.max_table_segment_pages != InvalidBlockNumber ||
+		 dopt.chunk_above_size > 0 ||
+		 dopt.chunk_size > 0 ||
+		 dopt.num_table_chunk_overrides > 0))
+		pg_fatal("table chunking options and --binary-upgrade cannot be used together");
 
 	/*
 	 * Non-option argument specifies database name as long as it wasn't
@@ -999,6 +1117,21 @@ main(int argc, char **argv)
 	 */
 	ConnectDatabaseAhx(fout, &dopt.cparams, false);
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
+
+	if (dopt.settings_from_database)
+		readDbChunkingConfig(fout, &dopt);
+
+	if (dopt.chunk_above_size > 0 && dopt.chunk_size == 0)
+		dopt.chunk_size = dopt.chunk_above_size;
+	else if (dopt.chunk_size > 0 && dopt.chunk_above_size == 0)
+		dopt.chunk_above_size = dopt.chunk_size;
+
+	if (dopt.binary_upgrade &&
+		(dopt.max_table_segment_pages != InvalidBlockNumber ||
+		 dopt.chunk_above_size > 0 ||
+		 dopt.chunk_size > 0 ||
+		 dopt.num_table_chunk_overrides > 0))
+		pg_fatal("table chunking options and --binary-upgrade cannot be used together");
 
 	/*
 	 * On hot standbys, never try to dump unlogged table data, since it will
@@ -1336,6 +1469,8 @@ help(const char *progname)
 	printf(_("  -T, --exclude-table=PATTERN  do NOT dump the specified table(s)\n"));
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
+	printf(_("  --chunk-above-size=SIZE      chunk tables whose total size exceeds SIZE\n"));
+	printf(_("  --chunk-size=SIZE            target byte size per table data chunk\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
@@ -1380,6 +1515,9 @@ help(const char *progname)
 	printf(_("  --section=SECTION            dump named section (pre-data, data, or post-data)\n"));
 	printf(_("  --sequence-data              include sequence data in dump\n"));
 	printf(_("  --serializable-deferrable    wait until the dump can run without anomalies\n"));
+	printf(_("  --settings-from-database=BOOL\n"
+			 "                               read pgdump.* chunking settings from database\n"
+			 "                               (default: on)\n"));
 	printf(_("  --snapshot=SNAPSHOT          use given snapshot for the dump\n"));
 	printf(_("  --statistics                 dump the statistics\n"));
 	printf(_("  --statistics-only            dump only the statistics, not schema or data\n"));
@@ -1387,6 +1525,7 @@ help(const char *progname)
 			 "                               match at least one entity each\n"));
 	printf(_("  --table-and-children=PATTERN dump only the specified table(s), including\n"
 			 "                               child and partition tables\n"));
+	printf(_("  --table-chunk-sizes=LIST     comma-separated [schema.]table:size overrides\n"));
 	printf(_("  --use-set-session-authorization\n"
 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
 			 "                               ALTER OWNER commands to set ownership\n"));
@@ -2877,6 +3016,330 @@ forcePartitionRootLoad(const TableInfo *tbinfo)
 }
 
 /*
+ * parse_table_chunk_sizes -
+ *	  parse comma-separated [schema.]table:size entries from
+ *	  pgdump.table_chunk_sizes, --table-chunk-sizes, or PGDUMP_TABLE_CHUNK_SIZES
+ */
+static void
+parse_table_chunk_sizes(const char *raw_list, const char *optname,
+						int source, DumpOptions *dopt)
+{
+	const char *p = raw_list;
+
+	for (;;)
+	{
+		const char *comma;
+		const char *entry_start;
+		const char *entry_end;
+		const char *colon;
+		const char *t_start;
+		const char *t_end;
+		const char *s_start;
+		const char *s_end;
+		const char *dot;
+		const char *scan;
+		char	   *size_str;
+		char	   *schemaname = NULL;
+		char	   *relname = NULL;
+		uint64		chunk_size = 0;
+
+		comma = strchr(p, ',');
+		entry_start = p;
+		entry_end = comma ? comma : (p + strlen(p));
+
+		while (entry_start < entry_end && isspace((unsigned char) *entry_start))
+			entry_start++;
+		while (entry_end > entry_start && isspace((unsigned char) *(entry_end - 1)))
+			entry_end--;
+
+		if (entry_start == entry_end)
+		{
+			pg_log_error("invalid value for %s: \"%s\"",
+						 optname, raw_list);
+			exit_nicely(1);
+		}
+
+		colon = memchr(entry_start, ':', (size_t) (entry_end - entry_start));
+		if (colon == NULL)
+		{
+			pg_log_error("invalid value for %s: \"%s\"",
+						 optname, raw_list);
+			exit_nicely(1);
+		}
+
+		t_start = entry_start;
+		t_end = colon;
+		while (t_start < t_end && isspace((unsigned char) *t_start))
+			t_start++;
+		while (t_end > t_start && isspace((unsigned char) *(t_end - 1)))
+			t_end--;
+
+		s_start = colon + 1;
+		s_end = entry_end;
+		while (s_start < s_end && isspace((unsigned char) *s_start))
+			s_start++;
+		while (s_end > s_start && isspace((unsigned char) *(s_end - 1)))
+			s_end--;
+
+		if (t_start == t_end || s_start == s_end)
+		{
+			pg_log_error("invalid value for %s: \"%s\"",
+						 optname, raw_list);
+			exit_nicely(1);
+		}
+
+		for (scan = t_start; scan < t_end; scan++)
+		{
+			if (isspace((unsigned char) *scan))
+			{
+				pg_log_error("invalid value for %s: \"%s\"",
+							 optname, raw_list);
+				exit_nicely(1);
+			}
+		}
+
+		dot = memchr(t_start, '.', (size_t) (t_end - t_start));
+		if (dot != NULL)
+		{
+			const char *rel_start = dot + 1;
+
+			if (dot == t_start || rel_start == t_end ||
+				memchr(rel_start, '.', (size_t) (t_end - rel_start)) != NULL)
+			{
+				pg_log_error("invalid value for %s: \"%s\"",
+							 optname, raw_list);
+				exit_nicely(1);
+			}
+			schemaname = pnstrdup(t_start, (size_t) (dot - t_start));
+			relname = pnstrdup(rel_start, (size_t) (t_end - rel_start));
+		}
+		else
+		{
+			schemaname = NULL;
+			relname = pnstrdup(t_start, (size_t) (t_end - t_start));
+		}
+
+		size_str = pnstrdup(s_start, (size_t) (s_end - s_start));
+		if (!option_parse_size_bytes(size_str, optname, &chunk_size))
+		{
+			pg_free(size_str);
+			pg_free(schemaname);
+			pg_free(relname);
+			exit_nicely(1);
+		}
+		pg_free(size_str);
+
+		dopt->table_chunk_overrides = (TableChunkSizeOverride *)
+			pg_realloc(dopt->table_chunk_overrides,
+					   (dopt->num_table_chunk_overrides + 1) * sizeof(TableChunkSizeOverride));
+		dopt->table_chunk_overrides[dopt->num_table_chunk_overrides].schemaname = schemaname;
+		dopt->table_chunk_overrides[dopt->num_table_chunk_overrides].relname = relname;
+		dopt->table_chunk_overrides[dopt->num_table_chunk_overrides].chunk_size = chunk_size;
+		dopt->table_chunk_overrides[dopt->num_table_chunk_overrides].source = source;
+		dopt->num_table_chunk_overrides++;
+
+		if (comma == NULL)
+			break;
+		p = comma + 1;
+	}
+}
+
+/*
+ * readDbChunkingConfig -
+ *	  query in-database pgdump.* settings when settings-from-database is on
+ */
+static void
+readDbChunkingConfig(Archive *fout, DumpOptions *dopt)
+{
+	PGresult   *res;
+
+	res = ExecuteSqlQueryForSingleRow(fout,
+									  "SELECT "
+									  "COALESCE("
+									  "NULLIF(current_setting('pgdump.table_chunk_sizes', true), ''), "
+									  "NULLIF(current_setting('pgdump.table-chunk-sizes', true), '')"
+									  ") AS table_chunk_sizes, "
+									  "COALESCE("
+									  "NULLIF(current_setting('pgdump.max-table-segment-pages', true), ''), "
+									  "NULLIF(current_setting('pgdump.max_table_segment_pages', true), '')"
+									  ") AS max_segment_pages, "
+									  "COALESCE("
+									  "NULLIF(current_setting('pgdump.chunk_above_size', true), ''), "
+									  "NULLIF(current_setting('pgdump.chunk-above-size', true), '')"
+									  ") AS chunk_above_size, "
+									  "COALESCE("
+									  "NULLIF(current_setting('pgdump.chunk_size', true), ''), "
+									  "NULLIF(current_setting('pgdump.chunk-size', true), '')"
+									  ") AS chunk_size");
+
+	if (!PQgetisnull(res, 0, 0))
+		parse_table_chunk_sizes(PQgetvalue(res, 0, 0),
+								"pgdump.table_chunk_sizes",
+								CHUNK_SRC_DB, dopt);
+
+	if (!PQgetisnull(res, 0, 1))
+	{
+		if (!option_parse_uint32(PQgetvalue(res, 0, 1),
+								 "pgdump.max-table-segment-pages",
+								 1, MaxBlockNumber,
+								 &dopt->max_table_segment_pages))
+		{
+			PQclear(res);
+			exit_nicely(1);
+		}
+	}
+
+	if (!PQgetisnull(res, 0, 2))
+	{
+		if (!option_parse_size_bytes(PQgetvalue(res, 0, 2),
+									 "pgdump.chunk_above_size",
+									 &dopt->chunk_above_size))
+		{
+			PQclear(res);
+			exit_nicely(1);
+		}
+	}
+
+	if (!PQgetisnull(res, 0, 3))
+	{
+		if (!option_parse_size_bytes(PQgetvalue(res, 0, 3),
+									 "pgdump.chunk_size",
+									 &dopt->chunk_size))
+		{
+			PQclear(res);
+			exit_nicely(1);
+		}
+	}
+
+	PQclear(res);
+}
+
+/*
+ * isChunkingActive -
+ *	  returns true if any table chunking configuration is active
+ */
+static bool
+isChunkingActive(const DumpOptions *dopt)
+{
+	if (!dopt->dumpData)
+		return false;
+
+	return (dopt->max_table_segment_pages != InvalidBlockNumber ||
+			dopt->chunk_size > 0 ||
+			dopt->num_table_chunk_overrides > 0);
+}
+
+/*
+ * computeSegmentPagesFromBytes -
+ *	  compute main-heap segment page count for a given target chunk_size in bytes
+ */
+static BlockNumber
+computeSegmentPagesFromBytes(const TableInfo *tbinfo, uint64 chunk_size)
+{
+	uint64		seg_pages;
+
+	if (OidIsValid(tbinfo->toast_oid))
+	{
+		if (tbinfo->tablebytes > 0)
+		{
+			double		num_chunks = (double) tbinfo->tablebytes / (double) chunk_size;
+			double		main_bytes_per_chunk = (double) tbinfo->relbytes / num_chunks;
+			double		pages_d = main_bytes_per_chunk / 8192.0;
+
+			if (pages_d < 1.0)
+				seg_pages = 1;
+			else if (pages_d >= (double) MaxBlockNumber)
+				seg_pages = MaxBlockNumber;
+			else
+				seg_pages = (uint64) pages_d;
+		}
+		else
+		{
+			seg_pages = chunk_size / 8192;
+		}
+	}
+	else
+	{
+		seg_pages = chunk_size / 8192;
+	}
+
+	if (seg_pages < 1)
+		seg_pages = 1;
+	if (seg_pages > MaxBlockNumber)
+		seg_pages = MaxBlockNumber;
+
+	return (BlockNumber) seg_pages;
+}
+
+/*
+ * getTableSegmentPages -
+ *	  determine the effective max-table-segment-pages for a table, or
+ *	  InvalidBlockNumber if the table should not be chunked
+ */
+static BlockNumber
+getTableSegmentPages(const DumpOptions *dopt, const TableInfo *tbinfo)
+{
+	const TableChunkSizeOverride *matched_override = NULL;
+
+	if (tbinfo->amname == NULL || strcmp(tbinfo->amname, "heap") != 0)
+		return InvalidBlockNumber;
+
+	for (int i = 0; i < dopt->num_table_chunk_overrides; i++)
+	{
+		const TableChunkSizeOverride *ov = &dopt->table_chunk_overrides[i];
+
+		if (strcmp(ov->relname, tbinfo->dobj.name) != 0)
+			continue;
+
+		if (ov->schemaname != NULL)
+		{
+			if (tbinfo->dobj.namespace == NULL ||
+				tbinfo->dobj.namespace->dobj.name == NULL ||
+				strcmp(ov->schemaname, tbinfo->dobj.namespace->dobj.name) != 0)
+				continue;
+
+			if (matched_override == NULL ||
+				ov->source >= matched_override->source)
+			{
+				matched_override = ov;
+			}
+		}
+		else
+		{
+			if (matched_override == NULL ||
+				ov->source > matched_override->source ||
+				(ov->source == matched_override->source &&
+				 matched_override->schemaname == NULL))
+			{
+				matched_override = ov;
+			}
+		}
+	}
+
+	/* Priority 1: Per-table override in table_chunk_sizes */
+	if (matched_override != NULL)
+	{
+		if (tbinfo->tablebytes <= matched_override->chunk_size)
+			return InvalidBlockNumber;
+		return computeSegmentPagesFromBytes(tbinfo, matched_override->chunk_size);
+	}
+
+	/* Priority 2: Global max_table_segment_pages */
+	if (dopt->max_table_segment_pages != InvalidBlockNumber)
+		return dopt->max_table_segment_pages;
+
+	/* Priority 3: Global chunk_above_size / chunk_size */
+	if (dopt->chunk_size > 0)
+	{
+		if (tbinfo->tablebytes <= dopt->chunk_above_size)
+			return InvalidBlockNumber;
+		return computeSegmentPagesFromBytes(tbinfo, dopt->chunk_size);
+	}
+
+	return InvalidBlockNumber;
+}
+
+/*
  * dumpTableData -
  *	  dump the contents of a single table
  *
@@ -2947,15 +3410,17 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 	if (tdinfo->dobj.dump & DUMP_COMPONENT_DATA)
 	{
 		TocEntry   *te;
+		BlockNumber seg_pages = getTableSegmentPages(dopt, tbinfo);
 
 		/* data chunking works off relpages, which are computed exactly using
-		 * pg_relation_size() when --max-table-segment-pages was set
+		 * pg_relation_size() when chunking was configured
 		 *
 		 * We also don't chunk if table access method is not "heap"
 		 * TODO: we may add chunking for other access methods later, maybe
 		 * based on primary key tranges
 		 */
-		if (tbinfo->relpages <= dopt->max_table_segment_pages ||
+		if (seg_pages == InvalidBlockNumber ||
+			tbinfo->relpages <= seg_pages ||
 			tbinfo->amname == NULL ||
 			strcmp(tbinfo->amname, "heap") != 0)
 		{
@@ -3000,9 +3465,9 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 				AssignDumpId(&chunk_tdinfo->dobj);
 				addObjectDependency(&chunk_tdinfo->dobj, tbinfo->dobj.dumpId);
 				chunk_tdinfo->startPage = (BlockNumber) current_chunk_start;
-				chunk_tdinfo->endPage = chunk_tdinfo->startPage + dopt->max_table_segment_pages - 1;
+				chunk_tdinfo->endPage = chunk_tdinfo->startPage + seg_pages - 1;
 
-				current_chunk_start += dopt->max_table_segment_pages;
+				current_chunk_start += seg_pages;
 				if (current_chunk_start >= tbinfo->relpages)
 					chunk_tdinfo->endPage = InvalidBlockNumber; /* last chunk is for "all the rest" */
 
@@ -3024,7 +3489,7 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 				if(chunk_tdinfo->endPage == InvalidBlockNumber)
 					te->dataLength = tbinfo->relpages - chunk_tdinfo->startPage;
 				else
-					te->dataLength = dopt->max_table_segment_pages;
+					te->dataLength = seg_pages;
 				/* let's assume toast pages distribute evenly among chunks */
 				if(tbinfo->relpages)
 					te->dataLength += te->dataLength * tbinfo->toastpages / tbinfo->relpages;
@@ -7269,6 +7734,8 @@ getTables(Archive *fout, int *numTables)
 	int			i_relhasindex;
 	int			i_relhasrules;
 	int			i_relpages;
+	int			i_relbytes;
+	int			i_tablebytes;
 	int			i_reltuples;
 	int			i_relallvisible;
 	int			i_relallfrozen;
@@ -7324,11 +7791,20 @@ getTables(Archive *fout, int *numTables)
 						 "c.relhasindex, c.relhasrules, ");
 
 	/* fetch current relation size if chunking is requested */
-	if (dopt->max_table_segment_pages != InvalidBlockNumber)
-		appendPQExpBufferStr(query, "COALESCE(pg_relation_size(c.oid), 0)/current_setting('block_size')::int AS relpages, ");
+	if (isChunkingActive(dopt))
+		appendPQExpBuffer(query,
+						  "COALESCE(pg_relation_size(c.oid), 0)/current_setting('block_size')::int AS relpages, "
+						  "CASE WHEN c.relkind = " CppAsString2(RELKIND_RELATION) " AND c.oid > %u::oid "
+						  "THEN COALESCE(pg_relation_size(c.oid), 0) ELSE 0 END AS relbytes, "
+						  "CASE WHEN c.relkind = " CppAsString2(RELKIND_RELATION) " AND c.oid > %u::oid "
+						  "THEN COALESCE(pg_table_size(c.oid), 0) ELSE 0 END AS tablebytes, ",
+						  g_last_builtin_oid, g_last_builtin_oid);
 	else
 		/* pg_class.relpages stores BlockNumber (uint32) in an int field, convert to oid to get unsigned int out */
-		appendPQExpBufferStr(query, "c.relpages::oid, ");
+		appendPQExpBufferStr(query,
+							 "c.relpages::oid, "
+							 "0::bigint AS relbytes, "
+							 "0::bigint AS tablebytes, ");
 
 	appendPQExpBufferStr(query, "c.reltuples, c.relallvisible, ");
 
@@ -7467,6 +7943,8 @@ getTables(Archive *fout, int *numTables)
 	i_relhasindex = PQfnumber(res, "relhasindex");
 	i_relhasrules = PQfnumber(res, "relhasrules");
 	i_relpages = PQfnumber(res, "relpages");
+	i_relbytes = PQfnumber(res, "relbytes");
+	i_tablebytes = PQfnumber(res, "tablebytes");
 	i_reltuples = PQfnumber(res, "reltuples");
 	i_relallvisible = PQfnumber(res, "relallvisible");
 	i_relallfrozen = PQfnumber(res, "relallfrozen");
@@ -7537,6 +8015,8 @@ getTables(Archive *fout, int *numTables)
 		tblinfo[i].hasindex = (strcmp(PQgetvalue(res, i, i_relhasindex), "t") == 0);
 		tblinfo[i].hasrules = (strcmp(PQgetvalue(res, i, i_relhasrules), "t") == 0);
 		tblinfo[i].relpages = strtoul(PQgetvalue(res, i, i_relpages), NULL, 10);
+		tblinfo[i].relbytes = strtou64(PQgetvalue(res, i, i_relbytes), NULL, 10);
+		tblinfo[i].tablebytes = strtou64(PQgetvalue(res, i, i_tablebytes), NULL, 10);
 		if (PQgetisnull(res, i, i_toastpages))
 			tblinfo[i].toastpages = 0;
 		else

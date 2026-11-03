@@ -157,6 +157,7 @@ InitDumpOptions(DumpOptions *opts)
 	opts->dumpData = true;
 	opts->dumpStatistics = false;
 	opts->max_table_segment_pages = InvalidBlockNumber;
+	opts->settings_from_database = true;
 }
 
 /*

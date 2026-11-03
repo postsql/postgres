@@ -690,6 +690,50 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--chunk-above-size=<replaceable class="parameter">size</replaceable></option></term>
+      <term><option>--chunk_above_size=<replaceable class="parameter">size</replaceable></option></term>
+      <listitem>
+       <para>
+        Chunk table data for heap tables whose total relation size (including
+        <acronym>TOAST</acronym> data, as reported by
+        <function>pg_table_size()</function>) exceeds
+        <replaceable class="parameter">size</replaceable>.
+        Sizes accept optional units <literal>k</literal>/<literal>kB</literal>,
+        <literal>M</literal>/<literal>MB</literal>,
+        <literal>G</literal>/<literal>GB</literal>, or
+        <literal>T</literal>/<literal>TB</literal> (case-insensitive, powers of
+        1024), defaulting to <literal>M</literal> (MiB) if no unit is specified.
+        If <option>--chunk-above-size</option> is specified without
+        <option>--chunk-size</option>, <option>--chunk-size</option> defaults
+        to the same value. Can also be configured in the database via
+        <varname>pgdump.chunk_above_size</varname> or in the environment via
+        <envar>PGDUMP_CHUNK_ABOVE_SIZE</envar>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--chunk-size=<replaceable class="parameter">size</replaceable></option></term>
+      <term><option>--chunk_size=<replaceable class="parameter">size</replaceable></option></term>
+      <listitem>
+       <para>
+        Specify the target byte size per table data chunk for heap tables whose
+        total relation size exceeds <option>--chunk-above-size</option>.
+        Sizes accept the same unit suffixes as
+        <option>--chunk-above-size</option> (defaulting to
+        <literal>M</literal>). If <option>--chunk-size</option> is specified
+        without <option>--chunk-above-size</option>,
+        <option>--chunk-above-size</option> defaults to the same value.
+        Size-based chunking automatically accounts for <acronym>TOAST</acronym>
+        table sizes when computing the number of main-heap pages per segment.
+        Can also be configured in the database via
+        <varname>pgdump.chunk_size</varname> or in the environment via
+        <envar>PGDUMP_CHUNK_SIZE</envar>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--column-inserts</option></term>
       <term><option>--attribute-inserts</option></term>
       <listitem>
@@ -1056,12 +1100,20 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>--max-table-segment-pages=<replaceable class="parameter">npages</replaceable></option></term>
+      <term><option>--max_table_segment_pages=<replaceable class="parameter">npages</replaceable></option></term>
       <listitem>
        <para>
         Dump data in segments based on number of pages in the main relation.
         If the number of data pages in the relation is more than <replaceable class="parameter">npages</replaceable>
         the data is split into segments based on that number of pages.
         Individual segments can be dumped in parallel.
+        Can also be configured in the database via
+        <varname>pgdump.max-table-segment-pages</varname> (or
+        <varname>pgdump.max_table_segment_pages</varname>) or in the environment
+        via <envar>PGDUMP_MAX_TABLE_SEGMENT_PAGES</envar>. When present,
+        <option>--max-table-segment-pages</option> overrides
+        <option>--chunk-above-size</option> and <option>--chunk-size</option>
+        for tables not matched by <option>--table-chunk-sizes</option>.
        </para>
 
        <note>
@@ -1359,6 +1411,29 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--settings-from-database=<replaceable class="parameter">boolean</replaceable></option></term>
+      <term><option>--settings_from_database=<replaceable class="parameter">boolean</replaceable></option></term>
+      <listitem>
+       <para>
+        Specifies whether <application>pg_dump</application> reads in-database
+        <literal>pgdump.*</literal> table chunking configuration parameters
+        (<varname>pgdump.table_chunk_sizes</varname>,
+        <varname>pgdump.max-table-segment-pages</varname> /
+        <varname>pgdump.max_table_segment_pages</varname>,
+        <varname>pgdump.chunk_above_size</varname>, and
+        <varname>pgdump.chunk_size</varname>). Defaults to <literal>on</literal>.
+        When enabled, in-database <literal>pgdump.*</literal> parameters take
+        highest precedence, followed by command-line options, and then
+        <literal>PGDUMP_*</literal> environment variables. When set to
+        <literal>off</literal>, in-database <literal>pgdump.*</literal>
+        settings are ignored and only command-line options and environment
+        variables are used. Can also be configured via the
+        <envar>PGDUMP_SETTINGS_FROM_DATABASE</envar> environment variable.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
        <term><option>--snapshot=<replaceable class="parameter">snapshotname</replaceable></option></term>
        <listitem>
          <para>
@@ -1455,6 +1530,27 @@ PostgreSQL documentation
         except that it also includes any partitions or inheritance child
         tables of the table(s) matching the
         <replaceable class="parameter">pattern</replaceable>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--table-chunk-sizes=<replaceable class="parameter">list</replaceable></option></term>
+      <term><option>--table_chunk_sizes=<replaceable class="parameter">list</replaceable></option></term>
+      <listitem>
+       <para>
+        Specify a comma-separated list of
+        <literal>[<replaceable>schema</replaceable>.]<replaceable>table</replaceable>:<replaceable>size</replaceable></literal>
+        pairs defining per-table chunk sizes (for example,
+        <literal>'public.big_table:64MB, other_table:128M'</literal>).
+        A matched heap table is chunked only if its total relation size
+        (<function>pg_table_size()</function>) exceeds its specified target
+        <replaceable class="parameter">size</replaceable>. Precedence is
+        resolved per individual table across active configuration sources
+        (in-database <varname>pgdump.table_chunk_sizes</varname>, command-line
+        <option>--table-chunk-sizes</option>, and environment variable
+        <envar>PGDUMP_TABLE_CHUNK_SIZES</envar>); within the same source,
+        schema-qualified entries take precedence over unqualified entries.
        </para>
       </listitem>
      </varlistentry>
@@ -1627,6 +1723,24 @@ PostgreSQL documentation
       Specifies whether to use color in diagnostic messages. Possible values
       are <literal>always</literal>, <literal>auto</literal> and
       <literal>never</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><envar>PGDUMP_CHUNK_ABOVE_SIZE</envar></term>
+    <term><envar>PGDUMP_CHUNK_SIZE</envar></term>
+    <term><envar>PGDUMP_MAX_TABLE_SEGMENT_PAGES</envar></term>
+    <term><envar>PGDUMP_SETTINGS_FROM_DATABASE</envar></term>
+    <term><envar>PGDUMP_TABLE_CHUNK_SIZES</envar></term>
+    <listitem>
+     <para>
+      Specify default values for the corresponding table chunking command-line
+      options (<option>--chunk-above-size</option>,
+      <option>--chunk-size</option>,
+      <option>--max-table-segment-pages</option>,
+      <option>--settings-from-database</option>, and
+      <option>--table-chunk-sizes</option>).
      </para>
     </listitem>
    </varlistentry>

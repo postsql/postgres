@@ -25,6 +25,10 @@ extern bool option_parse_int(const char *optarg, const char *optname,
 extern bool option_parse_uint32(const char *optarg, const char *optname,
 								uint32 min_range, uint32 max_range,
 								uint32 *result);
+extern bool option_parse_size_bytes(const char *optarg, const char *optname,
+									uint64 *result);
+extern bool option_parse_bool(const char *optarg, const char *optname,
+							  bool *result);
 extern bool parse_sync_method(const char *optarg,
 							  DataDirSyncMethod *sync_method);
 extern void check_mut_excl_opts_internal(int n, ...);

@@ -342,6 +342,8 @@ typedef struct _tableInfo
 								 * the computed from pg_relation_size()
 								 */
 	int			toastpages;		/* toast table's size in pages, if any */
+	uint64		relbytes;		/* pg_relation_size(c.oid) in bytes */
+	uint64		tablebytes;		/* pg_table_size(c.oid) in bytes */
 
 	bool		interesting;	/* true if need to collect more data */
 	bool		dummy_view;		/* view's real definition must be postponed */
