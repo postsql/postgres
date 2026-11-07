@@ -385,11 +385,12 @@ WaitLSNCleanup(void)
 	/*
 	 * deleteLSNWaiter() starts with the same lockless inHeap check, so
 	 * calling it unconditionally costs nothing when this process isn't
-	 * waiting.  Its lsnType is then unused, and reading it is harmless in any
-	 * case: an entry that was never used is zeroed, which is a valid
-	 * WaitLSNType.
+	 * waiting.  Its lsnType is then unused, and reading it is harmless once
+	 * MyProcNumber has been assigned: an entry that was never used is zeroed,
+	 * which is a valid WaitLSNType.  Skip cleanup before InitProcess() (for
+	 * example, during startup-packet reads in secure_read()).
 	 */
-	if (waitLSNState)
+	if (waitLSNState && MyProcNumber >= 0)
 		deleteLSNWaiter(waitLSNState->procInfos[MyProcNumber].lsnType);
 }
 
